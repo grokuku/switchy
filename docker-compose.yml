@@ -1,0 +1,62 @@
+# ─── Switchy — stack docker-compose (service séparé, jamais fusionné) ───
+#
+# Déploiement : le serveur TIRE l'image publiée sur GHCR — il ne la reconstruit
+# jamais localement (le build n'est qu'une option de DÉVELOPPEMENT, voir plus bas) :
+#   docker compose pull && docker compose up -d
+#
+# Adapté à l'environnement réel :
+#   • Switchy est un service AUTONOME de l'écosystème : port hôte 3008
+#     (Pi-Web 3000/3005, WebClaw 3006, Libry 3007) ;
+#   • ses données vivent dans un dossier DÉDIÉ de l'appdata Unraid (bind mount) :
+#     on ne partage JAMAIS le dossier d'un autre service ;
+#   • Switchy rejoint le réseau externe `dockercustom` (celui de Pi-Web) tout en
+#     restant joignable depuis l'hôte via le port publié 3008 ;
+#   • aucun fournisseur LLM n'est configuré par l'environnement : les services
+#     nommés et leurs clés se règlent depuis l'interface (v1).
+services:
+  switchy:
+    # Image PUBLIÉE par les workflows GitHub Actions sur GHCR : le serveur la
+    # TIRE, il ne la reconstruit pas. Tag ÉPINGLÉ sur une version → déploiement
+    # stable, aucune mise à jour surprise (contrairement à `latest`).
+    # ⚠️  Tant que le workflow « Release image » n'a pas tourné UNE fois, le tag
+    #     `0.1.0` n'existe pas encore sur GHCR — en attendant, prendre la ligne
+    #     `:test` ci-dessous.
+    # Si le paquet GHCR devient privé : se connecter une fois sur le serveur
+    # (`docker login ghcr.io`, jeton avec « read:packages ») avant le pull.
+    image: ghcr.io/grokuku/switchy:0.1.0
+    # Alternatives commentées (décommenter UNE ligne, commenter celle du dessus) :
+    # image: ghcr.io/grokuku/switchy:latest       # dernière release publiée
+    # image: ghcr.io/grokuku/switchy:test         # dernière CI de `main`
+    # image: ghcr.io/grokuku/switchy:sha-58d1467  # commit précis (immuable)
+    # ── DÉVELOPPEMENT LOCAL uniquement ─────────────────────────────────────────
+    # Reconstruire l'image sur cette machine au lieu de la tirer : commenter la
+    # ligne `image:` active ci-dessus puis décommenter ces deux lignes :
+    # build:
+    #   context: .
+    container_name: switchy
+    ports:
+      - "3008:3008"
+    environment:
+      SWITCHY_HOST: "0.0.0.0"
+      SWITCHY_PORT: "3008"
+      SWITCHY_DATA_DIR: "/app/data"
+      SWITCHY_RATE_LIMIT_PER_MIN: "${SWITCHY_RATE_LIMIT_PER_MIN:-600}"
+    volumes:
+      # Appdata Unraid dédiée à Switchy — JAMAIS celle d'un autre service. AVANT
+      # le premier démarrage, créer le dossier et le donner à l'utilisateur du
+      # conteneur (uid 10001) — sinon Switchy ne peut pas écrire ses données :
+      #   mkdir -p /mnt/user/appdata-ssd/Switchy/data
+      #   chown -R 10001:10001 /mnt/user/appdata-ssd/Switchy/data
+      - /mnt/user/appdata-ssd/Switchy/data:/app/data
+    restart: unless-stopped
+    networks:
+      - dockercustom
+
+networks:
+  # Réseau EXISTANT du serveur (celui de Pi-Web). Permet d'adresser
+  # `switchy:3008` par son nom depuis les autres conteneurs du réseau ; le port
+  # publié reste la voie d'accès pour l'hôte et le reste du LAN. Si ce réseau
+  # n'existait pas sur votre serveur, supprimez ce bloc `networks:` et
+  # `networks: - dockercustom` : Switchy fonctionne quand même via le port 3008.
+  dockercustom:
+    external: true

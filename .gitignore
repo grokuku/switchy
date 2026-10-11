@@ -1,0 +1,28 @@
+# Dépendances
+node_modules/
+
+# Build
+dist/
+
+# Environnement
+.env
+.env.local
+.env.*
+!.env.example
+
+# Données runtime (volume)
+.data/
+data/
+
+# Tests / couverture
+coverage/
+
+# Divers
+*.log
+npm-debug.log*
+.DS_Store
+*.tsbuildinfo
+
+# Éditeurs
+.vscode/
+.idea/

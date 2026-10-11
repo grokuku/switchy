@@ -1,0 +1,217 @@
+# =============================================================================
+# Switchy — Publication de l'image Docker de release (ghcr.io) + incrément de version.
+#
+# Principe repris de Libry (lui-même calqué sur Yuki) :
+#   lire la version (SOURCE UNIQUE de vérité) → construire et pousser l'image
+#   taguée `:<version>` + `:latest` + `:sha-<court>` → incrémenter la version
+#   (patch) → commit → push, par le bot GitHub Actions.
+#
+#   * Déclenchement MANUEL uniquement (`workflow_dispatch`) : aucun tag Git à
+#     pousser, et le commit de bump sur `main` ne peut PAS relancer ce workflow
+#     (garde anti-boucle).
+#   * la version vit dans `package.json` et l'incrément passe par
+#     `npm version --no-git-tag-version`, qui met à jour `package.json` ET
+#     `package-lock.json` en une seule opération ;
+#   * garde qualité identique à `ci.yml` AVANT toute publication (bloc
+#     volontairement dupliqué : ce workflow reste autonome) ;
+#   * `linux/amd64` seule + cache de build `type=gha`.
+#
+# Permissions : `contents: write` (commit du bump) + `packages: write` (image).
+# Aucun secret à configurer : le jeton éphémère `GITHUB_TOKEN` suffit.
+# =============================================================================
+name: Release image
+
+on:
+  # Publication manuelle uniquement : la version vient de `package.json`.
+  workflow_dispatch:
+
+# Sérialisation de TOUS les runs (deux runs manuels concurrents incrémenteraient
+# la version deux fois) et jamais d'annulation à mi-course d'un push d'image.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # `github.repository` vaut « grokuku/switchy » ; mis en minuscules plus bas
+  # (ghcr.io n'accepte QUE le minuscule). Le nom d'image suit le dépôt.
+  IMAGE_REPOSITORY: ${{ github.repository }}
+  NODE_VERSION: "22"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Garde-fou qualité : la publication ne part QUE si ces vérifications passent.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Typecheck, tests & build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Garde-fou vendor holaf
+        run: npm run check:vendor
+
+      - name: Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Construction + publication de l'image, PUIS incrément de version.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Build, push & bump version
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit + push du bump de version
+      packages: write # push de l'image sur ghcr.io
+    env:
+      DOCKER_DEFAULT_PLATFORM: linux/amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- 1. Lire la version (source unique de vérité) ---------------------
+      - name: Read version from package.json
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::version absente de package.json."
+            exit 1
+          fi
+          # Format MAJOR.MINOR.PATCH requis par l'incrément (étape 3).
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version invalide « ${VERSION} » dans package.json (attendu : MAJOR.MINOR.PATCH, ex. 0.1.0)."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Version lue : ${VERSION}"
+
+      # --- 2. Construire et pousser l'image AVEC la version courante --------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image reference and tags
+        id: meta
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IMAGE_REPOSITORY:-}" ]; then
+            echo "::error::github.repository est vide — impossible de dériver le nom d'image."
+            exit 1
+          fi
+          # ghcr.io n'accepte QUE le minuscule.
+          IMAGE="${REGISTRY}/$(printf '%s' "${IMAGE_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          SHA_SHORT="$(git rev-parse --short HEAD)"
+          # `:latest` ET `:<version>` proviennent du MÊME numéro (package.json),
+          # plus le tag immuable `:sha-<court>` pour la traçabilité.
+          TAGS="${IMAGE}:${VERSION}"$'\n'"${IMAGE}:latest"$'\n'"${IMAGE}:sha-${SHA_SHORT}"
+          {
+            echo "image=${IMAGE}"
+            echo "sha_short=${SHA_SHORT}"
+            echo "tags<<SWITCHY_IMAGE_TAGS"
+            printf '%s\n' "${TAGS}"
+            echo "SWITCHY_IMAGE_TAGS"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "IMAGE=${IMAGE}"
+            echo "VERSION=${VERSION}"
+          } >> "${GITHUB_ENV}"
+          echo "Image   : ${IMAGE}"
+          echo "Version : ${VERSION}"
+          echo "Tags    :"
+          while IFS= read -r tag; do printf '  - %s\n' "${tag}"; done <<< "${TAGS}"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          # `linux/amd64` seule.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- 3. Incrémenter la version (APRÈS le push de l'image) -------------
+      - name: Increment version (package.json + package-lock.json)
+        run: |
+          set -euo pipefail
+          CURRENT="$(node -p "require('./package.json').version")"
+          MAJOR="${CURRENT%%.*}"
+          REST="${CURRENT#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST#*.}"
+          NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          # `--no-git-tag-version` : AUCUN tag Git (règle maison reprise de
+          # Libry/Yuki) — le commit est fait à l'étape suivante par le bot.
+          npm version "${NEW_VERSION}" --no-git-tag-version
+          echo "Nouvelle version : ${NEW_VERSION}"
+
+      # --- 4. Committer et pousser le bump ----------------------------------
+      - name: Commit and push new version
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          NEW_VERSION="$(node -p "require('./package.json').version")"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to ${NEW_VERSION}"
+          git push
+
+      - name: Summary
+        env:
+          SHA_SHORT: ${{ steps.meta.outputs.sha_short }}
+        run: |
+          set -euo pipefail
+          NEXT_VERSION="$(node -p "require('./package.json').version")"
+          {
+            echo "### Image publiée sur ${REGISTRY}"
+            echo
+            echo "| Tag | Référence |"
+            echo "| --- | --- |"
+            echo "| version | \`${IMAGE}:${VERSION}\` |"
+            echo "| latest | \`${IMAGE}:latest\` |"
+            echo "| immuable | \`${IMAGE}:sha-${SHA_SHORT}\` |"
+            echo
+            echo "Version suivante : \`${NEXT_VERSION}\` (commit « bump » poussé par le workflow)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+# =============================================================================
+# Écarts / choix assumés (rappel)
+# -----------------------------------------------------------------------------
+#   * `:latest` publié VOLONTAIREMENT pour l'IMAGE DU PROJET (il suit le dernier
+#     build publié) ; `:<version>` et `:sha-<court>` permettent d'épingler un
+#     artefact reproductible.
+#   * Aucun tag Git n'est créé : la version vient de `package.json`.
+#   * Aucune interpolation `${{ }}` dans les scripts shell : tout passe par
+#     `env:`, avec `set -euo pipefail` et des garde-fous `::error::` explicites.
+# =============================================================================

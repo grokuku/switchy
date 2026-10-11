@@ -1,0 +1,229 @@
+# =============================================================================
+# Switchy — CI : qualité (typecheck, tests, build) + image Docker de TEST sur ghcr.io.
+#
+# Principe repris de Libry (lui-même calqué sur Yuki) :
+#   quality → image (UNE seule construction + smoke test du conteneur) →
+#   publication des tags de TEST `:test` + `:sha-<court>`, JAMAIS sur
+#   pull_request. Les tags de release (`:latest`, `:<version>`) restent
+#   réservés à `release.yml` : un build de test ne peut pas écraser une release.
+#
+# Adapté à Switchy :
+#   * un seul service Node/TypeScript, SANS navigateur ni dépendance système :
+#     le build est léger (pas de couche Chromium à cacher, mais le cache `gha`
+#     reste activé — même mécanisme que Libry) ;
+#   * Node 22, cohérent avec `engines` de package.json ;
+#   * les tests n'ont AUCUN accès réseau (aucune dépendance à un fournisseur).
+#
+# Aucun secret à configurer : le jeton éphémère `GITHUB_TOKEN` suffit.
+# =============================================================================
+name: CI
+
+on:
+  # Validation à chaque push et à chaque PR vers la branche par défaut.
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Porte de rejeu manuel : (re)construit et republie une image `:test`.
+  workflow_dispatch:
+
+# Permissions minimales :
+#   - `contents: read`  : lecture seule du dépôt (jamais d'écriture) ;
+#   - `packages: write` : push des images `:test` / `:sha-<court>` sur ghcr.io.
+permissions:
+  contents: read
+  packages: write
+
+# Annulation des exécutions obsolètes UNIQUEMENT pour les PR : un run de `main`
+# peut être en train de pousser une image, on ne le tue jamais à mi-course.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  # `github.repository` vaut « grokuku/switchy » ; il est mis en minuscules au
+  # moment de construire la référence (ghcr.io n'accepte QUE le minuscule).
+  # Le nom d'image suit le dépôt, il n'est pas écrit en dur.
+  IMAGE_REPOSITORY: ${{ github.repository }}
+  NODE_VERSION: "22"
+  # Tag local de l'image construite ici ; il n'est jamais publié tel quel.
+  IMAGE_LOCAL_TAG: switchy-ci:local
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Garde-fou qualité : le job `image` en dépend.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Typecheck, tests & build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Garde-fou vendor holaf : le CLI qui copie les briques vit dans
+      # holaf-lib et n'existe PAS sur GitHub — ce script (Node pur, hors
+      # réseau) vérifie que les .js de public/vendor/holaf/ correspondent aux
+      # empreintes pinnées (holaf-checksums.json + holaf-manifest.json).
+      - name: Garde-fou vendor holaf
+        run: npm run check:vendor
+
+      - name: Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Image Docker : validation Compose → construction (UNE fois) → smoke test →
+  # publication `:test` + `:sha-<court>` (jamais sur PR).
+  #
+  # Tout se joue dans UN seul job, sans transfert d'artefact entre jobs — c'est
+  # la même image (construite, testée, puis taguée/poussée) qui part.
+  # ---------------------------------------------------------------------------
+  image:
+    name: Image Docker (build, smoke test & publication :test)
+    needs: quality
+    runs-on: ubuntu-latest
+    env:
+      # Plateforme épinglée explicitement : linux/amd64 SEULE.
+      DOCKER_DEFAULT_PLATFORM: linux/amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Construction locale (`load: true`) avec le cache de build GitHub.
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE_LOCAL_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Invariants de sécurité / d'intégration du conteneur : le service répond
+      # ET tourne en utilisateur non-root.
+      - name: Smoke test (non-root + /health)
+        run: |
+          set -euo pipefail
+          # Port hôte aléatoire : aucun risque de collision sur le runner.
+          docker run --detach --name switchy-ci --publish 127.0.0.1::3008 "${IMAGE_LOCAL_TAG}"
+          # Nettoyage garanti, même en cas d'échec.
+          trap 'docker rm -f switchy-ci >/dev/null 2>&1 || true' EXIT
+
+          HOST_PORT="$(docker port switchy-ci 3008 | head -n1 | awk -F: '{print $NF}')"
+          if [ -z "${HOST_PORT}" ]; then
+            echo "::error::port publié introuvable pour le conteneur."
+            docker logs switchy-ci || true
+            exit 1
+          fi
+
+          # Attente de /health (l'image fournit aussi un HEALTHCHECK ; ici on
+          # échoue tôt avec un diagnostic clair plutôt que sans explication).
+          healthy=""
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${HOST_PORT}/health" | grep -q '"status":"ok"'; then
+              healthy="oui"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "${healthy}" ]; then
+            echo "::error::/health n'a pas répondu « ok » dans le délai imparti."
+            docker logs switchy-ci || true
+            exit 1
+          fi
+
+          UID_CONTAINER="$(docker exec switchy-ci id -u)"
+          if [ "${UID_CONTAINER}" != "10001" ]; then
+            echo "::error::le service ne tourne pas en non-root (uid=${UID_CONTAINER}, attendu 10001)."
+            exit 1
+          fi
+          echo "Smoke test OK : /health répond « ok », processus uid=${UID_CONTAINER} (non-root)."
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Sur PR : on a VALIDÉ (qualité + Compose + build + smoke test) SANS
+      # publier — un `:test` issu d'une PR écraserait le tag avec du code non
+      # fusionné, et le jeton des PR de fork est en lecture seule.
+      - name: Tag & push :test and :sha-<court>
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          if [ -z "${IMAGE_REPOSITORY:-}" ]; then
+            echo "::error::github.repository est vide — impossible de dériver le nom d'image."
+            exit 1
+          fi
+          # ghcr.io n'accepte QUE le minuscule.
+          IMAGE="${REGISTRY}/$(printf '%s' "${IMAGE_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          SHA_SHORT="$(git rev-parse --short HEAD)"
+          if ! printf '%s' "${SHA_SHORT}" | grep -Eq '^[0-9a-f]+$'; then
+            echo "::error::sha court invalide : « ${SHA_SHORT} »"
+            exit 1
+          fi
+          # Tags de TEST uniquement : `:latest` / `:<version>` restent réservés
+          # à `release.yml`.
+          docker tag "${IMAGE_LOCAL_TAG}" "${IMAGE}:test"
+          docker tag "${IMAGE_LOCAL_TAG}" "${IMAGE}:sha-${SHA_SHORT}"
+          docker push "${IMAGE}:test"
+          docker push "${IMAGE}:sha-${SHA_SHORT}"
+          # Transmis aux étapes suivantes via l'environnement (indirection
+          # shell, aucune expression GitHub évaluée dans ce script).
+          echo "IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
+          echo "SHA_SHORT=${SHA_SHORT}" >> "${GITHUB_ENV}"
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Image de TEST publiée sur ${REGISTRY}"
+            echo
+            echo "| Tag | Référence |"
+            echo "| --- | --- |"
+            echo "| jetable | \`${IMAGE}:test\` |"
+            echo "| immuable | \`${IMAGE}:sha-${SHA_SHORT}\` |"
+            echo
+            echo "> Les tags de release (\`:latest\`, \`:<version>\`) ne sont PAS touchés."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+# =============================================================================
+# Écarts / choix assumés (rappel)
+# -----------------------------------------------------------------------------
+#   * Plateforme `linux/amd64` SEULE (pas de multi-arch, pas de QEMU), comme
+#     Libry et Yuki.
+#   * Build en UN seul job via `docker/build-push-action` (cache gha) : l'image
+#     publiée est exactement celle qui a passé le smoke test.
+#   * AUCUN bump de version, AUCUNE écriture dans le dépôt (l'utilisateur gère
+#     ses commits) — même écart assumé que Libry.
+#   * Aucune interpolation `${{ }}` directement dans les scripts shell : tout
+#     passe par `env:`, avec `set -euo pipefail` et des garde-fous `::error::`
+#     explicites (échec bruyant).
+# =============================================================================

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="neutre-dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <title>Switchy</title>
+  <meta name="description" content="Switchy — passerelle LLM centralisée de l'écosystème holaf." />
+  <link rel="icon" href="data:," />
+
+  <!-- Marqueur inerte exigé par le garde d'idempotence de la brique `tokens`
+       (elle n'injecte alors AUCUNE balise <style> — tout le CSS est servi en
+       fichiers, compatible CSP style-src 'self'). -->
+  <meta id="holaf-tokens-style" />
+
+  <link rel="stylesheet" href="styles.css" />
+  <!-- CSS des briques extraits via getCss() (scripts/extract-holaf-css.mjs). -->
+  <link rel="stylesheet" href="vendor/holaf/holaf-modal.css" />
+  <link rel="stylesheet" href="vendor/holaf/holaf-toast.css" />
+
+  <!-- Brique FONDATION `tokens` : la SEULE autorisée à poser les variables
+       --holaf-* sur :root. Script classique (aucun export ESM) et SYNCHRONE :
+       le thème est posé avant le premier rendu. -->
+  <script src="vendor/holaf/holaf-tokens.js"></script>
+  <script>
+    /*
+     * Boot du thème — INLINE et SYNCHRONE (anti-flash) : lit `localStorage`
+     * (« switchy.theme », défaut `neutre-dark`), migre les anciens noms via
+     * HolafTokens.MIGRATIONS et pose le preset AVANT le premier rendu.
+     * Toute erreur est non bloquante : les alias de styles.css portent un
+     * repli hexadécimal, le rendu reste lisible sans la brique.
+     */
+    (() => {
+      "use strict";
+      const KEY = "switchy.theme";
+      const DEFAULT = "neutre-dark";
+      const tokens = window.HolafTokens;
+      if (!tokens) return;
+      try {
+        const stored = window.localStorage.getItem(KEY);
+        const value = (stored && tokens.MIGRATIONS[stored]) || stored || DEFAULT;
+        tokens.setTheme(value);
+        document.documentElement.setAttribute("data-theme", value);
+        if (stored && stored !== value) window.localStorage.setItem(KEY, value);
+      } catch {
+        /* Valeur stockée illisible (mode privé) ou preset inconnu : défaut. */
+        try {
+          tokens.setTheme(DEFAULT);
+          document.documentElement.setAttribute("data-theme", DEFAULT);
+        } catch {
+          /* Brique indisponible : le repli hexadécimal de styles.css s'applique. */
+        }
+      }
+    })();
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <div class="brand-text">
+        <h1>Switchy</h1>
+        <p>Passerelle LLM — services nommés, replis &amp; journal</p>
+      </div>
+    </div>
+
+    <!-- Sélecteur de thème (familles × mode) : rempli par app.js depuis
+         HolafTokens.listFamilies(). Masqué tant que la brique n'est pas là. -->
+    <div class="theme-control" id="theme-control" hidden>
+      <label class="sr-only" for="theme-family">Famille de thème</label>
+      <select id="theme-family" name="theme-family"></select>
+      <button type="button" id="theme-toggle" class="theme-toggle"
+              aria-label="Basculer entre clair et sombre"
+              title="Basculer entre clair et sombre"></button>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Sections de l'interface">
+      <button type="button" class="tab is-active" role="tab" id="tab-services"
+              data-tab="services" aria-selected="true" aria-controls="panel-services">
+        Services
+      </button>
+      <button type="button" class="tab" role="tab" id="tab-settings"
+              data-tab="settings" aria-selected="false" aria-controls="panel-settings">
+        Réglages
+      </button>
+    </nav>
+  </header>
+
+  <main class="content">
+    <section class="panel" id="panel-services" role="tabpanel" aria-labelledby="tab-services">
+      <header class="panel-head">
+        <h2>Services LLM</h2>
+        <p class="panel-hint">Les services nommés exposés aux autres projets
+          (principal, replis ordonnés, limites) seront listés ici ; les clients
+          appelleront le nom du service, jamais un modèle de fournisseur.</p>
+      </header>
+
+      <!-- Zone préparée pour le Lot 2 (cœur de la passerelle) : aucun contenu
+           métier pour l'instant, seulement l'état vide. -->
+      <div class="card">
+        <p class="empty" id="services-empty">Aucun service pour l'instant. La
+          configuration des services arrive avec le cœur de la passerelle.</p>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <header class="panel-head">
+        <h2>Réglages</h2>
+        <p class="panel-hint">Configuration du service, sans édition de fichier :
+          fournisseurs et clés, limites, journal d'appels.</p>
+      </header>
+
+      <!-- Zone préparée pour le Lot 2 (réglages + secrets jamais réaffichés).
+           Aucun contenu métier pour l'instant. -->
+      <div class="card">
+        <p class="empty" id="settings-empty">La configuration arrive avec le
+          cœur de la passerelle.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Switchy — service de l'écosystème holaf</span>
+    <span class="muted">Port 3008 · aucune obligation : chaque projet peut rester en direct.</span>
+  </footer>
+
+  <!-- Briques holaf-lib vendorisées (copiées VERBATIM par le CLI de la
+       librairie ; versions et empreintes dans vendor/holaf/). Chargées en
+       MODULES : ces fichiers sont « dual » (export ESM + global window.*) —
+       un <script> classique échouerait sur leur `export` top-level. Les
+       modules s'exécutent dans l'ordre du document, app.js en dernier. -->
+  <script type="module" src="vendor/holaf/holaf-icons.js"></script>
+  <script type="module" src="vendor/holaf/holaf-modal.js"></script>
+  <script type="module" src="vendor/holaf/holaf-toast.js"></script>
+  <script type="module" src="vendor/holaf/holaf-fetch.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

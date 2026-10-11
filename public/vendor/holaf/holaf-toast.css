@@ -1,0 +1,221 @@
+
+.holaf-toast-container {
+    position: fixed;
+    z-index: 200000;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    pointer-events: none;
+    max-width: calc(100vw - 24px);
+    --ht-bg: #171717;
+    --ht-fg: #f1f1f6;
+    --ht-border: #4a4a4d;
+    --ht-accent-info: #a1a3ff;
+    --ht-accent-success: #34d399;
+    --ht-accent-warning: #fbbf24;
+    --ht-accent-error: #f87171;
+    --ht-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+    --ht-radius: 10px;
+    --ht-width: 340px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.holaf-toast-container--top-right    { top: 16px; right: 16px; align-items: flex-end; }
+.holaf-toast-container--top-left     { top: 16px; left: 16px; align-items: flex-start; }
+.holaf-toast-container--bottom-right { bottom: 16px; right: 16px; align-items: flex-end; }
+.holaf-toast-container--bottom-left  { bottom: 16px; left: 16px; align-items: flex-start; }
+.holaf-toast-container--top-center   { top: 16px; left: 50%; transform: translateX(-50%); align-items: center; }
+.holaf-toast-container--bottom-center { bottom: 16px; left: 50%; transform: translateX(-50%); align-items: center; }
+
+.holaf-toast {
+    pointer-events: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    width: var(--ht-width);
+    max-width: 100%;
+    padding: 12px 14px;
+    background: var(--ht-bg);
+    color: var(--ht-fg);
+    border: 1px solid var(--ht-border);
+    border-left: 4px solid var(--ht-accent, var(--ht-accent-info));
+    border-radius: var(--ht-radius);
+    box-shadow: var(--ht-shadow);
+    position: relative;
+    overflow: hidden;
+    cursor: default;
+    animation: holaf-toast-slide-in 0.25s ease-out;
+}
+/* v0.5.0 : animation d'entrée ADAPTÉE à la position — le slide part du côté
+ * du bord auquel colle le conteneur. La règle de base .holaf-toast garde
+ * holaf-toast-slide-in (glisse DEPUIS le haut, couvre top-center) ; les
+ * variantes ci-dessous ne surchargent que les autres positions (même nom de
+ * keyframe homonyme conservé comme base). PAS de fill-mode d'entrée : la cible
+ * to du keyframe (opacity:1 + transform) garantit l'état final (bug
+ * historique évité — sans fill-mode, un toast interrompu retombait opacity:0). */
+.holaf-toast-container--top-right .holaf-toast,
+.holaf-toast-container--bottom-right .holaf-toast { animation: holaf-toast-slide-in-right 0.25s ease-out; }
+.holaf-toast-container--top-left .holaf-toast,
+.holaf-toast-container--bottom-left .holaf-toast { animation: holaf-toast-slide-in-left 0.25s ease-out; }
+.holaf-toast-container--bottom-center .holaf-toast { animation: holaf-toast-slide-in-up 0.25s ease-out; }
+/* v0.4.0 : fond teinté PAR TYPE avec fallback rétro-compatible. La règle de
+ * base ci-dessus pose background:var(--ht-bg) ; chaque type la raffine avec
+ * SA var optionnelle : si --ht-bg-<type> n'est pas définie (thèmes existants,
+ * hôtes anciens), le fond global --ht-bg s'applique. La substitution des
+ * custom properties se fait sur l'élément lui-même : un --ht-bg posé en
+ * inline (override par toast) l'emporte dans la chaîne de fallback, et un
+ * --ht-bg-<type> en inline (par toast ou via theme.vars) gagne sur tout. */
+.holaf-toast--info    { --ht-accent: var(--ht-accent-info);    background: var(--ht-bg-info, var(--ht-bg)); }
+.holaf-toast--success { --ht-accent: var(--ht-accent-success); background: var(--ht-bg-success, var(--ht-bg)); }
+.holaf-toast--warning { --ht-accent: var(--ht-accent-warning); background: var(--ht-bg-warning, var(--ht-bg)); }
+.holaf-toast--error   { --ht-accent: var(--ht-accent-error);   background: var(--ht-bg-error, var(--ht-bg)); }
+
+.holaf-toast--closing {
+    animation: holaf-toast-fade-out 0.2s ease-in forwards;
+}
+/* v0.5.0 : sortie en fondu ADAPTÉE à la position — le toast part du même côté
+ * que son entrée. Base holaf-toast-fade-out (vers le haut, top-center) ;
+ * variantes pour les autres positions. forwards conservé (état final tenu). */
+.holaf-toast-container--top-right .holaf-toast--closing,
+.holaf-toast-container--bottom-right .holaf-toast--closing { animation: holaf-toast-fade-out-right 0.2s ease-in forwards; }
+.holaf-toast-container--top-left .holaf-toast--closing,
+.holaf-toast-container--bottom-left .holaf-toast--closing { animation: holaf-toast-fade-out-left 0.2s ease-in forwards; }
+.holaf-toast-container--bottom-center .holaf-toast--closing { animation: holaf-toast-fade-out-down 0.2s ease-in forwards; }
+
+.holaf-toast__icon {
+    flex: none;
+    font-weight: 700;
+    color: var(--ht-accent);
+    line-height: 1.4;
+}
+.holaf-toast__body { flex: 1 1 auto; min-width: 0; }
+.holaf-toast__title {
+    font-weight: 650;
+    margin-bottom: 2px;
+    font-size: 14px;
+}
+.holaf-toast__message {
+    font-size: 13px;
+    line-height: 1.45;
+    overflow-wrap: break-word;
+}
+.holaf-toast__actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+.holaf-toast__action {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--ht-border);
+    background: transparent;
+    color: var(--ht-fg);
+    cursor: pointer;
+}
+.holaf-toast__action:hover { border-color: var(--ht-accent); color: var(--ht-accent); }
+
+.holaf-toast__close {
+    flex: none;
+    border: none;
+    background: transparent;
+    color: var(--ht-fg);
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 4px;
+    cursor: pointer;
+    opacity: 0.7;
+}
+.holaf-toast__close:hover { opacity: 1; }
+
+.holaf-toast__progress {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 3px;
+    width: 100%;
+    background: var(--ht-accent);
+    transform-origin: left center;
+    transform: scaleX(1);
+    opacity: 0.85;
+    /* Barre ANIMÉE en temps réel : la durée est posée inline (ms) par le JS,
+     * la barre part pleine (scaleX(1)) et se vide (scaleX(0)) en duration.
+     * animation gère le nom + la courbe temporelle ; la durée vient du style
+     * inline (prioritaire) pour rester synchro avec le timer d'auto-dismiss. */
+    animation: holaf-toast-progress linear;
+}
+/* Au survol, on gèle la barre à sa position courante via play-state:paused
+ * (l'animation CSS se met naturellement en pause, contrairement à l'ancien
+ * scaleX inline figé — temps de barre et timer restant restent synchrones). */
+.holaf-toast__progress--paused {
+    animation-play-state: paused;
+}
+/* Progression MANUELLE (v0.3.0) : show({ progress: 'manual' }) → barre visible
+ * (largeur 0) pilotée par update({ progress: 0-100 }) ; pas d'animation, pas
+ * de timer de fermeture auto. La largeur est posée inline (N%). */
+.holaf-toast__progress--manual {
+    animation: none;
+    transform: none;
+    width: 0%;
+}
+@keyframes holaf-toast-progress {
+    from { transform: scaleX(1); }
+    to   { transform: scaleX(0); }
+}
+
+/* Animations (désactivées si prefers-reduced-motion). */
+/* prefers-reduced-motion : la barre reste VISIBLE mais statique (pleine, sans
+ * animation) — le timer en JS ferme toujours le toast ; seule l'illusion de
+ * mouvements est supprimée. On garde un repère visuel stable et non animé. */
+@keyframes holaf-toast-slide-in {
+    from { opacity: 0; transform: translateY(-10px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+/* v0.5.0 : variantes d'entrée par position (homonyme de base conservé). */
+@keyframes holaf-toast-slide-in-right {
+    from { opacity: 0; transform: translateX(24px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes holaf-toast-slide-in-left {
+    from { opacity: 0; transform: translateX(-24px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes holaf-toast-slide-in-up {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes holaf-toast-fade-out {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateY(-6px); }
+}
+/* v0.5.0 : variantes de sortie par position (homonyme de base conservé). */
+@keyframes holaf-toast-fade-out-right {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateX(24px); }
+}
+@keyframes holaf-toast-fade-out-left {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateX(-24px); }
+}
+@keyframes holaf-toast-fade-out-down {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateY(8px); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .holaf-toast, .holaf-toast--closing { animation: none; }
+    .holaf-toast__progress { animation: none; }
+}
+
+/* Mobile : pleine largeur en bas (les 6 positions convergent). */
+@media (max-width: 600px) {
+    .holaf-toast-container {
+        left: 8px !important;
+        right: 8px !important;
+        top: auto !important;
+        bottom: 8px !important;
+        transform: none !important;
+        align-items: stretch;
+        --ht-width: 100%;
+    }
+}

@@ -1,0 +1,307 @@
+/* Switchy — habillage du socle statique.
+   DOCTRINE « ALIAS + REPLI » (comme Pi-Web et Libry) : les variables locales
+   sont des ALIAS des jetons --holaf-* posés au runtime par la brique `tokens`
+   (seule autorisée à écrire sur :root). Le 2e argument de var() est le REPLI
+   historique : sans la brique (JS indisponible), le rendu reste lisible.
+   Les transparences passent par color-mix() : AUCUN triplet RGB calculé en JS
+   (aucune écoute de `holaf-tokens-changed` nécessaire).
+
+   MISE EN PAGE : PLEINE LARGEUR exigée — jamais de colonne étroite centrée
+   (aucun `max-width` ni `margin: 0 auto` sur `.content`). */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces, bordures, textes, accent, danger ← jetons holaf. */
+  --switchy-bg: var(--holaf-surface, #0b0e14);
+  --switchy-bg-raised: var(--holaf-surface-raised, #131826);
+  --switchy-bg-hover: var(--holaf-surface-hover, #1a2133);
+  --switchy-border: var(--holaf-border, #26304a);
+  --switchy-text: var(--holaf-text, #e6eaf2);
+  --switchy-text-muted: var(--holaf-text-muted, #93a0b8);
+  --switchy-accent: var(--holaf-accent, #5aa9ff);
+  --switchy-danger: var(--holaf-danger, #ff6b6b);
+  --switchy-radius: var(--holaf-radius, 10px);
+
+  /* Fond accentué translucide : repli rgba() puis color-mix() (dérivé de
+     l'accent courant, toutes familles confondues). */
+  --switchy-accent-soft: rgba(90, 169, 255, 0.14);
+  --switchy-accent-soft: color-mix(in srgb, var(--switchy-accent) 14%, transparent);
+
+  --switchy-gap: 16px;
+}
+
+/* Le mode clair du thème (preset <famille>-light) pilote le color-scheme des
+   contrôles natifs — même source que les icônes clair/sombre. */
+html[data-theme$="-light"] {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--switchy-bg);
+  color: var(--switchy-text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ── Accessibilité (masqué à l'œil, lisible au lecteur d'écran) ───────── */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.muted {
+  color: var(--switchy-text-muted);
+}
+
+/* ── En-tête ─────────────────────────────────────────────────────────── */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--switchy-gap);
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--switchy-border);
+  background: var(--switchy-bg-raised);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--switchy-radius);
+  background: var(--switchy-accent-soft);
+  border: 1px solid var(--switchy-border);
+  color: var(--switchy-accent);
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.brand-text h1 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0.02em;
+}
+
+.brand-text p {
+  margin: 0;
+  color: var(--switchy-text-muted);
+  font-size: 12.5px;
+}
+
+/* ── Sélecteur de thème ──────────────────────────────────────────────── */
+
+.theme-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.theme-control select {
+  appearance: none;
+  padding: 7px 12px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 3px);
+  background: var(--switchy-bg);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.theme-control select:focus-visible,
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--switchy-accent);
+  outline-offset: 1px;
+}
+
+.theme-toggle {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 3px);
+  background: var(--switchy-bg);
+  color: var(--switchy-text-muted);
+  cursor: pointer;
+}
+
+.theme-toggle:hover {
+  background: var(--switchy-bg-hover);
+  color: var(--switchy-text);
+}
+
+.theme-toggle .icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* Une seule icône visible selon le mode : soleil en clair, lune en sombre. */
+.theme-toggle .icon--sun {
+  display: none;
+}
+
+html[data-theme$="-light"] .theme-toggle .icon--sun {
+  display: block;
+}
+
+html[data-theme$="-light"] .theme-toggle .icon--moon {
+  display: none;
+}
+
+/* ── Onglets ─────────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 3px);
+  padding: 3px;
+  background: var(--switchy-bg);
+}
+
+.tab {
+  padding: 6px 14px;
+  border: 0;
+  border-radius: calc(var(--switchy-radius) - 5px);
+  background: transparent;
+  color: var(--switchy-text-muted);
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--switchy-text);
+}
+
+.tab.is-active {
+  background: var(--switchy-accent-soft);
+  color: var(--switchy-accent);
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--switchy-accent);
+  outline-offset: 1px;
+}
+
+/* ── Contenu — PLEINE LARGEUR (jamais de colonne centrée) ────────────── */
+
+.content {
+  width: 100%;
+  flex: 1;
+  padding: 22px;
+}
+
+.panel {
+  width: 100%;
+}
+
+.panel-head {
+  margin-bottom: 14px;
+}
+
+.panel-head h2 {
+  margin: 0 0 2px;
+  font-size: 17px;
+}
+
+.panel-hint {
+  margin: 0;
+  color: var(--switchy-text-muted);
+  font-size: 13.5px;
+}
+
+/* ── Cartes ───────────────────────────────────────────────────────────── */
+
+.card {
+  width: 100%;
+  padding: 16px;
+  border: 1px solid var(--switchy-border);
+  border-radius: var(--switchy-radius);
+  background: var(--switchy-bg-raised);
+}
+
+.card + .card {
+  margin-top: var(--switchy-gap);
+}
+
+.card-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.empty {
+  margin: 0;
+  padding: 18px 0;
+  text-align: center;
+  color: var(--switchy-text-muted);
+}
+
+/* ── Pied de page ─────────────────────────────────────────────────────── */
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 22px;
+  border-top: 1px solid var(--switchy-border);
+  background: var(--switchy-bg-raised);
+  color: var(--switchy-text-muted);
+  font-size: 12.5px;
+}
+
+/* ── Petits écrans ────────────────────────────────────────────────────── */
+
+@media (max-width: 719px) {
+  .topbar {
+    justify-content: flex-start;
+  }
+
+  .theme-control {
+    order: 3;
+    margin-left: 0;
+  }
+
+  .tabs {
+    order: 2;
+  }
+}

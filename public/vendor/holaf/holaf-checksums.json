@@ -1,0 +1,30 @@
+{
+  "$comment": "GÉNÉRÉ par scripts/generate-holaf-checksums.mjs — empreintes pinnées des briques holaf-lib vendorisées (ne pas éditer à la main).",
+  "bricks": {
+    "tokens": {
+      "file": "holaf-tokens.js",
+      "version": "0.6.0",
+      "sha256": "bb03b44afd57bc3e0076045e2c73bb289dda2a930d107de6e2bf582569f9b345"
+    },
+    "icons": {
+      "file": "holaf-icons.js",
+      "version": "0.1.6",
+      "sha256": "fa49cdf330774e1a3215dda4dfe2aae65919bc3e7e66ea61d4f2b90d5cd8f6a5"
+    },
+    "modal": {
+      "file": "holaf-modal.js",
+      "version": "0.7.0",
+      "sha256": "8b8cfe0153ff747cab25cea87ef28eb9156e0f38119809ff9a9f26b6ad817d1a"
+    },
+    "toast": {
+      "file": "holaf-toast.js",
+      "version": "0.8.0",
+      "sha256": "54b625a50164ff8c9749bb568db31ba720fe043a362cd6c93afd1f2f4d3a486a"
+    },
+    "fetch": {
+      "file": "holaf-fetch.js",
+      "version": "0.2.0",
+      "sha256": "585e9a0d608db6bfe02a7f6e141a3cd125fe7aafbb1e458f5b73d983b02ee3ba"
+    }
+  }
+}
