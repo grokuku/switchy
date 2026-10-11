@@ -30,6 +30,9 @@ COPY --from=build /app/dist ./dist
 # Interface web statique (HTML/CSS/JS, sans étape de build) : copiée AVANT le
 # chown pour que l'utilisateur non-root puisse la lire.
 COPY public ./public
+# Outil de SECOURS de réinitialisation du mot de passe admin (accès machine
+# requis ; aucune route HTTP — voir README « Mot de passe administrateur »).
+COPY scripts/reset-admin-password.mjs ./scripts/reset-admin-password.mjs
 
 # Utilisateur NON-ROOT (uid fixe). Le répertoire de données lui appartient :
 # Switchy n'écrit que dans SON volume, jamais dans celui d'un autre service.

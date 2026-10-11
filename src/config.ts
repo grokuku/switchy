@@ -50,9 +50,9 @@ export function getKeysFile(): string {
 }
 
 /**
- * Clé d'API d'amorçage fournie par l'environnement ou le fichier (secret). Tant
- * qu'aucune clé n'existe (ni ici, ni dans le fichier de clés), l'API est OUVERTE
- * — c'est ce qui permet de tout configurer depuis l'interface (v1).
+ * Clé d'API optionnelle fournie par l'environnement (secret), acceptée pour les
+ * OUTILS en plus des clés nommées créées depuis l'interface. Aucun « mode
+ * amorçage » : sans clé valide NI session admin, l'API répond 401.
  */
 export function getApiKey(): string {
   return readEnv("SWITCHY_API_KEY", "");

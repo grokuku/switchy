@@ -23,8 +23,9 @@
  * (fournisseurs, services) vivent dans leur propre fichier — voir
  * `catalog-store.ts` : ce n'est PAS un réglage, c'est une collection versionnable.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, chmodSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, chmodSync, statSync, accessSync, constants } from "fs";
 import path from "path";
+import { ApiError } from "./utils/api-error.js";
 
 // ── Emplacement (résolu depuis l'environnement SEUL) ──
 
@@ -88,6 +89,24 @@ export function resetSettingsCache(): void {
   cache = null;
 }
 
+/**
+ * Diagnostic du dossier de données (utilisé au démarrage) : le répertoire
+ * existe-t-il et est-il accessible en ÉCRITURE ? Ne lève jamais : renvoie l'état
+ * pour que l'appelant logue un avertissement clair plutôt que de planter au
+ * premier enregistrement. Crée le dossier s'il manque (comme `writeSettings`).
+ */
+export function checkDataDir(): { dir: string; ok: boolean; error?: string } {
+  const dir = envDataDir();
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    accessSync(dir, constants.W_OK);
+    return { dir, ok: true };
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code ?? String(e);
+    return { dir, ok: false, error: code };
+  }
+}
+
 // ── Réglages non fournissables par le fichier ──
 
 /** Réglages dont la valeur ne peut venir QUE de l'environnement. */
@@ -132,8 +151,21 @@ function ensureConfigDir(): string {
  * Applique des mises à jour au fichier de réglages. `null` EFFACE l'entrée
  * (retour à l'env / au défaut) ; une chaîne la définit. Écriture atomique 0600.
  */
+/**
+ * Erreur d'écriture du fichier de réglages, TYPÉE (503 `STORAGE_NOT_WRITABLE`).
+ * Sans cette typisation, une écriture impossible (volume absent, mauvais
+ * propriétaire, lecture seule) remontait en 500 HTML opaque — et l'interface la
+ * présentait comme « mot de passe incorrect », ce qui masquait la vraie cause.
+ */
+function storageWriteError(file: string, err: unknown): ApiError {
+  const code = (err as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
+  return ApiError.storage(
+    `Cannot write "${file}" (${code}). Ensure $SWITCHY_DATA_DIR exists and is writable by the ` +
+      `Switchy user (in Docker: uid 10001 — chown -R 10001:10001 on the data folder).`,
+  );
+}
+
 export function writeSettings(updates: Record<string, string | null>): SettingsObject {
-  ensureConfigDir();
   const file = settingsFilePath();
   const next: SettingsObject = { ...readSettingsFile() };
   for (const [name, value] of Object.entries(updates)) {
@@ -143,8 +175,13 @@ export function writeSettings(updates: Record<string, string | null>): SettingsO
   const sorted: SettingsObject = {};
   for (const key of Object.keys(next).sort()) sorted[key] = next[key];
   const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(sorted, null, 2), { mode: 0o600 });
-  renameSync(tmp, file);
+  try {
+    ensureConfigDir();
+    writeFileSync(tmp, JSON.stringify(sorted, null, 2), { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch (e) {
+    throw storageWriteError(file, e);
+  }
   cache = null;
   return sorted;
 }

@@ -10,12 +10,15 @@
  * comptage global des appels en vol, journal d'appels) se montera sous
  * `/api/*`, AVANT le service statique — jamais l'inverse.
  */
-import express, { type Request, type Response } from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import rateLimit from "express-rate-limit";
 import { readFileSync } from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getHost, getPort, getRateLimitPerMin } from "./config.js";
 import { catalogCounts } from "./catalog-store.js";
+import { checkDataDir } from "./settings-store.js";
+import { describeAdminPasswordState } from "./session-store.js";
+import { errorBody } from "./utils/api-error.js";
 import { requireApiAuth } from "./middleware/api-auth.js";
 import sessionRouter from "./routes/session.js";
 import providersRouter from "./routes/providers.js";
@@ -98,6 +101,19 @@ export function createApp(): express.Express {
   const publicDir = fileURLToPath(new URL("../public", import.meta.url));
   app.use(express.static(publicDir));
 
+  // ── Erreurs TOUJOURS en JSON ──
+  // Sans ce gestionnaire, une exception hors d'une route (ex. écriture
+  // impossible dans le dossier de données) produisait une page HTML 500
+  // « Error: EACCES… » que l'interface ne savait pas lire : elle l'affichait
+  // comme « mot de passe incorrect ». Ici, toute erreur devient un corps JSON
+  // { error, code } homogène (503 STORAGE_NOT_WRITABLE compris).
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    const { status, body } = errorBody(err);
+    if (status >= 500) console.error("[switchy] request failed:", err);
+    res.status(status).json(body);
+  });
+
   return app;
 }
 
@@ -108,6 +124,17 @@ const isDirectRun = process.argv[1] ? import.meta.url === pathToFileURL(process.
 if (isDirectRun) {
   const port = getPort();
   const host = getHost();
+  const dataDir = checkDataDir();
+  if (dataDir.ok) {
+    console.log(`[switchy] data dir: ${dataDir.dir}`);
+  } else {
+    console.warn(
+      `[switchy] WARNING: data directory "${dataDir.dir}" is not writable (${dataDir.error}). ` +
+        `Login and saving settings WILL FAIL. Fix ownership/permissions ` +
+        `(Docker: chown -R 10001:10001 on the data folder).`,
+    );
+  }
+  console.log(`[switchy] admin password: ${describeAdminPasswordState()}`);
   app.listen(port, host, () => {
     console.log(`[switchy] listening on http://${host}:${port} (version ${version})`);
   });

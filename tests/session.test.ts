@@ -7,12 +7,22 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { makeTestEnv, createApiKey, type TestEnv } from "./helpers.js";
 import {
   SESSION_COOKIE,
   CSRF_COOKIE,
   DEFAULT_ADMIN_PASSWORD,
+  getStoredPasswordHash,
 } from "../src/session-store.js";
+import { verifySecretHash } from "../src/utils/secret-hash.js";
+import { resetSettingsCache } from "../src/settings-store.js";
+
+const RESET_SCRIPT = fileURLToPath(new URL("../scripts/reset-admin-password.mjs", import.meta.url));
 
 let env: TestEnv;
 let agent: ReturnType<typeof request.agent>;
@@ -199,5 +209,141 @@ describe("clés d'API des outils — contrat inchangé", () => {
       settings: { SWITCHY_CONCURRENCY: "5" },
     });
     expect(csrfCookieMissing.status).toBe(200);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// LE cas qui manquait : « première utilisation » = dossier de données neuf,
+// aucun hash stocké → le mot de passe par défaut `admin` DOIT être accepté.
+// ────────────────────────────────────────────────────────────────────────────
+describe("première utilisation (dossier de données neuf)", () => {
+  it("aucun hash stocké → `admin` accepté (le défaut s'applique)", async () => {
+    expect(getStoredPasswordHash()).toBeNull();
+    const { csrfToken } = await sessionState();
+    const res = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    expect(res.status).toBe(200);
+    expect(res.body.authenticated).toBe(true);
+    expect(res.body.passwordIsDefault).toBe(true);
+  });
+
+  it("dès qu'un mot de passe a été changé, `admin` n'est plus accepté (le dossier persiste)", async () => {
+    const { csrfToken } = await sessionState();
+    const lg = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    const changed = await agent
+      .post("/api/session/password")
+      .set("X-CSRF-Token", lg.body.csrfToken as string)
+      .send({ current: DEFAULT_ADMIN_PASSWORD, next: "change-une-fois" });
+    expect(changed.status).toBe(200);
+
+    const after = await sessionState();
+    const ko = await login(DEFAULT_ADMIN_PASSWORD, after.csrfToken);
+    expect(ko.status).toBe(401);
+    expect(ko.body.code).toBe("INVALID_PASSWORD");
+    // Message NON trompeur : on explique POURQUOI le défaut ne s'applique plus.
+    expect(typeof ko.body.hint).toBe("string");
+  });
+});
+
+describe("rate-limit du login — message distinct du 401", () => {
+  it("5 échecs → 6e tentative en 429 LOGIN_RATE_LIMITED (jamais 401 trompeur)", async () => {
+    const { csrfToken } = await sessionState();
+    for (let i = 0; i < 5; i += 1) {
+      const res = await login("faux", csrfToken);
+      expect(res.status).toBe(401);
+      expect(res.body.code).toBe("INVALID_PASSWORD");
+    }
+    const blocked = await login("faux", csrfToken);
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.code).toBe("LOGIN_RATE_LIMITED");
+    // Même le BON mot de passe est refusé tant que la fenêtre court : le code
+    // 429 + son message disent clairement que ce n'est PAS un mot de passe faux.
+    const correctButLimited = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    expect(correctButLimited.status).toBe(429);
+    expect(correctButLimited.body.code).toBe("LOGIN_RATE_LIMITED");
+  });
+
+  it("une connexion RÉUSSIE ne consomme pas le quota (5 succès d'affilée → toujours 200)", async () => {
+    for (let i = 0; i < 5; i += 1) {
+      const state = await sessionState();
+      const res = await login(DEFAULT_ADMIN_PASSWORD, state.csrfToken);
+      expect(res.status).toBe(200);
+    }
+    const state = await sessionState();
+    const sixth = await login(DEFAULT_ADMIN_PASSWORD, state.csrfToken);
+    expect(sixth.status).toBe(200);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Régression : dossier de données NON inscriptible (volume recréé par Docker en
+// root alors que le service tourne en uid 10001). L'ancien comportement était un
+// 500 HTML opaque, affiché par l'interface comme « Mot de passe incorrect. » —
+// c'est exactement ce qui faisait croire que le mot de passe par défaut ne
+// marchait pas. Désormais : 503 JSON STORAGE_NOT_WRITABLE, cause explicite.
+// ────────────────────────────────────────────────────────────────────────────
+describe("dossier de données non inscriptible", () => {
+  it("login → 503 STORAGE_NOT_WRITABLE en JSON (jamais un 500 HTML opaque)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "switchy-bad-dir-"));
+    const blocker = join(root, "not-a-directory");
+    writeFileSync(blocker, "x");
+    const bad = makeTestEnv({ SWITCHY_DATA_DIR: join(blocker, "data") });
+    try {
+      const ag = request.agent(bad.app);
+      const state = await ag.get("/api/session");
+      expect(state.status).toBe(200);
+      const res = await ag
+        .post("/api/session/login")
+        .set("X-CSRF-Token", state.body.csrfToken as string)
+        .send({ password: DEFAULT_ADMIN_PASSWORD });
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe("STORAGE_NOT_WRITABLE");
+      expect(String(res.headers["content-type"])).toContain("json");
+    } finally {
+      bad.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Procédure de secours documentée (accès machine requis, aucune route HTTP).
+// ────────────────────────────────────────────────────────────────────────────
+describe("scripts/reset-admin-password.mjs", () => {
+  it("restaure le défaut `admin` sur un dossier où le mot de passe a été changé", async () => {
+    const { csrfToken } = await sessionState();
+    const lg = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    await agent
+      .post("/api/session/password")
+      .set("X-CSRF-Token", lg.body.csrfToken as string)
+      .send({ current: DEFAULT_ADMIN_PASSWORD, next: "mot-de-passe-perdu" });
+
+    const afterChange = await sessionState();
+    expect((await login(DEFAULT_ADMIN_PASSWORD, afterChange.csrfToken)).status).toBe(401);
+
+    execFileSync(process.execPath, [RESET_SCRIPT], { env: { ...process.env }, stdio: "pipe" });
+    resetSettingsCache();
+    expect(getStoredPasswordHash()).toBeNull();
+
+    const restored = await sessionState();
+    const ok = await login(DEFAULT_ADMIN_PASSWORD, restored.csrfToken);
+    expect(ok.status).toBe(200);
+    expect(ok.body.passwordIsDefault).toBe(true);
+  });
+
+  it("`--password` écrit un hash reconnu par verifySecretHash de l'application", async () => {
+    execFileSync(process.execPath, [RESET_SCRIPT, "--password", "Repare-2026"], {
+      env: { ...process.env },
+      stdio: "pipe",
+    });
+    resetSettingsCache();
+    const stored = getStoredPasswordHash();
+    expect(stored).not.toBeNull();
+    expect(verifySecretHash("Repare-2026", stored as string)).toBe(true);
+    expect(verifySecretHash(DEFAULT_ADMIN_PASSWORD, stored as string)).toBe(false);
+
+    const state = await sessionState();
+    expect((await login("Repare-2026", state.csrfToken)).status).toBe(200);
+    // Le hash n'est JAMAIS stocké en clair ni réaffiché.
+    expect(readFileSync(join(env.dir, "config.json"), "utf-8")).not.toContain("Repare-2026");
   });
 });

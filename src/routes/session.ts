@@ -33,16 +33,21 @@ import {
 const router = Router();
 
 // ── Rate-limit DÉDIÉ du login (anti-force brute) ──
-// 5 tentatives/min/IP. Store dédié, réinitialisable en test.
+// 5 ÉCHECS/min/IP. `skipSuccessfulRequests` est essentiel : une connexion
+// RÉUSSIE ne doit pas consommer le quota — sinon un utilisateur qui se connecte
+// 5 fois dans la minute finissait bloqué (429) alors que son mot de passe était
+// BON, et croyait que « le mot de passe ne marche pas ». Store dédié,
+// réinitialisable en test.
 const LOGIN_RATE_LIMIT = 5;
 const loginStore = new MemoryStore();
 const loginRateLimiter = rateLimit({
   store: loginStore,
   windowMs: 60_000,
   limit: LOGIN_RATE_LIMIT,
+  skipSuccessfulRequests: true,
   standardHeaders: "draft-7",
   legacyHeaders: false,
-  message: { error: "Too many login attempts, try again later", code: "LOGIN_RATE_LIMITED" },
+  message: { error: "Too many failed login attempts, try again later", code: "LOGIN_RATE_LIMITED" },
 });
 
 /** Réinitialise le compteur du rate-limit de login (outil de test). */
@@ -62,7 +67,11 @@ router.post("/login", loginRateLimiter, requireCsrf, (req: Request, res: Respons
     return res.status(400).json({ error: "password is required" });
   }
   if (!verifyAdminPassword(password)) {
-    return res.status(401).json({ error: "Invalid password", code: "INVALID_PASSWORD" });
+    return res.status(401).json({
+      error: "Invalid password",
+      code: "INVALID_PASSWORD",
+      hint: "The default password 'admin' is only accepted while NO password has been set in the data directory.",
+    });
   }
   const session = issueSession();
   const ttl = getSessionTtlSeconds();

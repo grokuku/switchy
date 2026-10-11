@@ -32,6 +32,18 @@ export class ApiError extends Error {
   static conflict(message: string): ApiError {
     return new ApiError(409, "CONFLICT", message);
   }
+
+  /**
+   * 503 `STORAGE_NOT_WRITABLE` : le dossier de données n'existe pas ou n'est pas
+   * accessible en écriture (volume absent, mauvais propriétaire, lecture seule).
+   * Cas typique : dossier de volume recréé par Docker en root alors que le
+   * service tourne en uid 10001 → l'écriture du secret de session échoue.
+   * L'erreur BRUTE ne doit jamais remonter en HTML opaque : elle est typée pour
+   * que l'interface affiche la VRAIE cause (et non « mot de passe incorrect »).
+   */
+  static storage(message: string): ApiError {
+    return new ApiError(503, "STORAGE_NOT_WRITABLE", message);
+  }
 }
 
 /** Sérialise une erreur inconnue en réponse JSON homogène. */

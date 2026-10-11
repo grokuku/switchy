@@ -132,6 +132,19 @@ export function verifyAdminPassword(candidate: string): boolean {
 }
 
 /**
+ * Diagnostic NON secret de l'état du mot de passe (journal de démarrage).
+ * Ne révèle jamais le mot de passe ni son hash : sert uniquement à rendre la
+ * cause d'un échec de connexion visible dans les logs du conteneur.
+ */
+export function describeAdminPasswordState(): string {
+  const hash = getStoredPasswordHash();
+  if (!hash) return "default ('admin' accepted — no hash stored yet)";
+  return isPasswordDefault()
+    ? "default ('admin' still accepted — a hash of it is stored)"
+    : "custom (a CHANGED password is stored in the data dir; 'admin' no longer works)";
+}
+
+/**
  * Change le mot de passe admin : écrit le nouveau hash ET incrémente l'époque,
  * ce qui invalide TOUTES les sessions déjà émises.
  */

@@ -210,7 +210,7 @@ export function recordUsage(id: string): void {
   saveKeys(keys);
 }
 
-// ── Mode amorçage ──
+// ── Caches ──
 
 /** Réinitialise les caches mémo (outil de test). */
 export function resetAuthCaches(): void {

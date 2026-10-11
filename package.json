@@ -13,6 +13,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "reset:password": "node scripts/reset-admin-password.mjs",
     "check:vendor": "node scripts/check-holaf-vendor.mjs"
   },
   "dependencies": {

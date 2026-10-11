@@ -1410,12 +1410,8 @@
       applySession(data);
       showApp();
     } catch (err) {
-      const message =
-        err && err.status === 429
-          ? "Trop de tentatives — réessayez dans une minute."
-          : "Mot de passe incorrect.";
       if (error) {
-        error.textContent = message;
+        error.textContent = loginErrorMessage(err);
         error.hidden = false;
       }
       if (input) {
@@ -1425,6 +1421,35 @@
     } finally {
       if (button) button.disabled = false;
     }
+  }
+
+  /**
+   * Message de connexion adapté à la CAUSE RÉELLE.
+   * Auparavant, tout ce qui n'était pas un 429 était affiché « Mot de passe
+   * incorrect. » — y compris un 503 (dossier de données non inscriptible) ou un
+   * 403 (jeton CSRF expiré) : l'utilisateur croyait que son mot de passe était
+   * faux alors que ce n'était pas la cause.
+   */
+  function loginErrorMessage(err) {
+    const status = (err && err.status) || 0;
+    const code = err && err.data && err.data.code;
+    if (code === "LOGIN_RATE_LIMITED" || status === 429) {
+      return "Trop de tentatives — patientez une minute, puis réessayez.";
+    }
+    if (code === "STORAGE_NOT_WRITABLE" || status >= 500) {
+      return (
+        "Le dossier de données de Switchy n'est pas accessible en écriture : la connexion ne peut pas " +
+        "aboutir même avec le bon mot de passe. Vérifiez le dossier de données (voir README, « Mot de passe " +
+        "administrateur »)."
+      );
+    }
+    if (code === "CSRF_FAILED" || status === 403) {
+      return "Session de page expirée — rechargez la page (F5), puis réessayez.";
+    }
+    if (status === 400) {
+      return "Saisissez le mot de passe puis validez.";
+    }
+    return "Mot de passe incorrect.";
   }
 
   /** Déconnexion : retour EXACT à l'écran de connexion. */

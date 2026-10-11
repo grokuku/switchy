@@ -32,8 +32,10 @@ Objectifs du service :
   `switchy-keys.json`.
 - **API de configuration** (Lot 2) : `GET/POST/PUT/DELETE /api/providers`,
   `GET/POST/PUT/DELETE /api/services`, `GET/POST /api/settings`,
-  `GET/POST/DELETE /api/keys` — protégées par la clé d'API Switchy (mode
-  amorçage tant qu'aucune clé n'existe). Les secrets ne sont jamais réaffichés.
+  `GET/POST/DELETE /api/keys` — protégées par une **clé d'API** (outils) OU une
+  **session d'administration** (navigateur, lot connexion). Aucun « mode
+  amorçage » : l'API n'est jamais ouverte sans l'un des deux. Les secrets ne sont
+  jamais réaffichés.
 - Interface web **pleine largeur** servie sans build : onglets **Services**
   (CRUD, principal + replis ordonnés, capacités), **Fournisseurs** (CRUD, clé
   jamais réaffichée) et **Réglages** (badges source, « redémarrage requis »,
@@ -56,6 +58,76 @@ cp .env.example .env      # adapter si besoin
 npm run dev               # tsx watch (défaut : 0.0.0.0:3008)
 ```
 
+## Mot de passe administrateur
+
+La connexion à l'interface se fait par **mot de passe** (un seul compte :
+`admin`), matérialisée par un cookie de session signé HMAC. Les **clés d'API**
+(onglet Réglages / `SWITCHY_API_KEY`) restent le contrat des OUTILS — elles ne se
+confondent pas avec la connexion de l'humain.
+
+### Première connexion
+
+- Mot de passe par défaut : **`admin`**.
+- Il n'est accepté que **tant qu'aucun mot de passe n'a été enregistré** dans le
+dossier de données (`$SWITCHY_DATA_DIR/config.json`).
+- **Changez-le dès la première connexion** (onglet **Réglages**). Tant qu'il
+reste `admin`, les actions sensibles sont refusées (`403 PASSWORD_NOT_CHANGED`)
+et un bandeau le rappelle.
+
+### « Le mot de passe ne marche plus » — trois causes, dans l'ordre
+
+**1. Le dossier de données garde un ancien mot de passe.**
+Le mot de passe est stocké (hashé) dans `$SWITCHY_DATA_DIR/config.json`. Dès
+qu'il a été changé une fois, `admin` **ne fonctionne plus**, même après
+redémarrage : le dossier **persiste** (volume Docker). Ce n'est pas un bug,
+c'est la persistance.
+→ **Remettre le compte à zéro** (accès à la machine requis) :
+
+```bash
+# Docker (conteneur `switchy`) : retour au mot de passe `admin`
+docker compose exec switchy node scripts/reset-admin-password.mjs
+# ou fixer directement un nouveau mot de passe :
+docker compose exec switchy node scripts/reset-admin-password.mjs --password 'MonNouveauMotDePasse'
+# depuis les sources (avec SWITCHY_DATA_DIR positionné) :
+npm run reset:password
+```
+
+⚠️ Cette procédure n'est **volontairement pas** exposée par le réseau (aucune
+route HTTP) : il faut un accès au système de fichiers. Elle invalide les sessions
+déjà ouvertes.
+
+**2. Trop de tentatives.** 5 **échecs** par minute au maximum. Au-delà, le
+serveur répond `429` avec un message explicite (« Trop de tentatives… »),
+**distinct** d'un mot de passe incorrect. Patientez une minute. Une connexion
+*réussie* ne consomme pas le quota.
+
+**3. Le dossier de données n'est pas accessible en écriture.** Typiquement après
+avoir **supprimé le dossier de données** : Docker le recrée appartenant à `root`,
+alors que Switchy tourne en **uid 10001** → la connexion échoue. Le message
+d'erreur le dit désormais clairement (`503 STORAGE_NOT_WRITABLE`, affiché tel
+quel par l'interface) et le démarrage en avertit dans les journaux. Remède :
+
+```bash
+mkdir -p /mnt/user/appdata-ssd/Switchy/data
+chown -R 10001:10001 /mnt/user/appdata-ssd/Switchy/data
+```
+
+> **Piège à connaître** : supprimer le dossier de données efface aussi le mot de
+> passe (retour à `admin`) — mais si Docker recrée le dossier avec le mauvais
+> propriétaire, la connexion échoue quand même. Recréez-le avec le **bon
+> propriétaire** avant de relancer.
+
+**Diagnostic** — au démarrage, Switchy journalise deux lignes utiles :
+
+```
+[switchy] data dir: /app/data
+[switchy] admin password: default ('admin' accepted — no hash stored yet)
+```
+
+ou, en cas de problème, un avertissement explicite
+(`WARNING: data directory "…" is not writable (EACCES)`) et
+`admin password: custom (a CHANGED password is stored…)`.
+
 ## Scripts
 
 | Script | Rôle |
@@ -66,6 +138,7 @@ npm run dev               # tsx watch (défaut : 0.0.0.0:3008)
 | `npm test` | Tests (vitest). |
 | `npm run typecheck` | Vérification de types sans émission. |
 | `npm run check:vendor` | Empreintes des briques holaf vendorisées (CI, hors réseau). |
+| `npm run reset:password` | Réinitialise le mot de passe admin (secours ; accès machine requis). |
 
 ## Interface web & briques holaf-lib
 
@@ -150,7 +223,7 @@ l'**interface** (v1) — jamais par édition de fichier à la main.
 | `SWITCHY_PORT` | `3008` | Port (Pi-Web 3000/3005, WebClaw 3006, Libry 3007). |
 | `SWITCHY_DATA_DIR` | `/app/data` | Répertoire de données persistant (volume). |
 | `SWITCHY_RATE_LIMIT_PER_MIN` | `600` | Requêtes/minute/IP. |
-| `SWITCHY_API_KEY` | — | Clé d'API d'amorçage (secret ; sinon l'API est ouverte au 1er démarrage). |
+| `SWITCHY_API_KEY` | — | Clé d'API optionnelle (secret) pour les OUTILS, en plus des clés créées dans l'interface. |
 | `SWITCHY_CONCURRENCY` | `3` | Limite globale de concurrence (à chaud). |
 | `SWITCHY_LOG_LEVEL` | `info` | Niveau de log (à chaud). |
 | `SWITCHY_CALLS_LOG_MODE` | `summary` | Journal d'appels : `off` \| `summary` \| `full`. |
@@ -169,7 +242,7 @@ src/
   config.ts         # getters de configuration (env ?? fichier ?? défaut)
   settings-store.ts # réglages scalaires ($DATA_DIR/config.json, catalogue déclaratif)
   catalog-store.ts  # fournisseurs + services ($DATA_DIR/catalog.json) + validation
-  switchy-auth.ts   # clés d'API nommées/hachées/révocables (mode amorçage)
+  switchy-auth.ts   # clés d'API nommées/hachées/révocables (outils)
   middleware/       # garde d'authentification des routes /api
   routes/           # providers, services, settings, keys
   utils/            # hachage scrypt, erreurs HTTP typées
@@ -178,7 +251,7 @@ public/
   styles.css      # plein largeur, alias des jetons --holaf-*
   app.js          # onglets, thème, configuration (CRUD via /api/*)
   vendor/holaf/   # briques holaf-lib copiées verbatim (pinnées)
-scripts/          # toolchain vendor holaf (extraction CSS, empreintes, garde-fou)
+scripts/          # toolchain vendor holaf + reset-admin-password.mjs (secours)
 tests/            # santé, catalogue, réglages, auth, statique, mise en page, vendor
             #   (hors réseau)
 docs/api.md       # contrat d'API (santé + configuration)
