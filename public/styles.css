@@ -266,7 +266,11 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   background: var(--switchy-bg-raised);
 }
 
-.card + .card {
+/* Écart vertical entre cartes EMPILÉES (onglet Réglages).
+   ⚠️ Les cartes de GRILLE (`.item-card`) sont exclues : dans une grille, la
+   marge haute ne s'appliquerait qu'aux cartes 2..n (jamais à la 1re), ce qui
+   décalait leur contenu vers le bas et rendait la 1re carte plus haute. */
+.card + .card:not(.item-card) {
   margin-top: var(--switchy-gap);
 }
 
@@ -427,7 +431,10 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   gap: var(--switchy-gap);
 }
 
-.item-card {
+/* Les cartes d'une grille ne portent JAMAIS de marge de superposition : c'est
+   la grille qui espace (`gap`) et qui ÉTIRE toutes les cartes d'une ligne à la
+   même hauteur (`align-items: stretch` par défaut). */
+.cards-grid > .item-card {
   margin: 0;
 }
 
@@ -444,9 +451,19 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   margin-bottom: 10px;
 }
 
+/* Le titre occupe SA PROPRE ligne et reste TRONQUÉ à une seule ligne
+   (ellipsis) : la hauteur de l'en-tête ne dépend donc pas de la longueur du
+   libellé et badges / boutons / lignes clé-valeur tombent à la même hauteur
+   d'une carte à l'autre. Le libellé complet reste lisible en infobulle
+   (`title=`) et dans le formulaire d'édition. */
 .item-title {
+  flex: 1 1 100%;
+  min-width: 0;
   margin: 0;
   font-size: 15.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .item-actions {

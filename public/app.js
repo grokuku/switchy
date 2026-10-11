@@ -612,7 +612,9 @@
     const card = h("article", { class: "card item-card" });
 
     const head = h("header", { class: "item-head" });
-    head.append(h("h3", { class: "item-title", text: p.label || p.id }));
+    // Titre tronqué à une ligne (CSS) : l'infobulle garde le libellé complet.
+    const providerTitle = p.label || p.id;
+    head.append(h("h3", { class: "item-title", text: providerTitle, attrs: { title: providerTitle } }));
     const badges = h("div", { class: "badges" });
     badges.append(badge(p.id, "id"));
     badges.append(badge(typeLabel(p.type)));
@@ -797,7 +799,8 @@
     const card = h("article", { class: "card item-card" });
 
     const head = h("header", { class: "item-head" });
-    head.append(h("h3", { class: "item-title", text: s.name }));
+    // Titre tronqué à une ligne (CSS) : l'infobulle garde le nom complet.
+    head.append(h("h3", { class: "item-title", text: s.name, attrs: { title: s.name } }));
     const badges = h("div", { class: "badges" });
     badges.append(s.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
     if (s.vision) badges.append(badge("vision", "ok"));
