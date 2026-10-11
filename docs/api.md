@@ -38,10 +38,19 @@ Liveness, aligné sur les autres services de l'écosystème. Public, sans clé.
 | `POST` | `/api/providers` | Création |
 | `PUT` | `/api/providers/:id` | Mise à jour |
 | `DELETE` | `/api/providers/:id` | Suppression (refusée `409` si un service l'utilise) |
+| `GET` | `/api/providers/:id/models` | Modèles du fournisseur (`?refresh=1` pour forcer) |
+| `GET` | `/api/providers/:id/models/:model` | Capacités d'un modèle (contexte, vision, outils, réflexion) |
 
 **Fournisseur** : `id`, `label`, `type` (`openai-compatible` \| `ollama-native` \|
 `anthropic` \| `google`), `baseUrl` (URL `/v1`), `nativeUrl?` (URL native, ex.
-Ollama `/api/tags`), `apiKey` (**secret**), `enabled`.
+Ollama `/api/tags`), **`maxConcurrency?`** (appels simultanés du **compte** ;
+absent = défaut global `SWITCHY_CONCURRENCY`, min 1 — `0` refusé),
+`apiKey` (**secret**), `enabled`.
+
+Les deux routes `/models` interrogent le fournisseur avec **sa clé** (OpenAI-
+compatible `GET {baseUrl}/models` ; Ollama natif `GET {nativeUrl}/api/tags` et
+`POST {nativeUrl}/api/show`), avec cache court ; fournisseur injoignable → `502`,
+clé refusée → `502` `PROVIDER_AUTH_ERROR`.
 
 ⚠️ **La clé d'API d'un fournisseur n'est JAMAIS renvoyée en clair** : la vue
 publique la remplace par `{ "configured": bool, "preview": "••••" }`.
@@ -62,12 +71,16 @@ Sémantique du champ `apiKey` :
 
 **Service** : `name`, `description`, `principal` `{providerId, model, reasoning}`,
 `fallbacks[]` (mêmes champs, ordonnés), `contextWindow`, `maxOutputTokens`,
-`vision`, `reservations?` `{light?, heavy?}`, `enabled`.
+`vision`, **`prioritaire`** (booléen : ses appels passent avant les autres quand
+une place se libère chez le fournisseur), `enabled`.
+
+> Migration douce : un ancien `catalog.json` contenant `reservations` reste
+> lisible — le champ est **ignoré**, `prioritaire` vaut `false` par défaut.
 
 **Validation** (réponses `400` `VALIDATION_ERROR` avec `errors[]`) : nom unique
 (`409` `CONFLICT` si dupliqué), `providerId` existant, bornes numériques
 (`contextWindow` ∈ [1, 100 000 000], `maxOutputTokens` ∈ [1, 10 000 000],
-réservations ∈ [0, 1000], ≤ 16 replis).
+`maxConcurrency` ∈ [1, 1000], ≤ 16 replis).
 
 ## Réglages — `/api/settings`
 
@@ -96,6 +109,50 @@ Corps de `POST` : `{ "settings": { "SWITCHY_CONCURRENCY": "5", "SWITCHY_API_KEY"
 Les clés sont hachées (**scrypt**, sel par clé) dans
 `$SWITCHY_DATA_DIR/switchy-keys.json` (0600).
 
+## Journal d'appels — `/api/calls`
+
+| Méthode | Chemin | Effet |
+| --- | --- | --- |
+| `GET` | `/api/calls` | Tentatives journalisées (plus récent d'abord) + bilan des replis |
+
+Pagination `limit` (défaut 50, max 500) / `offset` (défaut 0) ; filtres
+`service` et `result` (`ok` \| `error` \| `aborted` \| `skipped`).
+
+Chaque **tentative** est une entrée JSONL (`$SWITCHY_DATA_DIR/calls.jsonl`) :
+
+| Champ | Sens |
+| --- | --- |
+| `ts` | horodatage ISO de fin de tentative |
+| `callId` | identifiant de l'**appel logique**, commun à toutes ses tentatives |
+| `service` | service nommé appelé |
+| `attempt` | rang : `0` = principal, `1..` = repli n° |
+| `isFallback` | `true` ⇔ cette tentative EST un repli (= `attempt > 0`) |
+| `provider` / `model` | fournisseur et modèle visés |
+| `result` | `ok` \| `error` \| `aborted` \| `skipped` |
+| `status` | code HTTP amont (absent si échec réseau) |
+| `reason` | motif **catégorisé** (voir ci-dessous) |
+| `durationMs`, `tokens?`, `stream?` | durée, consommation, streaming |
+
+`reason` appartient à une **liste blanche fermée** : `quota` (quota/limite
+d'usage épuisé), `rate_limit` (429 de débit), `overloaded` (503), `auth_error`
+(401/403), `network_error`, `upstream_error`. **Jamais** de clé, de prompt ni de
+corps fournisseur dans le journal.
+
+La réponse porte aussi `summary` (bilan des replis, **non filtré**) :
+`windowHours`, `total`, `last24h`, `byService`, `byFallbackProvider`, `reasons`.
+Les entrées antérieures à ce lot (sans `callId`/`reason`/`isFallback`) restent
+lisibles et comptées (`attempt > 0` ⇒ repli).
+
+### Politique de repli
+
+Le relais bascule du principal vers les replis sur `404`, `408`, `409`, `429`,
+les `5xx` et les échecs réseau. Il **ne bascule pas** sur une erreur manifeste de
+la requête (`400`, `405`, `406`, `413`, `415`, `422`) **ni sur un échec
+d'authentification** (`401`, `403`) : une clé invalide/expirée ne sera pas valide
+chez le fournisseur suivant, et basculer vers un repli payant masquerait un
+simple problème de configuration. L'échec est alors relayé tel quel et
+journalisé avec `reason: "auth_error"`.
+
 ## Interface web
 
 Servie depuis `public/` (vanilla, sans build), montée **après** `/health` et
@@ -103,9 +160,10 @@ Servie depuis `public/` (vanilla, sans build), montée **après** `/health` et
 jamais servi pour une URL arbitraire). Trois onglets : **Services**,
 **Fournisseurs**, **Réglages** — CRUD complet, sans jamais éditer un fichier.
 
-## À venir (Lot 3+)
+## À venir (Lot 4)
 
 - Relais transparent vers les fournisseurs (streaming SSE, tool-calling) et
-  relais de l'API native Ollama (`/api/tags`, capacités).
-- Comptage global des appels en vol (limite de compte, ex. Ollama Pro : 3).
-- Exécution des replis et journal d'appels ; tableau de bord (Lot 4).
+  relais de l'API native Ollama (`/api/tags`, capacités) : **en place**.
+- Comptage des appels en vol **par fournisseur** : **en place**.
+- Replis, journal d'appels et compteur de replis : **en place** (voir
+  « Journal d'appels »). Reste : le tableau de bord dédié.

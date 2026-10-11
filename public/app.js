@@ -564,6 +564,158 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  // Modèles du fournisseur (combobox + capacités)
+  //
+  // Switchy interroge le FOURNISSEUR (avec sa clé) pour proposer ses modèles ;
+  // la liste est mise en cache côté page (le fournisseur n'est pas questionné à
+  // chaque frappe) et un bouton « rafraîchir » la force. Le champ reste TOUJOURS
+  // saisissable à la main (un modèle absent de la liste reste utilisable).
+  // ════════════════════════════════════════════════════════════════════════
+
+  /** Cache page : identifiant de fournisseur → liste d'identifiants de modèles. */
+  const modelLists = new Map();
+
+  async function fetchProviderModels(providerId, force) {
+    if (!providerId) return [];
+    if (!force && modelLists.has(providerId)) return modelLists.get(providerId);
+    const data = await apiRequest(
+      `/api/providers/${encodeURIComponent(providerId)}/models${force ? "?refresh=1" : ""}`,
+    );
+    const models = Array.isArray(data && data.models)
+      ? data.models.map((m) => m && m.id).filter(Boolean)
+      : [];
+    modelLists.set(providerId, models);
+    return models;
+  }
+
+  /**
+   * Combobox de modèle : champ texte LIBRE + champ de filtre + liste déroulante
+   * alimentée par le fournisseur + bouton « rafraîchir » + ligne d'état.
+   * `onSelect(model)` est appelé à chaque sélection (ou saisie validée).
+   */
+  function modelCombo(opts) {
+    opts = opts || {};
+    const valueInput = inputText(opts.value || "");
+    valueInput.setAttribute("placeholder", "modèle (saisie libre possible)");
+    valueInput.setAttribute("aria-label", opts.label || "modèle");
+    const filterInput = inputText("");
+    filterInput.setAttribute("placeholder", "filtrer les modèles…");
+    filterInput.setAttribute("aria-label", "filtrer les modèles");
+    const list = h("select", {
+      class: "model-list",
+      attrs: { size: "6", "aria-label": "modèles proposés" },
+    });
+    const status = h("p", { class: "model-status muted" });
+    const refreshBtn = iconButton("refresh", "Rafraîchir", {
+      class: "btn btn--ghost btn--icon",
+      attrs: { title: "Interroger à nouveau le fournisseur" },
+    });
+
+    let providerId = opts.providerId || "";
+    let loading = false;
+
+    function renderOptions() {
+      const all = modelLists.get(providerId) || [];
+      const filter = filterInput.value.trim().toLowerCase();
+      const visible = filter ? all.filter((m) => m.toLowerCase().includes(filter)) : all;
+      list.replaceChildren();
+      for (const m of visible) list.append(h("option", { value: m, text: m, attrs: { title: m } }));
+      if (valueInput.value && !visible.includes(valueInput.value)) {
+        list.prepend(h("option", { value: valueInput.value, text: valueInput.value }));
+      }
+      list.value = valueInput.value;
+      if (!loading) {
+        status.textContent = all.length
+          ? `${visible.length} / ${all.length} modèle(s)`
+          : "Aucun modèle listé — saisissez l'identifiant à la main.";
+      }
+    }
+
+    async function load(force) {
+      if (!providerId) {
+        list.replaceChildren();
+        status.textContent = "";
+        return;
+      }
+      loading = true;
+      status.textContent = "Interrogation du fournisseur…";
+      try {
+        await fetchProviderModels(providerId, force);
+      } catch (err) {
+        modelLists.delete(providerId);
+        status.textContent = (err && err.message) || "Fournisseur injoignable.";
+      } finally {
+        loading = false;
+      }
+      renderOptions();
+    }
+
+    list.addEventListener("change", () => {
+      valueInput.value = list.value;
+      if (opts.onSelect) opts.onSelect(list.value);
+    });
+    filterInput.addEventListener("input", renderOptions);
+    valueInput.addEventListener("change", () => {
+      if (opts.onSelect) opts.onSelect(valueInput.value.trim());
+    });
+    refreshBtn.addEventListener("click", () => {
+      void load(true);
+    });
+
+    const wrap = h(
+      "div",
+      { class: "model-combo" },
+      h("div", { class: "model-combo-top" }, valueInput, refreshBtn),
+      filterInput,
+      list,
+      status,
+    );
+
+    void load(false);
+
+    return {
+      wrap,
+      getValue: () => valueInput.value.trim(),
+      setValue: (v) => {
+        valueInput.value = v == null ? "" : String(v);
+        renderOptions();
+      },
+      setProvider: (id) => {
+        providerId = id || "";
+        renderOptions();
+        void load(false);
+      },
+    };
+  }
+
+  /**
+   * Champ modèle compact pour une ligne de repli : `<input list>` alimenté par
+   * les modèles du fournisseur choisi (filtrage natif + saisie libre).
+   */
+  function modelInputWithSuggestions(providerId, value) {
+    const input = inputText(value);
+    input.setAttribute("placeholder", "modèle");
+    input.setAttribute("aria-label", "modèle du repli");
+    const listId = nextId("models");
+    input.setAttribute("list", listId);
+    const datalist = h("datalist", { attrs: { id: listId } });
+
+    async function load(id) {
+      datalist.replaceChildren();
+      if (!id) return;
+      try {
+        const models = await fetchProviderModels(id, false);
+        for (const m of models) datalist.append(h("option", { value: m }));
+      } catch {
+        /* Fournisseur injoignable : la saisie libre reste possible. */
+      }
+    }
+    void load(providerId);
+
+    return { input, datalist, setProvider: load };
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
   // Fournisseurs
   // ════════════════════════════════════════════════════════════════════════
 
@@ -642,6 +794,19 @@
       h(
         "div",
         null,
+        h("dt", { text: "simultané" }),
+        h("dd", {
+          text:
+            p.maxConcurrency !== undefined && p.maxConcurrency !== null
+              ? `${p.maxConcurrency} appel(s) / compte`
+              : "défaut global",
+        }),
+      ),
+    );
+    dl.append(
+      h(
+        "div",
+        null,
         h("dt", { text: "clé" }),
         h("dd", { text: p.apiKey && p.apiKey.configured ? `configurée ${p.apiKey.preview}` : "—" }),
       ),
@@ -676,6 +841,21 @@
     nativeInput.setAttribute("placeholder", "https://ollama.com/api");
     form.append(field("URL native (optionnelle)", nativeInput, "Découverte des modèles (ex. Ollama /api/tags)"));
 
+    // Limite de concurrence DU COMPTE (la limite appartient au fournisseur).
+    const concurrencyInput = inputNumber(
+      editing && provider.maxConcurrency !== undefined && provider.maxConcurrency !== null ? provider.maxConcurrency : "",
+      1,
+      1000,
+    );
+    concurrencyInput.setAttribute("placeholder", "défaut global (3)");
+    form.append(
+      field(
+        "appels simultanés du compte",
+        concurrencyInput,
+        "Limite du COMPTE chez ce fournisseur (ex. 3 pour Ollama Pro). Laisser vide = valeur par défaut globale. Minimum 1.",
+      ),
+    );
+
     // Clé : jamais réaffichée. Champ vide = inchangé.
     const keyWrap = h("div", { class: "field" });
     const keyLabel = h("label", { text: "clé d'API du fournisseur" });
@@ -708,6 +888,9 @@
           nativeUrl: nativeInput.value.trim(),
           enabled: enabledBox.input.checked,
         };
+        const mcRaw = concurrencyInput.value.trim();
+        if (mcRaw !== "") body.maxConcurrency = Number(mcRaw);
+        else if (editing) body.maxConcurrency = null; // retour au défaut global
         if (editing) {
           if (clearKey.input.checked) body.apiKey = null;
           else if (keyInput.value.trim() !== "") body.apiKey = keyInput.value.trim();
@@ -747,16 +930,57 @@
   async function loadServices() {
     try {
       // Les fournisseurs alimentent les menus du formulaire : on les charge aussi.
-      const [servicesData, providersData] = await Promise.all([
+      const [servicesData, providersData, callsData] = await Promise.all([
         apiRequest("/api/services"),
         apiRequest("/api/providers").catch(() => null),
+        apiRequest("/api/calls?limit=1").catch(() => null),
       ]);
       state.services = Array.isArray(servicesData && servicesData.services) ? servicesData.services : [];
       if (providersData && Array.isArray(providersData.providers)) state.providers = providersData.providers;
+      renderFallbackSummary(callsData && callsData.summary);
       renderServices();
     } catch (err) {
       handleApiError(err, "Impossible de charger les services.");
     }
+  }
+
+  /**
+   * Bandeau sobre « replis » (24 h et total) avec les fournisseurs de repli
+   * sollicités. Objectif : CONSTATER qu'un repli — parfois PAYANT — a eu lieu,
+   * et combien de fois. Aucun détail d'appel ici (le journal complet reste
+   * dans l'API `/api/calls`).
+   */
+  function renderFallbackSummary(summary) {
+    const el = $("fallback-summary");
+    if (!el) return;
+    if (!summary || typeof summary !== "object") {
+      el.hidden = true;
+      return;
+    }
+    const last24h = Number(summary.last24h) || 0;
+    const total = Number(summary.total) || 0;
+    el.replaceChildren();
+    el.append(h("span", { class: "fallback-summary__count", text: `Replis (24 h) : ${last24h}` }));
+    if (total !== last24h) el.append(h("span", { class: "muted", text: `· total : ${total}` }));
+    const providers = Object.entries(summary.byFallbackProvider || {});
+    if (providers.length > 0) {
+      el.append(
+        h("span", {
+          class: "muted",
+          text: `· fournisseur de repli : ${providers.map(([id, n]) => `${providerLabel(id)} (${n})`).join(", ")}`,
+        }),
+      );
+    }
+    const services = Object.entries(summary.byService || {});
+    if (services.length > 0) {
+      el.append(
+        h("span", {
+          class: "muted",
+          text: `· par service : ${services.map(([name, n]) => `${name} (${n})`).join(", ")}`,
+        }),
+      );
+    }
+    el.hidden = false;
   }
 
   function servicesView() {
@@ -803,6 +1027,7 @@
     head.append(h("h3", { class: "item-title", text: s.name, attrs: { title: s.name } }));
     const badges = h("div", { class: "badges" });
     badges.append(s.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
+    if (s.prioritaire) badges.append(badge("prioritaire", "env"));
     if (s.vision) badges.append(badge("vision", "ok"));
     badges.append(badge(`${s.fallbacks ? s.fallbacks.length : 0} repli(s)`));
     head.append(badges);
@@ -828,11 +1053,8 @@
     const dl = h("dl", { class: "kv" });
     dl.append(h("div", null, h("dt", { text: "contexte" }), h("dd", { text: formatNumber(s.contextWindow) })));
     dl.append(h("div", null, h("dt", { text: "tokens max" }), h("dd", { text: formatNumber(s.maxOutputTokens) })));
-    if (s.reservations) {
-      const parts = [];
-      if (s.reservations.light !== undefined) parts.push(`léger ≤ ${s.reservations.light}`);
-      if (s.reservations.heavy !== undefined) parts.push(`lourd ≤ ${s.reservations.heavy}`);
-      if (parts.length) dl.append(h("div", null, h("dt", { text: "réservations" }), h("dd", { text: parts.join(", ") })));
+    if (s.prioritaire) {
+      dl.append(h("div", null, h("dt", { text: "priorité" }), h("dd", { text: "passe en premier" })));
     }
     card.append(dl);
     return card;
@@ -867,9 +1089,12 @@
         step ? step.providerId : (state.providers[0] && state.providers[0].id) || "",
       );
       providerSel.setAttribute("aria-label", "fournisseur du repli");
-      const modelInput = inputText(step ? step.model : "");
-      modelInput.setAttribute("placeholder", "modèle");
-      modelInput.setAttribute("aria-label", "modèle du repli");
+      // Champ modèle suggéré par le fournisseur choisi (liste + saisie libre).
+      const model = modelInputWithSuggestions(
+        step ? step.providerId : providerSel.value,
+        step ? step.model : "",
+      );
+      providerSel.addEventListener("change", () => model.setProvider(providerSel.value));
       const reasoningSel = buildSelect(REASONING_LEVELS, step ? step.reasoning : "off");
       reasoningSel.setAttribute("aria-label", "réflexion du repli");
 
@@ -903,7 +1128,7 @@
         }),
       );
 
-      li.append(providerSel, modelInput, reasoningSel, tools);
+      li.append(providerSel, model.input, model.datalist, reasoningSel, tools);
       return li;
     }
 
@@ -959,20 +1184,30 @@
     // Principal
     form.append(formSection("Fournisseur principal"));
     const principal = editing ? service.principal : { providerId: state.providers[0].id, model: "", reasoning: "off" };
-    const principalWrap = h("div", { class: "step-editor" });
     const principalProvider = buildSelect(
       state.providers.map((p) => ({ value: p.id, label: p.label || p.id })),
       principal.providerId,
     );
     principalProvider.setAttribute("aria-label", "fournisseur principal");
-    const principalModel = inputText(principal.model);
-    principalModel.setAttribute("placeholder", "modèle");
-    principalModel.setAttribute("aria-label", "modèle principal");
-    principalModel.required = true;
+    form.append(field("fournisseur", principalProvider));
+
+    // Combobox alimenté par le fournisseur (filtre + liste + saisie libre).
+    const principalModel = modelCombo({
+      providerId: principal.providerId,
+      value: principal.model,
+      label: "modèle principal",
+      onSelect: (model) => {
+        void detectCapabilities(model);
+      },
+    });
+    principalProvider.addEventListener("change", () => principalModel.setProvider(principalProvider.value));
+    form.append(
+      field("modèle", principalModel.wrap, "Liste fournie par le fournisseur ; saisie libre possible si le modèle n'y figure pas."),
+    );
+
     const principalReasoning = buildSelect(REASONING_LEVELS, principal.reasoning);
     principalReasoning.setAttribute("aria-label", "réflexion principale");
-    principalWrap.append(principalProvider, principalModel, principalReasoning);
-    form.append(principalWrap);
+    form.append(field("niveau de réflexion", principalReasoning));
 
     // Capacités
     form.append(formSection("Capacités"));
@@ -988,22 +1223,65 @@
     const visionBox = checkbox(editing ? !!service.vision : false, "Vision (entrée image)");
     form.append(visionBox.wrap);
 
-    // Réservations
-    form.append(formSection("Réservations de slots (optionnel)"));
-    const reserves = h("div", { class: "form-cols" });
-    const lightInput = inputNumber(
-      editing && service.reservations && service.reservations.light !== undefined ? service.reservations.light : "",
-      0,
-      1000,
+    const capStatus = h("p", { class: "model-status muted" });
+
+    /** Interroge le fournisseur pour pré-remplir les capacités du modèle choisi. */
+    async function detectCapabilities(model) {
+      const providerId = principalProvider.value;
+      if (!providerId || !model) return;
+      capStatus.textContent = "Interrogation du fournisseur pour les capacités…";
+      try {
+        const data = await apiRequest(
+          `/api/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(model)}`,
+        );
+        const info = data && data.model ? data.model : null;
+        if (!info) {
+          capStatus.textContent = "";
+          return;
+        }
+        if (info.detected) {
+          const detected = [];
+          if (info.capabilities) {
+            visionBox.input.checked = !!info.capabilities.vision;
+            detected.push(`vision : ${info.capabilities.vision ? "oui" : "non"}`);
+            detected.push(`outils : ${info.capabilities.tools ? "oui" : "non"}`);
+            detected.push(`réflexion : ${info.capabilities.thinking ? "oui" : "non"}`);
+          }
+          if (typeof info.contextWindow === "number") {
+            contextInput.value = String(info.contextWindow);
+            detected.push(`contexte : ${formatNumber(info.contextWindow)}`);
+          }
+          if (typeof info.maxOutputTokens === "number") {
+            maxOutInput.value = String(info.maxOutputTokens);
+            detected.push(`tokens max : ${formatNumber(info.maxOutputTokens)}`);
+          }
+          if (Array.isArray(info.reasoningLevels) && info.reasoningLevels.length) {
+            principalReasoning.value = info.reasoningLevels.includes(principalReasoning.value)
+              ? principalReasoning.value
+              : info.reasoningLevels[info.reasoningLevels.length - 1];
+          }
+          capStatus.textContent = `Détecté chez le fournisseur — ${detected.join(" · ")}. Champs pré-remplis, corrigez si besoin.`;
+        } else {
+          capStatus.textContent =
+            info.note || "Capacités non exposées par ce fournisseur — saisissez-les à la main.";
+        }
+      } catch (err) {
+        capStatus.textContent = (err && err.message) || "Impossible de lire les capacités du modèle.";
+      }
+    }
+
+    form.append(capStatus);
+
+    // Priorité (intrinsèque au service — plus aucune réservation par classe).
+    form.append(formSection("Priorité"));
+    const prioritaireBox = checkbox(editing ? service.prioritaire === true : false, "Prioritaire");
+    form.append(prioritaireBox.wrap);
+    form.append(
+      h("p", {
+        class: "field-hint muted",
+        text: "Ses appels passent en premier quand une place se libère chez le fournisseur (le léger n'attend pas derrière le lourd).",
+      }),
     );
-    reserves.append(field("léger ≤", lightInput, "Le léger n'attend pas derrière le lourd"));
-    const heavyInput = inputNumber(
-      editing && service.reservations && service.reservations.heavy !== undefined ? service.reservations.heavy : "",
-      0,
-      1000,
-    );
-    reserves.append(field("lourd ≤", heavyInput));
-    form.append(reserves);
 
     // Replis
     form.append(formSection("Replis ordonnés"));
@@ -1019,24 +1297,16 @@
           description: descInput.value.trim(),
           principal: {
             providerId: principalProvider.value,
-            model: principalModel.value.trim(),
+            model: principalModel.getValue(),
             reasoning: principalReasoning.value,
           },
           fallbacks: fallbacks.collect(),
           contextWindow: Number(contextInput.value),
           maxOutputTokens: Number(maxOutInput.value),
           vision: visionBox.input.checked,
+          prioritaire: prioritaireBox.input.checked,
           enabled: enabledBox.input.checked,
         };
-        const light = lightInput.value.trim() === "" ? undefined : Number(lightInput.value);
-        const heavy = heavyInput.value.trim() === "" ? undefined : Number(heavyInput.value);
-        if (light !== undefined || heavy !== undefined) {
-          body.reservations = {};
-          if (light !== undefined) body.reservations.light = light;
-          if (heavy !== undefined) body.reservations.heavy = heavy;
-        } else if (editing) {
-          body.reservations = null;
-        }
         if (editing) {
           await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, { method: "PUT", body });
           notify(`Service « ${service.name} » mis à jour.`);

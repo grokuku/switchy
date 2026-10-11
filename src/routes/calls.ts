@@ -3,8 +3,9 @@
  *
  * Pagination : `limit` (défaut 50, max 500), `offset` (défaut 0). Filtres
  * facultatifs : `service` (nom exact), `result` (`ok` | `error` | `aborted` |
- * `skipped`). Le plus récent d'abord. Le tableau de bord viendra au Lot 4 ;
- * cette route est son contrat.
+ * `skipped`). Le plus récent d'abord. La réponse porte aussi un `summary`
+ * (bilan des replis, non filtré) : compteur total / dernières 24 h et
+ * répartitions par service et par fournisseur de repli sollicité.
  */
 import { Router, type Request, type Response } from "express";
 import { readCallsLog } from "../llm/calls-log.js";

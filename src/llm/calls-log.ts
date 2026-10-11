@@ -8,10 +8,11 @@
  * ignoré (fournisseur absent/désactivé).
  *
  * ⚠️ SÉCURITÉ : le journal ne contient JAMAIS de clé d'API ni de contenu de
- * prompt — uniquement des métadonnées techniques (horodatage, service,
- * fournisseur, modèle, résultat, code HTTP, durée, tokens si le fournisseur
- * les fournit, rang du repli). Les messages d'erreur stockés sont ceux des
- * échecs RÉSEAU, tronqués — jamais le corps d'une réponse fournisseur.
+ * prompt — uniquement des métadonnées techniques (horodatage, identifiant
+ * d'appel `callId`, service, fournisseur, modèle, résultat, code HTTP, motif
+ * CATÉGORISÉ `reason` (liste blanche), durée, tokens si le fournisseur les
+ * fournit, rang du repli). Les messages d'erreur stockés sont ceux des échecs
+ * RÉSEAU, tronqués — jamais le corps d'une réponse fournisseur.
  *
  * Stockage BORNÉ :
  *   - `SWITCHY_CALLS_LOG_MODE`            : `off` | `summary` (défaut) | `full` ;
@@ -25,6 +26,7 @@
  * compaction via tmp + rename — même pattern que les autres magasins.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "fs";
+import { randomUUID } from "node:crypto";
 import path from "path";
 import { getCallsLogFile, getCallsLogMaxEntries, getCallsLogMode, getCallsLogRetentionDays } from "../config.js";
 
@@ -37,13 +39,58 @@ export interface CallLogTokens {
 /** Résultat d'une tentative de relais. */
 export type CallResult = "ok" | "error" | "aborted" | "skipped";
 
+/**
+ * Motif CATÉGORISÉ d'un échec — liste blanche FERMÉE. C'est le SEUL niveau de
+ * détail toléré sur la cause : jamais le corps, jamais la clé, jamais le prompt.
+ *   - `quota`         : quota/limite d'usage épuisé (ex. Ollama « weekly usage limit ») ;
+ *   - `rate_limit`    : 429 de débit (trop de requêtes), sans motif de quota ;
+ *   - `overloaded`    : 503 (service momentanément indisponible) ;
+ *   - `auth_error`    : 401/403 (clé invalide/expirée ou droits insuffisants) ;
+ *   - `network_error` : échec réseau (aucune réponse HTTP) ;
+ *   - `upstream_error`: tout autre code / erreur amont.
+ */
+export const CALL_REASONS = ["quota", "rate_limit", "overloaded", "auth_error", "network_error", "upstream_error"] as const;
+export type CallReason = (typeof CALL_REASONS)[number];
+
+/**
+ * Identifiant d'un APPEL LOGIQUE, commun à TOUTES ses tentatives (principal +
+ * replis). Permet de constater un repli sans corréler à la main horodatage et
+ * service : deux lignes partageant le même `callId` = un seul appel replié.
+ * Court (12 caractères hexadécimaux) pour rester lisible dans le journal.
+ */
+export function newCallId(): string {
+  return randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+/**
+ * Catégorise un échec fournisseur en motif court (voir `CallReason`).
+ * `bodyText` sert UNIQUEMENT à distinguer un quota épuisé d'un simple débit
+ * dépassé : il n'est JAMAIS journalisé (il peut contenir du contexte compte).
+ */
+export function classifyReason(status: number | undefined, bodyText?: string): CallReason {
+  if (status === undefined) return "network_error";
+  if (status === 401 || status === 403) return "auth_error";
+  if (status === 429) {
+    const hay = (bodyText ?? "").toLowerCase();
+    if (hay.includes("quota") || hay.includes("usage limit")) return "quota";
+    if (hay.includes("limit") && !hay.includes("rate limit")) return "quota";
+    return "rate_limit";
+  }
+  if (status === 503) return "overloaded";
+  return "upstream_error";
+}
+
 export interface CallLogEntry {
   /** Horodatage ISO 8601 de la FIN de la tentative. */
   ts: string;
+  /** Identifiant de l'appel logique, commun à toutes ses tentatives (facultatif : entrées antérieures). */
+  callId?: string;
   /** Service du catalogue (ou `native:<providerId>` pour le relais natif). */
   service: string;
   /** Rang dans la chaîne : 0 = principal, 1.. = repli n° (repli ⇔ attempt > 0). */
   attempt: number;
+  /** Repli ? Explicité (= `attempt > 0`) pour une lecture immédiate, sans calcul. */
+  isFallback?: boolean;
   /** Fournisseur visé. */
   provider: string;
   /** Modèle demandé au fournisseur. */
@@ -51,13 +98,16 @@ export interface CallLogEntry {
   result: CallResult;
   /** Code HTTP de la réponse fournisseur (absent si échec réseau). */
   status?: number;
+  /** Motif CATÉGORISÉ de l'échec (liste blanche) — jamais le corps ni un secret. */
+  reason?: CallReason;
   /** Message court d'un échec réseau (jamais le corps du fournisseur). */
   error?: string;
   durationMs: number;
   /** Consommation rapportée par le fournisseur, si disponible. */
   tokens?: CallLogTokens;
   // ── Mode « full » uniquement ──
-  cls?: "light" | "heavy";
+  /** Le service appelé était-il prioritaire ? (priorité intrinsèque, sans en-tête) */
+  prioritaire?: boolean;
   stream?: boolean;
   endpoint?: string;
   providerType?: string;
@@ -68,12 +118,15 @@ export type CallLogInput = Omit<CallLogEntry, "ts"> & { ts?: string };
 /** Champs essentiels conservés en mode « summary ». */
 const ESSENTIAL: (keyof CallLogEntry)[] = [
   "ts",
+  "callId",
   "service",
   "attempt",
+  "isFallback",
   "provider",
   "model",
   "result",
   "status",
+  "reason",
   "error",
   "durationMs",
   "tokens",
@@ -84,7 +137,7 @@ const ESSENTIAL: (keyof CallLogEntry)[] = [
 const MAX_ERROR_CHARS = 300;
 
 /** Champs exposés par la route de consultation (whitelist : un fichier modifié à la main ne peut rien injecter). */
-const READ_FIELDS: (keyof CallLogEntry)[] = [...ESSENTIAL, "cls", "endpoint", "providerType"];
+const READ_FIELDS: (keyof CallLogEntry)[] = [...ESSENTIAL, "prioritaire", "endpoint", "providerType"];
 
 // ── État mémoire (un seul process) ──
 
@@ -140,6 +193,9 @@ export function logCall(input: CallLogInput): void {
     const entry: CallLogEntry = {
       ...input,
       ts: input.ts ?? new Date().toISOString(),
+      // Un repli est une tentative de rang > 0 : on l'EXPLICITE pour que le
+      // journal se lise sans recalcul (les entrées antérieures restent lisibles).
+      isFallback: input.isFallback ?? (typeof input.attempt === "number" && input.attempt > 0),
       error: truncateError(input.error),
     };
     if (getCallsLogMode() !== "full") {
@@ -224,11 +280,71 @@ export interface CallsLogQuery {
   result?: string;
 }
 
+/**
+ * Bilan des replis, calculé sur le journal (indépendamment des filtres de la
+ * page). Objectif : l'utilisateur VOIT que son repli payant a été sollicité, et
+ * combien de fois. Les répartitions portent sur la fenêtre (`windowHours`).
+ */
+export interface FallbackStats {
+  /** Taille de la fenêtre des répartitions, en heures. */
+  windowHours: number;
+  /** Nombre total de tentatives de repli journalisées (tout le journal). */
+  total: number;
+  /** Nombre de tentatives de repli dans la fenêtre. */
+  last24h: number;
+  /** Tentatives de repli de la fenêtre, par service appelé. */
+  byService: Record<string, number>;
+  /** Tentatives de repli de la fenêtre, par fournisseur de repli sollicité. */
+  byFallbackProvider: Record<string, number>;
+  /** Tentatives de repli de la fenêtre, par motif catégorisé. */
+  reasons: Record<string, number>;
+}
+
+/** Ramasse les tentatives de repli et leurs répartitions sur `windowHours`. */
+export function summarizeFallbacks(
+  entries: CallLogEntry[],
+  windowHours = 24,
+  now: number = Date.now(),
+): FallbackStats {
+  const cutoff = now - Math.max(0, windowHours) * 3_600_000;
+  const stats: FallbackStats = {
+    windowHours,
+    total: 0,
+    last24h: 0,
+    byService: {},
+    byFallbackProvider: {},
+    reasons: {},
+  };
+  const bump = (bucket: Record<string, number>, key: string): void => {
+    bucket[key] = (bucket[key] ?? 0) + 1;
+  };
+  for (const entry of entries) {
+    const ts = typeof entry.ts === "string" ? Date.parse(entry.ts) : Number.NaN;
+    const inWindow = Number.isFinite(ts) ? ts >= cutoff : true;
+    // Un repli est une tentative de rang > 0 (isFallback explicite ou ancien journal).
+    const isFallback = entry.isFallback === true || (typeof entry.attempt === "number" && entry.attempt > 0);
+    if (isFallback) {
+      stats.total += 1;
+      if (inWindow) {
+        stats.last24h += 1;
+        bump(stats.byService, String(entry.service ?? "?"));
+        bump(stats.byFallbackProvider, String(entry.provider ?? "?"));
+      }
+    }
+    // Motifs d'échec de la fenêtre — TOUS rangs confondus : c'est la raison de
+    // l'échec du principal (429 quota, 503…) qui explique le repli.
+    if (typeof entry.reason === "string" && inWindow) bump(stats.reasons, entry.reason);
+  }
+  return stats;
+}
+
 export interface CallsLogPage {
   entries: CallLogEntry[];
   total: number;
   limit: number;
   offset: number;
+  /** Bilan des replis (global, non filtré) — voir `FallbackStats`. */
+  summary: FallbackStats;
 }
 
 const DEFAULT_LIMIT = 50;
@@ -267,8 +383,12 @@ export function readCallsLog(query: CallsLogQuery = {}): CallsLogPage {
     }
   } catch (err) {
     console.error("[calls-log] Failed to read:", err);
-    return { entries: [], total: 0, limit, offset };
+    return { entries: [], total: 0, limit, offset, summary: summarizeFallbacks([]) };
   }
+
+  // Le bilan des replis porte sur TOUT le journal (non filtré) : c'est un
+  // compteur de référence, pas une vue de la page courante.
+  const summary = summarizeFallbacks(entries);
 
   if (query.service) entries = entries.filter((e) => e.service === query.service);
   if (query.result) entries = entries.filter((e) => e.result === query.result);
@@ -276,7 +396,7 @@ export function readCallsLog(query: CallsLogQuery = {}): CallsLogPage {
   const total = entries.length;
   // Le plus récent d'abord : l'ordre du fichier est chronologique croissant.
   const page = entries.reverse().slice(offset, offset + limit);
-  return { entries: page, total, limit, offset };
+  return { entries: page, total, limit, offset, summary };
 }
 
 // ── Purge périodique de la rétention (le nombre est géré à l'écriture) ──

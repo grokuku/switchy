@@ -230,6 +230,8 @@ export const SETTINGS_SPEC: readonly SettingSpec[] = [
 
   // ── Runtime (appliqués à chaud) ──
   { name: "SWITCHY_LOG_LEVEL", group: "runtime", type: "string", default: "info", options: ["debug", "info", "warn", "error"] },
+  // Plafond de concurrence PAR DÉFAUT d'un fournisseur sans `maxConcurrency`
+  // propre (la limite est comptée par fournisseur, plus globalement).
   {
     name: "SWITCHY_CONCURRENCY",
     group: "runtime",

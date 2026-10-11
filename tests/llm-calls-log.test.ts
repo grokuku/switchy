@@ -83,19 +83,18 @@ describe("journal d'appels — contenu", () => {
     expect(raw).toContain("chat");
   });
 
-  it("mode full : ajoute la classe, le streaming et la provenance — toujours sans contenu", async () => {
+  it("mode full : ajoute la priorité, le streaming et la provenance — toujours sans contenu", async () => {
     env.cleanup();
     env = makeTestEnv({ SWITCHY_CALLS_LOG_MODE: "full" });
-    await seedChat();
+    await seedChat({ prioritaire: true });
     mock = installMockFetch(() => jsonResponse({ choices: [] }));
 
     await api(env.app)
       .post("/api/llm/chat")
-      .set("X-Switchy-Class", "light")
       .send({ messages: [{ role: "user", content: "SECRET" }] });
 
     const entry = JSON.parse(logLines()[0]) as Record<string, unknown>;
-    expect(entry).toMatchObject({ cls: "light", stream: false, endpoint: "POST /api/llm/:service" });
+    expect(entry).toMatchObject({ prioritaire: true, stream: false, endpoint: "POST /api/llm/:service" });
     expect(entry).not.toHaveProperty("messages");
     expect(JSON.stringify(entry)).not.toContain("SECRET");
   });

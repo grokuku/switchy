@@ -3,7 +3,7 @@
 **Passerelle LLM centralisée** de l'écosystème **holaf** : elle expose des
 **services LLM nommés** (ex. `Deepseek-Fast`) — principal + replis ordonnés,
 niveau de réflexion, taille de contexte, tokens de sortie max, vision,
-réservations de slots — que les autres projets (Pi-Web, Yuki, Kinoscribe,
+priorité — que les autres projets (Pi-Web, Yuki, Kinoscribe,
 Docky, protocore…) appellent **par nom de service**, jamais par modèle de
 fournisseur.
 
@@ -12,9 +12,12 @@ Objectifs du service :
 - **Relayer** les appels vers les fournisseurs (transparent : streaming SSE,
   tool-calling) et **relayer aussi l'API native Ollama** (`/api/tags`,
   capacités) — sans quoi la découverte des modèles côté Pi-Web serait cassée.
-- **Compter les appels en vol globalement** : l'abonnement Ollama Pro autorise
-  3 requêtes simultanées **par compte**, toutes clés confondues. Switchy est le
-  point unique qui sait ce que font tous les outils à la fois.
+- **Compter les appels en vol PAR FOURNISSEUR** : la limite appartient au
+  **compte** du fournisseur (ex. Ollama Pro autorise 3 requêtes simultanées par
+  compte, toutes clés confondues). Chaque fournisseur a son propre « seau » :
+  deux fournisseurs ne se limitent **jamais** mutuellement. Le service, lui,
+  porte seulement un indicateur **« prioritaire »** (ses appels passent en
+  premier quand une place se libère) — intrinsèque, sans en-tête client.
 - Tenir un **journal d'appels** (un repli silencieux est un changement de
   qualité invisible).
 
@@ -36,6 +39,11 @@ Objectifs du service :
   **session d'administration** (navigateur, lot connexion). Aucun « mode
   amorçage » : l'API n'est jamais ouverte sans l'un des deux. Les secrets ne sont
   jamais réaffichés.
+- **Découverte des modèles** : `GET /api/providers/:id/models` (liste pour le
+  formulaire de service) et `GET /api/providers/:id/models/:model` (capacités :
+  contexte, vision, outils, réflexion). Switchy interroge le fournisseur avec
+  **sa clé** (OpenAI-compatible `GET /models` ; Ollama natif `GET /api/tags` et
+  `POST /api/show`), avec cache court.
 - Interface web **pleine largeur** servie sans build : onglets **Services**
   (CRUD, principal + replis ordonnés, capacités), **Fournisseurs** (CRUD, clé
   jamais réaffichée) et **Réglages** (badges source, « redémarrage requis »,
@@ -224,7 +232,7 @@ l'**interface** (v1) — jamais par édition de fichier à la main.
 | `SWITCHY_DATA_DIR` | `/app/data` | Répertoire de données persistant (volume). |
 | `SWITCHY_RATE_LIMIT_PER_MIN` | `600` | Requêtes/minute/IP. |
 | `SWITCHY_API_KEY` | — | Clé d'API optionnelle (secret) pour les OUTILS, en plus des clés créées dans l'interface. |
-| `SWITCHY_CONCURRENCY` | `3` | Limite globale de concurrence (à chaud). |
+| `SWITCHY_CONCURRENCY` | `3` | Concurrence **par défaut d'un fournisseur** sans `maxConcurrency` propre (à chaud). |
 | `SWITCHY_LOG_LEVEL` | `info` | Niveau de log (à chaud). |
 | `SWITCHY_CALLS_LOG_MODE` | `summary` | Journal d'appels : `off` \| `summary` \| `full`. |
 | `SWITCHY_CALLS_LOG_RETENTION_DAYS` | `7` | Rétention du journal (jours). |
@@ -244,7 +252,8 @@ src/
   catalog-store.ts  # fournisseurs + services ($DATA_DIR/catalog.json) + validation
   switchy-auth.ts   # clés d'API nommées/hachées/révocables (outils)
   middleware/       # garde d'authentification des routes /api
-  routes/           # providers, services, settings, keys
+  routes/           # providers (+ modèles), services, settings, keys
+  llm/              # relais, concurrence PAR FOURNISSEUR, découverte des modèles, journal
   utils/            # hachage scrypt, erreurs HTTP typées
 public/
   index.html      # onglets Services / Fournisseurs / Réglages

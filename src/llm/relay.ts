@@ -20,14 +20,19 @@
  *
  * Politique de bascule (`shouldFallback`) : on ne bascule PAS sur une erreur
  * manifeste de la requête (400, 405, 406, 413, 415, 422) — l'étape suivante
- * échouerait pareil ; on bascule sur tout le reste (401/403/404 : clé ou
- * modèle propres à un fournisseur, 408/409/429, 5xx, échec réseau).
+ * échouerait pareil — NI sur un échec d'AUTHENTIFICATION (401/403) : une clé
+ * invalide/expirée ne deviendra pas valide chez le fournisseur suivant, et
+ * basculer vers un repli PAYANT masquerait un simple problème de configuration.
+ * L'échec est alors relayé tel quel et journalisé (`reason: "auth_error"`).
+ * On bascule sur tout le reste : 404 (modèle propre à un fournisseur), 408/409,
+ * 429 (quota ou débit), 5xx, échec réseau.
  */
 import type { IncomingHttpHeaders } from "node:http";
 import { getProvider, getService, type ProviderRecord, type ServiceRecord, type ServiceStep } from "../catalog-store.js";
+import { getConcurrency } from "../config.js";
 import { ApiError } from "../utils/api-error.js";
-import { logCall, type CallLogTokens } from "./calls-log.js";
-import { llmSlots, QueueFullError, QueueTimeoutError, type SlotClass } from "./slot-queue.js";
+import { classifyReason, logCall, newCallId, type CallLogTokens } from "./calls-log.js";
+import { llmSlots, QueueFullError, QueueTimeoutError } from "./slot-queue.js";
 
 // ── Entrées / sorties ──
 
@@ -38,8 +43,6 @@ export interface RelayInput {
   body: Record<string, unknown>;
   /** En-têtes de la requête client (filtrés avant émission). */
   headers: IncomingHttpHeaders;
-  /** Classe d'appel (en-tête `X-Switchy-Class`), priorité et quota de file. */
-  cls?: SlotClass;
   /** Signal d'annulation (déconnexion du client). */
   signal?: AbortSignal;
   /** Étiquette de provenance pour le journal (mode `full`). */
@@ -153,7 +156,7 @@ export function filterResponseHeaders(headers: Headers): Record<string, string> 
 
 // ── Politique de bascule ──
 
-const NON_FALLBACK_STATUSES = new Set([400, 405, 406, 413, 415, 422]);
+const NON_FALLBACK_STATUSES = new Set([400, 401, 403, 405, 406, 413, 415, 422]);
 
 /** Vrai si l'échec de l'étape justifie d'essayer l'étape suivante. */
 export function shouldFallback(status: number | undefined): boolean {
@@ -295,10 +298,12 @@ interface StepParams {
   service: ServiceRecord;
   step: ServiceStep;
   attempt: number;
+  /** Identifiant de l'appel logique (commun à toutes les tentatives). */
+  callId: string;
   provider: ProviderRecord;
   body: Record<string, unknown>;
   headers: IncomingHttpHeaders;
-  cls: SlotClass;
+  prioritaire: boolean;
   signal: AbortSignal | undefined;
   endpoint: string | undefined;
 }
@@ -308,14 +313,16 @@ type StepOutcome =
   | { ok: false; failure: UpstreamFailure; fallbackable: boolean };
 
 async function attemptStep(params: StepParams): Promise<StepOutcome> {
-  const { service, step, attempt, provider, body, headers, cls, signal, endpoint } = params;
+  const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint } = params;
   const startedAt = Date.now();
 
-  // Slot GLOBAL : un identifiant unique est généré par la file (jamais une clé métier).
+  // Slot du seau DU FOURNISSEUR : sa `maxConcurrency` (ou le défaut global)
+  // s'applique, et la priorité est INTRINSÈQUE au service (pas d'en-tête client).
   const slotKey = await llmSlots.acquire({
     service: service.name,
-    cls,
-    reservations: service.reservations,
+    provider: provider.id,
+    limit: provider.maxConcurrency ?? getConcurrency(),
+    prioritaire,
   });
   let released = false;
   const release = (): void => {
@@ -325,11 +332,12 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
   };
 
   const common = {
+    callId,
     service: service.name,
     attempt,
     provider: provider.id,
     model: step.model,
-    cls,
+    prioritaire,
     endpoint,
     providerType: provider.type,
   };
@@ -346,11 +354,13 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     if (!upstream.ok) {
       const errorBody = Buffer.from(await upstream.arrayBuffer());
       const fallbackable = shouldFallback(upstream.status);
+      const reason = classifyReason(upstream.status, errorBody.toString("utf-8"));
       logCall({
         ...common,
         result: "error",
         status: upstream.status,
-        error: fallbackable ? "upstream_error" : "upstream_rejected_request",
+        reason,
+        error: fallbackable ? "upstream_error" : reason === "auth_error" ? "upstream_auth_error" : "upstream_rejected_request",
         durationMs: Date.now() - startedAt,
         stream: wantsStream(body),
       });
@@ -369,7 +379,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
           ...common,
           result: report.aborted ? "aborted" : report.error ? "error" : "ok",
           status: upstream.status,
-          ...(report.error && !report.aborted ? { error: report.error } : {}),
+          ...(report.error && !report.aborted ? { error: report.error, reason: "upstream_error" as const } : {}),
           durationMs: Date.now() - startedAt,
           tokens: report.usage,
           stream: true,
@@ -396,7 +406,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     logCall({
       ...common,
       result: aborted ? "aborted" : "error",
-      ...(aborted ? {} : { error: err instanceof Error ? err.message : String(err) }),
+      ...(aborted ? {} : { error: err instanceof Error ? err.message : String(err), reason: "network_error" as const }),
       durationMs: Date.now() - startedAt,
       stream: wantsStream(body),
     });
@@ -418,7 +428,7 @@ function jsonErrorBody(message: string, code: string): Buffer {
 
 /**
  * Relaie un appel « chat completions » pour un service nommé :
- * principal → replis, avec comptage global et journalisation de CHAQUE
+ * principal → replis, avec comptage PAR FOURNISSEUR et journalisation de CHAQUE
  * tentative. Jette `ApiError` (service inconnu/désactivé), `QueueFullError` /
  * `QueueTimeoutError` (429 côté route) ou `UpstreamFailure` (dernier échec à
  * relayer tel quel).
@@ -433,8 +443,11 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
     throw new UpstreamFailure(499, {}, null, { aborted: true, message: "Client disconnected" });
   }
 
-  const cls: SlotClass = input.cls ?? "heavy";
+  const prioritaire = service.prioritaire === true;
   const steps: ServiceStep[] = [service.principal, ...service.fallbacks];
+  // Identifiant commun à TOUTES les tentatives de cet appel : un repli se
+  // constate en lisant le journal (mêmes `callId`) sans corrélation manuelle.
+  const callId = newCallId();
 
   let lastFailure: UpstreamFailure | null = null;
   let anyAttempted = false;
@@ -445,6 +458,7 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
     if (!provider || !provider.enabled) {
       // Étape impossible : journalisée (jamais silencieuse), aucun appel réseau.
       logCall({
+        callId,
         service: service.name,
         attempt,
         provider: step.providerId,
@@ -452,7 +466,7 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
         result: "skipped",
         error: provider ? "provider_disabled" : "provider_missing",
         durationMs: 0,
-        cls,
+        prioritaire,
         endpoint: input.endpoint,
       });
       continue;
@@ -463,10 +477,11 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
       service,
       step,
       attempt,
+      callId,
       provider,
       body: input.body,
       headers: input.headers,
-      cls,
+      prioritaire,
       signal: input.signal,
       endpoint: input.endpoint,
     });

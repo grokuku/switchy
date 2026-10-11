@@ -36,7 +36,11 @@ export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const LIMITS = {
   contextWindow: { min: 1, max: 100_000_000 },
   maxOutputTokens: { min: 1, max: 10_000_000 },
-  reserves: { min: 0, max: 1000 },
+  /**
+   * Plafond de simultanéité du COMPTE d'un fournisseur. La borne est au moins
+   * 1 : `0` bloquerait toute la capacité (ancien piège des réservations).
+   */
+  maxConcurrency: { min: 1, max: 1000 },
   maxFallbacks: 16,
 } as const;
 
@@ -52,12 +56,6 @@ export interface ServiceStep {
   reasoning: ReasoningLevel;
 }
 
-/** Réservations de slots (optionnel) : « léger ≤ light, lourd ≤ heavy ». */
-export interface ServiceReservations {
-  light?: number;
-  heavy?: number;
-}
-
 export interface ProviderRecord {
   id: string;
   label: string;
@@ -66,6 +64,15 @@ export interface ProviderRecord {
   baseUrl: string;
   /** URL de l'API NATIVE du fournisseur (ex. Ollama `/api/tags`) — optionnelle. */
   nativeUrl?: string;
+  /**
+   * Nombre d'appels SIMULTANÉS autorisés pour le COMPTE de ce fournisseur
+   * (ex. 3 pour Ollama Cloud Pro, 500 pour un OpenRouter payant…). Absent =
+   * valeur par défaut globale `SWITCHY_CONCURRENCY`. C'est LE bon endroit : la
+   * limite appartient au fournisseur, pas au service. Chaque fournisseur a son
+   * propre « seau » de places : deux fournisseurs ne se limitent JAMAIS
+   * mutuellement.
+   */
+  maxConcurrency?: number;
   /** SECRET : clé du fournisseur. Jamais renvoyée par l'API. */
   apiKey?: string;
   enabled: boolean;
@@ -81,7 +88,13 @@ export interface ServiceRecord {
   contextWindow: number;
   maxOutputTokens: number;
   vision: boolean;
-  reservations?: ServiceReservations;
+  /**
+   * Priorité de file INTRINSÈQUE au service : quand une place se libère chez un
+   * fournisseur, les appels des services prioritaires passent avant les autres
+   * (le « léger » n'attend pas derrière le « lourd »). Comme le service est
+   * défini une fois dans le catalogue, le client n'a AUCUN en-tête à envoyer.
+   */
+  prioritaire: boolean;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -104,12 +117,45 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
+/**
+ * Migration DOUCE à la lecture : un `catalog.json` d'une version antérieure
+ * reste TOUJOURS lisible. Les champs disparus (ex. `reservations` d'un service)
+ * sont simplement IGNORÉS ; les nouveaux champs prennent leur valeur par défaut
+ * (`prioritaire: false`, `maxConcurrency` absent = défaut global). Aucun crash,
+ * aucune réécriture forcée.
+ */
+function normalizeProvider(value: Record<string, unknown>): ProviderRecord {
+  const provider = { ...value } as unknown as ProviderRecord;
+  const mc = provider.maxConcurrency;
+  if (mc !== undefined && (!Number.isInteger(mc) || mc < LIMITS.maxConcurrency.min)) {
+    delete provider.maxConcurrency; // valeur illégale (ex. 0) → retombe sur le défaut global
+  }
+  return provider;
+}
+
+function normalizeService(value: Record<string, unknown>): ServiceRecord {
+  // `reservations` (ancien champ de service) est explicitement écarté : sa
+  // sémantique a migré vers `ProviderRecord.maxConcurrency`.
+  const { reservations: _legacyReservations, ...rest } = value;
+  const service = { ...rest } as unknown as ServiceRecord;
+  service.prioritaire = service.prioritaire === true; // défaut `false` si absent
+  return service;
+}
+
 /** Sanitise ce qui vient du disque : on ne fait jamais confiance au fichier. */
 function sanitizeCatalog(raw: unknown): Catalog {
   const root = asRecord(raw);
   if (!root) return { ...EMPTY, providers: [], services: [] };
-  const providers = Array.isArray(root.providers) ? (root.providers.filter((p) => asRecord(p)) as ProviderRecord[]) : [];
-  const services = Array.isArray(root.services) ? (root.services.filter((s) => asRecord(s)) as ServiceRecord[]) : [];
+  const providers = Array.isArray(root.providers)
+    ? root.providers
+        .filter((p) => asRecord(p))
+        .map((p) => normalizeProvider(asRecord(p) as Record<string, unknown>))
+    : [];
+  const services = Array.isArray(root.services)
+    ? root.services
+        .filter((s) => asRecord(s))
+        .map((s) => normalizeService(asRecord(s) as Record<string, unknown>))
+    : [];
   return { version: CATALOG_VERSION, providers, services };
 }
 
@@ -214,6 +260,34 @@ function requireInteger(
     return null;
   }
   return value;
+}
+
+/**
+ * Valide `maxConcurrency` (plafond de simultanéité du compte fournisseur).
+ * `undefined`/`null`/chaîne vide = NON fourni (défaut global) ; sinon entier
+ * ≥ 1. Le `0` est REFUSÉ avec un message explicite : il bloquerait toute la
+ * capacité du fournisseur (ancien piège des réservations).
+ */
+function requireMaxConcurrency(value: unknown, field: string, errors: string[]): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    errors.push(`${field}: must be an integer (simultaneous calls allowed for this provider account)`);
+    return null;
+  }
+  if (value < LIMITS.maxConcurrency.min) {
+    errors.push(`${field}: must be at least ${LIMITS.maxConcurrency.min} (0 would disable the provider entirely)`);
+    return null;
+  }
+  if (value > LIMITS.maxConcurrency.max) {
+    errors.push(`${field}: must be at most ${LIMITS.maxConcurrency.max}`);
+    return null;
+  }
+  return value;
+}
+
+/** Interprète un `maxConcurrency` optionnel : vide → `undefined` (non fourni). */
+function optionalMaxConcurrency(value: unknown, field: string, errors: string[]): number | null | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  return requireMaxConcurrency(value, field, errors);
 }
 
 function requireEnum<T extends string>(
@@ -336,6 +410,7 @@ export function createProvider(input: unknown): ProviderRecord {
     }
   }
   const enabled = body.enabled === undefined ? true : requireBoolean(body.enabled, "enabled", errors);
+  const maxConcurrency = optionalMaxConcurrency(body.maxConcurrency, "maxConcurrency", errors);
 
   if (errors.length > 0) throw ApiError.validation(errors);
 
@@ -351,6 +426,7 @@ export function createProvider(input: unknown): ProviderRecord {
     type: type as ProviderType,
     baseUrl: baseUrl as string,
     ...(nativeUrl ? { nativeUrl } : {}),
+    ...(typeof maxConcurrency === "number" ? { maxConcurrency } : {}),
     enabled: enabled as boolean,
     createdAt: now,
     updatedAt: now,
@@ -401,6 +477,14 @@ export function updateProvider(id: string, input: unknown): ProviderRecord {
       } catch {
         errors.push("nativeUrl: must be a valid absolute URL");
       }
+    }
+  }
+  if (body.maxConcurrency !== undefined) {
+    if (body.maxConcurrency === null || body.maxConcurrency === "") {
+      delete next.maxConcurrency; // null/"" = retour au défaut global
+    } else {
+      const mc = requireMaxConcurrency(body.maxConcurrency, "maxConcurrency", errors);
+      if (mc !== null) next.maxConcurrency = mc;
     }
   }
   if (body.enabled !== undefined) {
@@ -460,7 +544,7 @@ function validateServiceBody(
   contextWindow?: number;
   maxOutputTokens?: number;
   vision?: boolean;
-  reservations?: ServiceReservations | null;
+  prioritaire?: boolean;
   enabled?: boolean;
 } {
   const out: ReturnType<typeof validateServiceBody> = {};
@@ -517,25 +601,9 @@ function validateServiceBody(
     const vision = requireBoolean(body.vision ?? false, "vision", errors);
     if (vision !== null) out.vision = vision;
   }
-  if (body.reservations !== undefined) {
-    if (body.reservations === null) {
-      out.reservations = null;
-    } else {
-      const obj = asRecord(body.reservations);
-      if (!obj) {
-        errors.push("reservations: must be an object { light?, heavy? } or null");
-      } else {
-        const light =
-          obj.light === undefined || obj.light === null
-            ? undefined
-            : requireInteger(obj.light, "reservations.light", errors, LIMITS.reserves) ?? undefined;
-        const heavy =
-          obj.heavy === undefined || obj.heavy === null
-            ? undefined
-            : requireInteger(obj.heavy, "reservations.heavy", errors, LIMITS.reserves) ?? undefined;
-        out.reservations = { ...(light !== undefined ? { light } : {}), ...(heavy !== undefined ? { heavy } : {}) };
-      }
-    }
+  if (body.prioritaire !== undefined || mustExist) {
+    const prioritaire = requireBoolean(body.prioritaire ?? false, "prioritaire", errors);
+    if (prioritaire !== null) out.prioritaire = prioritaire;
   }
   if (body.enabled !== undefined || mustExist) {
     const enabled = requireBoolean(body.enabled ?? true, "enabled", errors);
@@ -569,9 +637,7 @@ export function createService(input: unknown): ServiceRecord {
     contextWindow: parsed.contextWindow as number,
     maxOutputTokens: parsed.maxOutputTokens as number,
     vision: parsed.vision ?? false,
-    ...(parsed.reservations && Object.keys(parsed.reservations).length > 0
-      ? { reservations: parsed.reservations }
-      : {}),
+    prioritaire: parsed.prioritaire ?? false,
     enabled: parsed.enabled ?? true,
     createdAt: now,
     updatedAt: now,
@@ -609,10 +675,7 @@ export function updateService(name: string, input: unknown): ServiceRecord {
   if (parsed.contextWindow !== undefined) next.contextWindow = parsed.contextWindow;
   if (parsed.maxOutputTokens !== undefined) next.maxOutputTokens = parsed.maxOutputTokens;
   if (parsed.vision !== undefined) next.vision = parsed.vision;
-  if (parsed.reservations !== undefined) {
-    if (parsed.reservations === null || Object.keys(parsed.reservations).length === 0) delete next.reservations;
-    else next.reservations = parsed.reservations;
-  }
+  if (parsed.prioritaire !== undefined) next.prioritaire = parsed.prioritaire;
   if (parsed.enabled !== undefined) next.enabled = parsed.enabled;
 
   next.updatedAt = new Date().toISOString();

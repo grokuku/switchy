@@ -301,6 +301,27 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-size: 12.5px;
 }
 
+/* Compteur de replis (onglet Services) — bandeau SOBRE, PLEINE LARGEUR. */
+.fallback-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0 0 var(--switchy-gap);
+  padding: 8px 12px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 3px);
+  background: var(--switchy-bg-raised);
+  color: var(--switchy-text-muted);
+  font-size: 12.5px;
+}
+
+.fallback-summary__count {
+  color: var(--switchy-warn);
+  font-weight: 600;
+}
+
 .field--grow {
   flex: 1 1 260px;
 }
@@ -439,7 +460,8 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 }
 
 .card + .cards-grid,
-.toolbar + .cards-grid {
+.toolbar + .cards-grid,
+.fallback-summary + .cards-grid {
   margin: 0;
 }
 
@@ -660,6 +682,41 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 .fallback-tools {
   display: flex;
   gap: 4px;
+}
+
+/* ── Combobox de modèle (formulaire de service) ───────────────────────── */
+
+.model-combo {
+  display: grid;
+  gap: 6px;
+}
+
+.model-combo-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-combo-top input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.model-combo select.model-list {
+  width: 100%;
+  min-height: 96px;
+  padding: 4px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg-raised);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.model-status {
+  margin: 0;
+  font-size: 12.5px;
 }
 
 /* ── Réglages ─────────────────────────────────────────────────────────── */

@@ -12,24 +12,19 @@
  * tool-calling et canaux de réflexion passés tels quels, codes d'erreur du
  * fournisseur relayés tels quels.
  *
- * Classe d'appel : en-tête `X-Switchy-Class: light|heavy` (défaut `heavy`) —
- * priorité de file et quota `reservations.light` / `reservations.heavy` du
- * service. Réponses de saturation : 429 + `Retry-After` (file pleine ou
- * attente expirée).
+ * Concurrence : PAR FOURNISSEUR (`ProviderRecord.maxConcurrency`, sinon le
+ * défaut global `SWITCHY_CONCURRENCY`). La priorité de file est INTRINSÈQUE au
+ * service (`ServiceRecord.prioritaire`) : le client n'a AUCUN en-tête à envoyer.
+ * Réponses de saturation : 429 + `Retry-After` (file pleine ou attente expirée).
  */
 import { Router, type Request, type Response } from "express";
 import { Readable } from "node:stream";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { relayServiceChat, UpstreamFailure, QueueFullError, QueueTimeoutError, type RelayOutput } from "../llm/relay.js";
-import type { SlotClass } from "../llm/slot-queue.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
 
 /** Estimation Retry-After (ms) quand la file d'attente est saturée. */
 const RETRY_AFTER_FALLBACK_MS = 5000;
-
-function slotClassOf(req: Request): SlotClass {
-  return req.get("x-switchy-class")?.toLowerCase() === "light" ? "light" : "heavy";
-}
 
 function bodyRecord(body: unknown): Record<string, unknown> {
   return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
@@ -64,7 +59,6 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
       serviceName,
       body: bodyRecord(req.body),
       headers: req.headers,
-      cls: slotClassOf(req),
       signal: controller.signal,
       endpoint,
     });

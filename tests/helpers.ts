@@ -10,6 +10,7 @@ import { resetAuthCaches, createKey } from "../src/switchy-auth.js";
 import { resetLoginRateLimitForTests } from "../src/routes/session.js";
 import { resetLlmSlots } from "../src/llm/slot-queue.js";
 import { resetCallsLogState } from "../src/llm/calls-log.js";
+import { resetModelCatalogCache } from "../src/llm/model-catalog.js";
 
 export interface TestEnv {
   app: Express;
@@ -59,6 +60,7 @@ export function makeTestEnv(overrides: Record<string, string> = {}): TestEnv {
   resetAuthCaches();
   resetLlmSlots();
   resetCallsLogState();
+  resetModelCatalogCache();
   // Compteur anti-force brute du login : store module, réinitialisé par test.
   void resetLoginRateLimitForTests();
 

@@ -8,8 +8,9 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
-import { readFileSync, statSync } from "fs";
+import { readFileSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
+import { resetCatalogCache } from "../src/catalog-store.js";
 import { makeTestEnv, createApiKey, type TestEnv } from "./helpers.js";
 
 let env: TestEnv;
@@ -101,6 +102,32 @@ describe("providers — CRUD", () => {
     const res = await auth(request(env.app).delete("/api/providers/inexistant"));
     expect(res.status).toBe(404);
   });
+
+  it("maxConcurrency : accepté (≥ 1), absent = défaut global, 0 refusé", async () => {
+    const withLimit = await auth(request(env.app).post("/api/providers")).send(validProvider({ maxConcurrency: 3 }));
+    expect(withLimit.status).toBe(201);
+    expect(withLimit.body.provider.maxConcurrency).toBe(3);
+
+    const noLimit = await auth(request(env.app)
+      .post("/api/providers"))
+      .send(validProvider({ id: "sans-limite", label: "Sans limite" }));
+    expect(noLimit.status).toBe(201);
+    expect(noLimit.body.provider.maxConcurrency).toBeUndefined();
+
+    const zero = await auth(request(env.app)
+      .post("/api/providers"))
+      .send(validProvider({ id: "zero", label: "Zero", maxConcurrency: 0 }));
+    expect(zero.status).toBe(400);
+    expect(zero.body.code).toBe("VALIDATION_ERROR");
+    expect(zero.body.errors.join(" ")).toMatch(/maxConcurrency/);
+  });
+
+  it("mise à jour : maxConcurrency null → retour au défaut global", async () => {
+    await auth(request(env.app).post("/api/providers")).send(validProvider({ maxConcurrency: 5 }));
+    const res = await auth(request(env.app).put("/api/providers/ollama-cloud")).send({ maxConcurrency: null });
+    expect(res.status).toBe(200);
+    expect(res.body.provider.maxConcurrency).toBeUndefined();
+  });
 });
 
 const validService = (over = {}) => ({
@@ -111,7 +138,7 @@ const validService = (over = {}) => ({
   contextWindow: 128000,
   maxOutputTokens: 8192,
   vision: false,
-  reservations: { light: 1, heavy: 2 },
+  prioritaire: true,
   enabled: true,
   ...over,
 });
@@ -127,7 +154,9 @@ describe("services — CRUD & validation", () => {
     expect(res.body.service.name).toBe("Deepseek-Fast");
     expect(res.body.service.principal.model).toBe("deepseek-v3");
     expect(res.body.service.fallbacks).toHaveLength(1);
-    expect(res.body.service.reservations).toEqual({ light: 1, heavy: 2 });
+    expect(res.body.service.prioritaire).toBe(true);
+    // `reservations` n'existe plus au niveau du service.
+    expect(res.body.service.reservations).toBeUndefined();
   });
 
   it("nom dupliqué → 409", async () => {
@@ -194,5 +223,50 @@ describe("catalogue — persistance & permissions", () => {
     expect(fileMode).toBe(0o600);
     const dirMode = statSync(env.dir).mode & 0o777;
     expect(dirMode).toBe(0o700);
+  });
+
+  it("migration douce : un ancien catalogue (reservations) reste lisible sans casser", async () => {
+    // Fichier d'une version antérieure : service avec `reservations`, fournisseur
+    // sans `maxConcurrency`, service sans `prioritaire`.
+    const legacy = {
+      version: 1,
+      providers: [
+        {
+          id: "ollama-cloud",
+          label: "Ollama Cloud",
+          type: "openai-compatible",
+          baseUrl: "https://ollama.com/v1",
+          enabled: true,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          updatedAt: "2020-01-01T00:00:00.000Z",
+        },
+      ],
+      services: [
+        {
+          name: "Legacy",
+          description: "ancien",
+          principal: { providerId: "ollama-cloud", model: "m", reasoning: "off" },
+          fallbacks: [],
+          contextWindow: 8000,
+          maxOutputTokens: 1000,
+          vision: false,
+          reservations: { light: 1, heavy: 2 },
+          enabled: true,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          updatedAt: "2020-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    writeFileSync(join(env.dir, "catalog.json"), JSON.stringify(legacy), { mode: 0o600 });
+    resetCatalogCache();
+
+    const services = await auth(request(env.app).get("/api/services"));
+    expect(services.status).toBe(200);
+    expect(services.body.services[0].name).toBe("Legacy");
+    expect(services.body.services[0].reservations).toBeUndefined();
+    expect(services.body.services[0].prioritaire).toBe(false);
+
+    const providers = await auth(request(env.app).get("/api/providers"));
+    expect(providers.body.providers[0].maxConcurrency).toBeUndefined();
   });
 });

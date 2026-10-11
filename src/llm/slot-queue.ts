@@ -1,45 +1,46 @@
 /**
- * Compteur GLOBAL de concurrence LLM de Switchy — la raison d'être du service.
+ * Compteur de concurrence LLM de Switchy — PAR FOURNISSEUR.
  *
- * Un point unique qui connaît TOUS les appels en vol (toutes clés et tous
- * clients confondus) et applique :
+ * La limite appartient au COMPTE du fournisseur (ex. Ollama Cloud Pro autorise
+ * 3 requêtes simultanées par compte, toutes clés et tous clients confondus).
+ * Chaque fournisseur a donc son PROPRE « seau » de places : deux fournisseurs
+ * différents ne se limitent JAMAIS mutuellement (c'est le cœur de la
+ * correction par rapport à l'ancien compteur global unique).
  *
- *   1. la limite globale `SWITCHY_CONCURRENCY` (défaut 3 — abonnement Ollama
- *      Cloud Pro), relue À CHAUD à chaque admission ;
- *   2. une file d'attente BORNÉE (`SWITCHY_QUEUE_MAX`) : au-delà, rejet
- *      immédiat (`QueueFullError` → 429 + `Retry-After` côté route) ;
- *   3. des RÉSERVATIONS par service, par classe d'appel (« léger ≤
- *      reservations.light, lourd ≤ reservations.heavy ») : un service peut
- *      plafonner sa propre simultanéité pour ne pas saturer la limite globale
- *      et laisser de la place aux autres — c'est ainsi qu'« un léger n'attend
- *      pas derrière un lourd » ;
- *   4. une PRIORITÉ de file aux appels légers : lorsqu'un slot se libère, les
- *      `light` en attente passent avant les `heavy` ;
- *   5. un WATCHDOG qui libère de force un slot détenu anormalement longtemps
+ * Un point unique qui connaît tous les appels en vol et applique :
+ *
+ *   1. le plafond `ProviderRecord.maxConcurrency` (absent = défaut global
+ *      `SWITCHY_CONCURRENCY`), relu à chaud à chaque admission — la borne est
+ *      au moins 1 : `0` est interdit à la saisie ;
+ *   2. une file d'attente BORNÉE (`SWITCHY_QUEUE_MAX`, tous fournisseurs
+ *      confondus) : au-delà, rejet immédiat (`QueueFullError` → 429 +
+ *      `Retry-After` côté route) ;
+ *   3. une PRIORITÉ INTRINSÈQUE au service : quand une place se libère chez un
+ *      fournisseur, les appels des services marqués `prioritaire` passent
+ *      AVANT les autres — c'est ainsi qu'« un léger n'attend pas derrière un
+ *      lourd », SANS en-tête client. Le client n'a rien à savoir ni à envoyer ;
+ *   4. un WATCHDOG qui libère de force un slot détenu anormalement longtemps
  *      (`SWITCHY_SLOT_WATCHDOG_MS`) : un client planté (abort non propagé,
  *      chemin de libération oublié) ne doit jamais figer la capacité ;
- *   6. un identifiant de slot UNIQUE par appel, généré ici
- *      (`llm:<uuid>`) — jamais une clé métier : deux appels indépendants ne
- *      doivent jamais partager un slot (leçon de réentrance, pi-sdk.md §6.1).
+ *   5. un identifiant de slot UNIQUE par appel, généré ici (`llm:<uuid>`) —
+ *      jamais une clé métier : deux appels indépendants ne doivent jamais
+ *      partager un slot (leçon de réentrance, pi-sdk.md §6.1).
  *
- * Ce module ne connaît AUCUN mot produit : les services sont des noms du
- * catalogue, la classe d'appel est fournie par l'appelant. La libération est
- * idempotente (le watchdog peut avoir libéré le slot entre-temps).
+ * La libération est idempotente (le watchdog peut avoir libéré le slot
+ * entre-temps).
  */
 import { randomUUID } from "crypto";
-import { getConcurrency, getQueueMax, getQueueTimeoutMs, getSlotWatchdogMs } from "../config.js";
-import type { ServiceReservations } from "../catalog-store.js";
-
-/** Classe d'un appel : « léger » (interactif, court) ou « lourd » (agent, long). */
-export type SlotClass = "light" | "heavy";
+import { getQueueMax, getQueueTimeoutMs, getSlotWatchdogMs } from "../config.js";
 
 export interface SlotRequest {
   /** Nom du service appelé (ou pseudo-service du relais natif). */
   service: string;
-  /** Classe d'appel — détermine la priorité de file et le quota appliqué. */
-  cls: SlotClass;
-  /** Réservations du service (`{ light?, heavy? }`) — quota simultané par classe. */
-  reservations?: ServiceReservations;
+  /** Fournisseur visé : c'est SA limite de compte qui s'applique. */
+  provider: string;
+  /** Plafond effectif du fournisseur (≥ 1) — `maxConcurrency` ou défaut global. */
+  limit: number;
+  /** Priorité intrinsèque du service : ses appels passent avant les autres. */
+  prioritaire: boolean;
 }
 
 /** File pleine : la route répond 429 + `Retry-After` (patron Libry). */
@@ -70,8 +71,16 @@ const RETRY_AFTER_MS = 5000;
 interface ActiveSlot {
   slotKey: string;
   service: string;
-  cls: SlotClass;
+  provider: string;
+  prioritaire: boolean;
   acquiredAt: number;
+}
+
+interface ProviderQueue {
+  /** Appels prioritaires (services `prioritaire`) : drainés en premier. */
+  priority: Waiter[];
+  /** Appels ordinaires. */
+  normal: Waiter[];
 }
 
 interface Waiter {
@@ -83,37 +92,47 @@ interface Waiter {
   reject: (err: Error) => void;
 }
 
-export interface SlotQueueStats {
-  limit: number;
+export interface ProviderSlotStats {
+  limit: number | null;
   active: number;
   queued: number;
-  activeLight: number;
-  activeHeavy: number;
-  queuedLight: number;
-  queuedHeavy: number;
 }
 
-export class GlobalSlotQueue {
+export interface SlotQueueStats {
+  /** Nombre d'appels en vol, tous fournisseurs confondus. */
+  active: number;
+  /** Nombre d'appels en attente, tous fournisseurs confondus. */
+  queued: number;
+  activePriority: number;
+  activeNormal: number;
+  queuedPriority: number;
+  queuedNormal: number;
+  /** Détail par fournisseur (diagnostic, tableau de bord). */
+  providers: Record<string, ProviderSlotStats>;
+}
+
+export class ProviderSlotQueue {
   private readonly active = new Map<string, ActiveSlot>();
-  /** Deux files FIFO : les `light` sont drainés AVANT les `heavy`. */
-  private readonly lightQueue: Waiter[] = [];
-  private readonly heavyQueue: Waiter[] = [];
+  /** Une file par fournisseur, chacune scindée prioritaire / ordinaire. */
+  private readonly queues = new Map<string, ProviderQueue>();
 
   /**
-   * Acquiert un slot pour un appel. Résout AVEC l'identifiant de slot généré
-   * (à passer à `release`), ou rejette `QueueFullError` / `QueueTimeoutError`.
-   * L'appelant DOIT toujours libérer le slot (`finally` ou fin de flux).
+   * Acquiert un slot pour un appel sur le seau de SON fournisseur. Résout AVEC
+   * l'identifiant de slot généré (à passer à `release`), ou rejette
+   * `QueueFullError` / `QueueTimeoutError`. L'appelant DOIT toujours libérer
+   * le slot (`finally` ou fin de flux).
    */
   acquire(request: SlotRequest): Promise<string> {
     if (this.canRun(request)) {
-      const slotKey = this.take(request);
-      return Promise.resolve(slotKey);
+      return Promise.resolve(this.take(request));
     }
 
-    const queue = this.queueFor(request.cls);
     if (this.waiterCount() >= Math.max(0, getQueueMax())) {
       return Promise.reject(new QueueFullError(RETRY_AFTER_MS));
     }
+
+    const queue = this.queueFor(request.provider);
+    const bucket = request.prioritaire ? queue.priority : queue.normal;
 
     return new Promise<string>((resolve, reject) => {
       const waiter: Waiter = {
@@ -127,21 +146,23 @@ export class GlobalSlotQueue {
       const timeoutMs = getQueueTimeoutMs();
       if (timeoutMs > 0) {
         waiter.timer = setTimeout(() => {
-          const idx = this.indexOf(queue, waiter);
-          if (idx >= 0) queue.splice(idx, 1);
+          const idx = bucket.indexOf(waiter);
+          if (idx >= 0) bucket.splice(idx, 1);
           reject(new QueueTimeoutError(Date.now() - waiter.enqueuedAt));
         }, timeoutMs);
         // Ne jamais retenir le process (arrêt propre, tests vitest).
         (waiter.timer as { unref?: () => void })?.unref?.();
       }
-      queue.push(waiter);
+      bucket.push(waiter);
     });
   }
 
   /** Libère un slot (no-op idempotent si déjà libéré, ex. par le watchdog). */
   release(slotKey: string): void {
-    if (!this.active.delete(slotKey)) return;
-    this.drain();
+    const slot = this.active.get(slotKey);
+    if (!slot) return;
+    this.active.delete(slotKey);
+    this.drain(slot.provider);
   }
 
   /**
@@ -152,48 +173,74 @@ export class GlobalSlotQueue {
   forceReleaseStale(now: number = Date.now()): string[] {
     const threshold = getSlotWatchdogMs();
     if (threshold <= 0) return [];
-    const stale: string[] = [];
+    const stale: ActiveSlot[] = [];
     for (const slot of this.active.values()) {
-      if (now - slot.acquiredAt > threshold) stale.push(slot.slotKey);
+      if (now - slot.acquiredAt > threshold) stale.push(slot);
     }
-    for (const slotKey of stale) {
-      this.active.delete(slotKey);
-      this.drain();
+    const freedProviders = new Set<string>();
+    for (const slot of stale) {
+      this.active.delete(slot.slotKey);
+      freedProviders.add(slot.provider);
     }
-    return stale;
+    for (const provider of freedProviders) this.drain(provider);
+    return stale.map((slot) => slot.slotKey);
   }
 
-  /** Stats temps réel (diagnostic, tests ; le tableau de bord viendra au Lot 4). */
+  /** Stats temps réel (diagnostic, tests). */
   getStats(): SlotQueueStats {
-    let activeLight = 0;
-    let activeHeavy = 0;
+    let activePriority = 0;
+    let activeNormal = 0;
+    const providers: Record<string, ProviderSlotStats> = {};
     for (const slot of this.active.values()) {
-      if (slot.cls === "light") activeLight++;
-      else activeHeavy++;
+      if (slot.prioritaire) activePriority++;
+      else activeNormal++;
+      const entry = (providers[slot.provider] ??= { limit: null, active: 0, queued: 0 });
+      entry.active++;
     }
+
+    let queuedPriority = 0;
+    let queuedNormal = 0;
+    for (const [provider, queue] of this.queues) {
+      queuedPriority += queue.priority.length;
+      queuedNormal += queue.normal.length;
+      const entry = (providers[provider] ??= { limit: null, active: 0, queued: 0 });
+      entry.queued = queue.priority.length + queue.normal.length;
+    }
+
     return {
-      limit: getConcurrency(),
       active: this.active.size,
-      queued: this.waiterCount(),
-      activeLight,
-      activeHeavy,
-      queuedLight: this.lightQueue.length,
-      queuedHeavy: this.heavyQueue.length,
+      queued: queuedPriority + queuedNormal,
+      activePriority,
+      activeNormal,
+      queuedPriority,
+      queuedNormal,
+      providers,
     };
   }
 
   // ── Interne ──
 
-  private queueFor(cls: SlotClass): Waiter[] {
-    return cls === "light" ? this.lightQueue : this.heavyQueue;
+  private queueFor(provider: string): ProviderQueue {
+    let queue = this.queues.get(provider);
+    if (!queue) {
+      queue = { priority: [], normal: [] };
+      this.queues.set(provider, queue);
+    }
+    return queue;
   }
 
   private waiterCount(): number {
-    return this.lightQueue.length + this.heavyQueue.length;
+    let n = 0;
+    for (const queue of this.queues.values()) n += queue.priority.length + queue.normal.length;
+    return n;
   }
 
-  private indexOf(queue: Waiter[], waiter: Waiter): number {
-    return queue.indexOf(waiter);
+  private countActiveFor(provider: string): number {
+    let n = 0;
+    for (const slot of this.active.values()) {
+      if (slot.provider === provider) n++;
+    }
+    return n;
   }
 
   private take(request: SlotRequest): string {
@@ -201,64 +248,47 @@ export class GlobalSlotQueue {
     this.active.set(slotKey, {
       slotKey,
       service: request.service,
-      cls: request.cls,
+      provider: request.provider,
+      prioritaire: request.prioritaire,
       acquiredAt: Date.now(),
     });
     return slotKey;
   }
 
-  private countActive(service: string, cls: SlotClass): number {
-    let n = 0;
-    for (const slot of this.active.values()) {
-      if (slot.service === service && slot.cls === cls) n++;
-    }
-    return n;
-  }
-
-  /** Quota simultané du service pour la classe demandée (`null` = aucun quota). */
-  private quotaFor(request: SlotRequest): number | null {
-    const reservations = request.reservations;
-    if (!reservations) return null;
-    const quota = request.cls === "light" ? reservations.light : reservations.heavy;
-    return typeof quota === "number" ? quota : null;
-  }
-
+  /** Le seau du fournisseur a-t-il encore une place libre ? (borne min 1) */
   private canRun(request: SlotRequest): boolean {
-    if (this.active.size >= Math.max(1, getConcurrency())) return false;
-    const quota = this.quotaFor(request);
-    if (quota !== null && this.countActive(request.service, request.cls) >= quota) return false;
-    return true;
+    return this.countActiveFor(request.provider) < Math.max(1, request.limit);
   }
 
   /**
-   * Sert les files tant que progresser est possible : un slot libre va d'abord
-   * au premier `light` éligible (priorité), puis au premier `heavy` éligible.
-   * Un premier waiteur bloqué par SON quota ne doit pas bloquer les suivants
-   * (services différents) : on scanne la file.
+   * Sert la file d'UN fournisseur tant que progresser est possible : une place
+   * libre va d'abord au premier `prioritaire` éligible, puis au premier
+   * ordinaire. Un waiteur bloqué ne doit pas bloquer les suivants.
    */
-  private drain(): void {
+  private drain(provider: string): void {
+    const queue = this.queues.get(provider);
+    if (!queue) return;
     let progressed = true;
     while (progressed) {
       progressed = false;
-      for (const queue of [this.lightQueue, this.heavyQueue]) {
-        for (let i = 0; i < queue.length; i++) {
-          const waiter = queue[i];
+      for (const bucket of [queue.priority, queue.normal]) {
+        for (let i = 0; i < bucket.length; i++) {
+          const waiter = bucket[i];
           if (!this.canRun(waiter.request)) continue;
-          queue.splice(i, 1);
+          bucket.splice(i, 1);
           if (waiter.timer) clearTimeout(waiter.timer);
           waiter.slotKey = this.take(waiter.request);
           waiter.resolve(waiter.slotKey);
           progressed = true;
           break;
         }
-        if (this.active.size >= Math.max(1, getConcurrency())) return;
       }
     }
   }
 }
 
-/** Instance partagée du service (limites relues à chaud depuis la config). */
-export const llmSlots = new GlobalSlotQueue();
+/** Instance partagée du service (limites relues à chaud depuis le catalogue). */
+export const llmSlots = new ProviderSlotQueue();
 
 // Watchdog périodique : libère les slots détenus anormalement longtemps.
 // `unref()` pour ne jamais retenir le process ; le seuil est relu à chaud.
@@ -274,16 +304,18 @@ const watchdogTimer = setInterval(() => {
 
 /** Vide slots et files (outil de test : l'instance est partagée par process). */
 export function resetLlmSlots(): void {
-  const stats = llmSlots as unknown as {
+  const internals = llmSlots as unknown as {
     active: Map<string, ActiveSlot>;
-    lightQueue: Waiter[];
-    heavyQueue: Waiter[];
+    queues: Map<string, ProviderQueue>;
   };
-  for (const waiter of [...stats.lightQueue, ...stats.heavyQueue]) {
-    if (waiter.timer) clearTimeout(waiter.timer);
-    waiter.reject(new QueueTimeoutError(0));
+  for (const queue of internals.queues.values()) {
+    for (const waiter of [...queue.priority, ...queue.normal]) {
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(new QueueTimeoutError(0));
+    }
+    queue.priority.length = 0;
+    queue.normal.length = 0;
   }
-  stats.lightQueue.length = 0;
-  stats.heavyQueue.length = 0;
-  stats.active.clear();
+  internals.queues.clear();
+  internals.active.clear();
 }

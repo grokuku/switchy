@@ -63,9 +63,15 @@ export function getLogLevel(): string {
 }
 
 /**
- * Limite globale de concurrence (requêtes LLM simultanées), appliquée à chaud.
- * Défaut 3 : l'abonnement Ollama Cloud Pro autorise 3 requêtes simultanées par
- * compte, toutes clés confondues.
+ * Plafond de concurrence PAR DÉFAUT d'un fournisseur qui ne précise pas son
+ * `ProviderRecord.maxConcurrency` (relu à chaud).
+ *
+ * ⚠️ Ce n'est PLUS une limite globale unique : la concurrence est comptée PAR
+ * FOURNISSEUR (chaque compte a son seau). Cette valeur est le simple défaut
+ * (Ollama Cloud Pro autorise 3 requêtes simultanées par compte, toutes clés
+ * confondues) ; un fournisseur précis peut la surcharger. On ne garde PAS de
+ * plafond global « toutes enseignes » : il réintroduirait exactement le couplage
+ * entre fournisseurs que ce changement supprime.
  */
 export function getConcurrency(): number {
   const parsed = Number.parseInt(readEnv("SWITCHY_CONCURRENCY", "3"), 10);
