@@ -42,12 +42,17 @@
   const tabs = Array.from(document.querySelectorAll(".tab"));
   const panels = {
     services: document.getElementById("panel-services"),
+    activity: document.getElementById("panel-activity"),
     providers: document.getElementById("panel-providers"),
     settings: document.getElementById("panel-settings"),
   };
 
+  /** Onglet affiché (sert à ne PAS rafraîchir un onglet inactif). */
+  let activeTab = "services";
+
   /** Affiche l'onglet demandé et masque les autres. */
   function activate(name) {
+    activeTab = name;
     for (const tab of tabs) {
       const selected = tab.dataset.tab === name;
       tab.classList.toggle("is-active", selected);
@@ -58,7 +63,12 @@
     }
     if (name === "providers") loadProviders();
     else if (name === "settings") loadSettings();
-    else loadServices();
+    else if (name === "activity") {
+      loadDashboard();
+      startDashboardAutoRefresh();
+    } else loadServices();
+    // L'auto-rafraîchissement ne tourne QUE sur l'onglet Activité.
+    if (name !== "activity") stopDashboardAutoRefresh();
   }
 
   // ── Thème (brique tokens) ────────────────────────────────────────────────
@@ -930,57 +940,16 @@
   async function loadServices() {
     try {
       // Les fournisseurs alimentent les menus du formulaire : on les charge aussi.
-      const [servicesData, providersData, callsData] = await Promise.all([
+      const [servicesData, providersData] = await Promise.all([
         apiRequest("/api/services"),
         apiRequest("/api/providers").catch(() => null),
-        apiRequest("/api/calls?limit=1").catch(() => null),
       ]);
       state.services = Array.isArray(servicesData && servicesData.services) ? servicesData.services : [];
       if (providersData && Array.isArray(providersData.providers)) state.providers = providersData.providers;
-      renderFallbackSummary(callsData && callsData.summary);
       renderServices();
     } catch (err) {
       handleApiError(err, "Impossible de charger les services.");
     }
-  }
-
-  /**
-   * Bandeau sobre « replis » (24 h et total) avec les fournisseurs de repli
-   * sollicités. Objectif : CONSTATER qu'un repli — parfois PAYANT — a eu lieu,
-   * et combien de fois. Aucun détail d'appel ici (le journal complet reste
-   * dans l'API `/api/calls`).
-   */
-  function renderFallbackSummary(summary) {
-    const el = $("fallback-summary");
-    if (!el) return;
-    if (!summary || typeof summary !== "object") {
-      el.hidden = true;
-      return;
-    }
-    const last24h = Number(summary.last24h) || 0;
-    const total = Number(summary.total) || 0;
-    el.replaceChildren();
-    el.append(h("span", { class: "fallback-summary__count", text: `Replis (24 h) : ${last24h}` }));
-    if (total !== last24h) el.append(h("span", { class: "muted", text: `· total : ${total}` }));
-    const providers = Object.entries(summary.byFallbackProvider || {});
-    if (providers.length > 0) {
-      el.append(
-        h("span", {
-          class: "muted",
-          text: `· fournisseur de repli : ${providers.map(([id, n]) => `${providerLabel(id)} (${n})`).join(", ")}`,
-        }),
-      );
-    }
-    const services = Object.entries(summary.byService || {});
-    if (services.length > 0) {
-      el.append(
-        h("span", {
-          class: "muted",
-          text: `· par service : ${services.map(([name, n]) => `${name} (${n})`).join(", ")}`,
-        }),
-      );
-    }
-    el.hidden = false;
   }
 
   function servicesView() {
@@ -1599,6 +1568,276 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  // Tableau de bord « Activité » (auto-rafraîchi, PLEINE LARGEUR)
+  //
+  // Une SEULE requête (`GET /api/dashboard`) porte tout l'onglet. Le minuteur
+  // ne rafraîchit QUE lorsque l'onglet Activité est affiché ET la page visible
+  // (aucun appel inutile en arrière-plan). Le re-rendu est complet mais garde
+  // la même structure : pas de saut visuel.
+  // ════════════════════════════════════════════════════════════════════════
+
+  /** Période d'auto-rafraîchissement (ms) — onglet actif uniquement. */
+  const DASHBOARD_REFRESH_MS = 5000;
+
+  let dashboardTimer = null;
+  let dashboardLoading = false;
+
+  /** Grand nombre lisible : 1234567 → « 1,2 M », 340000 → « 340 k ». */
+  function formatCompact(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    const abs = Math.abs(num);
+    if (abs >= 1e6) return `${(num / 1e6).toLocaleString("fr-FR", { maximumFractionDigits: 1 })} M`;
+    if (abs >= 1e3) return `${(num / 1e3).toLocaleString("fr-FR", { maximumFractionDigits: 1 })} k`;
+    return num.toLocaleString("fr-FR");
+  }
+
+  /** Token : « — » si inconnu (jamais un 0 trompeur). */
+  function formatTokens(value) {
+    return value === null || value === undefined ? "—" : formatCompact(value);
+  }
+
+  /** Pourcentage à partir d'un ratio 0..1 : « 98 % », « — » si inconnu. */
+  function formatPercent(ratio) {
+    if (ratio === null || ratio === undefined) return "—";
+    const num = Number(ratio);
+    return Number.isFinite(num) ? `${Math.round(num * 100)} %` : "—";
+  }
+
+  /** Durée lisible : « 850 ms », « 1,5 s », « 2 min 05 s ». */
+  function formatDuration(ms) {
+    const num = Number(ms);
+    if (!Number.isFinite(num) || num < 0) return "—";
+    if (num < 1000) return `${Math.round(num)} ms`;
+    if (num < 60000) return `${(num / 1000).toLocaleString("fr-FR", { maximumFractionDigits: 1 })} s`;
+    const minutes = Math.floor(num / 60000);
+    const seconds = Math.round((num % 60000) / 1000);
+    return `${minutes} min ${String(seconds).padStart(2, "0")} s`;
+  }
+
+  /** Heure locale d'une entrée du journal (HH:MM:SS). */
+  function formatClock(iso) {
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString("fr-FR", { hour12: false });
+  }
+
+  /**
+   * Pastilles ● / ○ : jusqu'à 5 points, remplis ∝ aux places occupées (jamais
+   * 2500 points pour un plafond de 2500). Le chiffre exact reste affiché à côté.
+   */
+  function occupancyDots(active, limit) {
+    const total = Math.min(Math.max(Number(limit) || 1, 1), 5);
+    let filled = limit > 0 ? Math.round((active / limit) * total) : 0;
+    if (active > 0 && filled === 0) filled = 1;
+    if (active >= limit) filled = total;
+    const wrap = h("span", { class: "dots", attrs: { "aria-hidden": "true" } });
+    for (let i = 0; i < total; i++) wrap.append(h("span", { class: "dot" + (i < filled ? " dot--on" : "") }));
+    return wrap;
+  }
+
+  function dashboardStat(label, value, opts) {
+    opts = opts || {};
+    const box = h("div", { class: "stat" + (opts.alert ? " stat--alert" : "") });
+    box.append(h("span", { class: "stat-value", text: value }));
+    box.append(h("span", { class: "stat-label", text: label }));
+    if (opts.hint) box.append(h("span", { class: "stat-hint", text: opts.hint }));
+    return box;
+  }
+
+  /** Bloc ① — « En ce moment » : concurrence par fournisseur. */
+  function renderLiveBlock(live) {
+    const block = h("section", { class: "dash-block" });
+    block.append(h("h3", { class: "dash-title", text: "En ce moment" }));
+    const providers = (live && live.providers) || [];
+    if (providers.length === 0) {
+      block.append(h("p", { class: "muted", text: "Aucun fournisseur configuré." }));
+      return block;
+    }
+    const list = h("div", { class: "live-list" });
+    for (const p of providers) {
+      const row = h("div", { class: `live-row live-row--${p.state || "free"}` });
+      row.append(h("span", { class: "live-name", text: p.label || p.id, attrs: { title: p.label || p.id } }));
+      row.append(occupancyDots(Number(p.active) || 0, Number(p.limit) || 0));
+      row.append(h("span", { class: "live-count", text: `${p.active}/${p.limit}` }));
+      row.append(
+        h("span", {
+          class: "live-queued" + (p.queued > 0 ? " live-queued--busy" : ""),
+          text: p.queued > 0 ? `${p.queued} en attente` : "file vide",
+        }),
+      );
+      list.append(row);
+    }
+    block.append(list);
+    block.append(
+      h("p", {
+        class: "dash-note muted",
+        text: `${Number(live.active) || 0} appel(s) en cours · ${Number(live.queued) || 0} en attente au total`,
+      }),
+    );
+    return block;
+  }
+
+  /** Bloc ② — « 24 h » : appels, réussite, replis (alerte), latence. */
+  function renderSummaryBlock(activity) {
+    activity = activity || {};
+    const block = h("section", { class: "dash-block" });
+    block.append(h("h3", { class: "dash-title", text: "24 h" }));
+    const stats = h("div", { class: "stats" });
+    stats.append(dashboardStat("appels", formatCompact(activity.calls)));
+    stats.append(dashboardStat("réussite", formatPercent(activity.successRate)));
+    stats.append(
+      dashboardStat("replis", formatCompact(activity.fallbacks), {
+        alert: Number(activity.fallbacks) > 0,
+        hint: `${formatPercent(activity.fallbackRate)} des appels`,
+      }),
+    );
+    const latency = activity.latency || {};
+    stats.append(
+      dashboardStat("latence moy.", formatDuration(latency.avgMs), { hint: `max ${formatDuration(latency.maxMs)}` }),
+    );
+    block.append(stats);
+    return block;
+  }
+
+  /** Ligne du tableau de tokens (total, service ou fournisseur). */
+  function tokenRow(name, totals, opts) {
+    opts = opts || {};
+    const tr = h("tr", { class: opts.total ? "token-row token-row--total" : "token-row" });
+    tr.append(h("th", { text: name, attrs: { scope: "row" } }));
+    tr.append(h("td", { text: formatTokens(totals.prompt) }));
+    tr.append(h("td", { text: formatTokens(totals.completion) }));
+    tr.append(h("td", { text: formatTokens(totals.reasoning) }));
+    return tr;
+  }
+
+  function tokenGroupRow(label) {
+    return h("tr", { class: "token-group" }, h("th", { text: label, attrs: { colspan: "4" } }));
+  }
+
+  /** Bloc ③ — « Tokens (24 h) » : total, par service, par fournisseur. */
+  function renderTokensBlock(tokens) {
+    tokens = tokens || {};
+    const block = h("section", { class: "dash-block" });
+    block.append(h("h3", { class: "dash-title", text: "Tokens (24 h)" }));
+
+    const table = h("table", { class: "token-table" });
+    const head = h("tr");
+    head.append(h("th", { text: "" }));
+    head.append(h("th", { text: "entrée" }));
+    head.append(h("th", { text: "sortie" }));
+    head.append(h("th", { text: "réflexion" }));
+    const thead = h("thead");
+    thead.append(head);
+    table.append(thead);
+
+    const tbody = h("tbody");
+    tbody.append(tokenRow("Total", tokens.total || { prompt: null, completion: null, reasoning: null }, { total: true }));
+    const services = Object.entries(tokens.byService || {});
+    if (services.length > 0) {
+      tbody.append(tokenGroupRow("Par service"));
+      for (const [name, totals] of services) tbody.append(tokenRow(name, totals));
+    }
+    const providers = Object.entries(tokens.byProvider || {});
+    if (providers.length > 0) {
+      tbody.append(tokenGroupRow("Par fournisseur"));
+      for (const [name, totals] of providers) tbody.append(tokenRow(name, totals));
+    }
+    table.append(tbody);
+    block.append(table);
+
+    if (services.length === 0 && providers.length === 0) {
+      block.append(h("p", { class: "dash-note muted", text: "Aucune consommation rapportée sur la période." }));
+    } else {
+      block.append(h("p", { class: "dash-note muted", text: "« — » = non exposé par le fournisseur (ou compte inconnu)." }));
+    }
+    return block;
+  }
+
+  function resultBadge(entry) {
+    const result = entry.result || "error";
+    const labels = { ok: "OK", error: "erreur", aborted: "interrompu", skipped: "ignoré" };
+    const variant = result === "ok" ? "ok" : result === "error" ? "danger" : "warn";
+    return badge(labels[result] || result, variant);
+  }
+
+  /** Bloc ④ — « Derniers appels » (badge REPLI visible). */
+  function renderRecentBlock(recent) {
+    const block = h("section", { class: "dash-block" });
+    block.append(h("h3", { class: "dash-title", text: "Derniers appels" }));
+    const rows = recent || [];
+    if (rows.length === 0) {
+      block.append(h("p", { class: "muted", text: "Aucun appel journalisé." }));
+      return block;
+    }
+    const list = h("ol", { class: "recent-list" });
+    for (const entry of rows) {
+      const li = h("li", { class: "recent-row" });
+      li.append(h("span", { class: "recent-time", text: formatClock(entry.ts) }));
+      li.append(h("span", { class: "recent-service", text: entry.service || "?", attrs: { title: entry.service || "?" } }));
+      li.append(h("span", { class: "recent-provider muted", text: providerLabel(entry.provider) }));
+      li.append(resultBadge(entry));
+      li.append(h("span", { class: "recent-duration muted", text: formatDuration(entry.durationMs) }));
+      if (entry.isFallback) li.append(h("span", { class: "badge badge--danger repli-badge", text: "REPLI" }));
+      list.append(li);
+    }
+    block.append(list);
+    return block;
+  }
+
+  /** Peint le tableau de bord à partir de la réponse `/api/dashboard`. */
+  function renderDashboard(data) {
+    const host = $("dashboard");
+    const empty = $("activity-empty");
+    if (!host) return;
+    if (!data || typeof data !== "object") {
+      if (empty) {
+        empty.hidden = false;
+        empty.textContent = "Aucune donnée d'activité pour l'instant.";
+      }
+      host.replaceChildren();
+      return;
+    }
+    if (empty) empty.hidden = true;
+    const row = h("div", { class: "dash-row" });
+    row.append(renderLiveBlock(data.live));
+    row.append(renderSummaryBlock(data.activity));
+    host.replaceChildren(row, renderTokensBlock(data.tokens), renderRecentBlock(data.recent));
+  }
+
+  /** Charge (et peint) le tableau de bord — garde anti-réentrance. */
+  async function loadDashboard() {
+    if (dashboardLoading) return;
+    dashboardLoading = true;
+    try {
+      const data = await apiRequest("/api/dashboard");
+      renderDashboard(data);
+      const status = $("activity-status");
+      if (status) status.textContent = `Mis à jour à ${new Date().toLocaleTimeString("fr-FR", { hour12: false })}`;
+    } catch (err) {
+      handleApiError(err, "Impossible de charger l'activité.");
+    } finally {
+      dashboardLoading = false;
+    }
+  }
+
+  /** Démarre l'auto-rafraîchissement (onglet actif visible uniquement). */
+  function startDashboardAutoRefresh() {
+    stopDashboardAutoRefresh();
+    const auto = $("activity-auto");
+    if (auto && !auto.checked) return;
+    dashboardTimer = setInterval(() => {
+      if (activeTab === "activity" && !document.hidden) loadDashboard();
+    }, DASHBOARD_REFRESH_MS);
+  }
+
+  function stopDashboardAutoRefresh() {
+    if (dashboardTimer !== null) {
+      clearInterval(dashboardTimer);
+      dashboardTimer = null;
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
   // Connexion / session (accès de l'humain)
   //
   // L'écran de connexion est la PAGE D'ENTRÉE. Tant qu'aucune session valide
@@ -1803,6 +2042,17 @@
 
     const settingsSave = $("settings-save");
     if (settingsSave) settingsSave.addEventListener("click", () => saveSettings());
+
+    const activityReload = $("activity-reload");
+    if (activityReload) activityReload.addEventListener("click", () => loadDashboard());
+    const activityAuto = $("activity-auto");
+    if (activityAuto) {
+      activityAuto.addEventListener("change", () => {
+        if (activityAuto.checked && activeTab === "activity") startDashboardAutoRefresh();
+        else stopDashboardAutoRefresh();
+      });
+    }
+
     const keyForm = $("key-form");
     if (keyForm) {
       keyForm.addEventListener("submit", (event) => {
@@ -1815,8 +2065,14 @@
   /** Onglet porté par l'ancre d'URL (`#settings`), défaut « services ». */
   function tabFromHash() {
     const hash = (window.location.hash || "").replace(/^#/, "");
-    return hash === "settings" || hash === "providers" ? hash : "services";
+    return hash === "settings" || hash === "providers" || hash === "activity" ? hash : "services";
   }
+
+  // Revient sur l'onglet Activité après un passage en arrière-plan : on relit
+  // l'état tout de suite plutôt que d'attendre le prochain tic.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && activeTab === "activity") loadDashboard();
+  });
 
   wireSession();
   initTheme();

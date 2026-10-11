@@ -109,6 +109,10 @@
               data-tab="services" aria-selected="true" aria-controls="panel-services">
         Services
       </button>
+      <button type="button" class="tab" role="tab" id="tab-activity"
+              data-tab="activity" aria-selected="false" aria-controls="panel-activity">
+        Activité
+      </button>
       <button type="button" class="tab" role="tab" id="tab-providers"
               data-tab="providers" aria-selected="false" aria-controls="panel-providers">
         Fournisseurs
@@ -143,10 +147,29 @@
       </div>
 
       <p class="empty" id="services-empty">Chargement…</p>
-      <!-- Compteur sobre de replis (24 h) : l'utilisateur VOIT que son repli
-           (potentiellement payant) a été sollicité, et combien de fois. -->
-      <div class="fallback-summary" id="fallback-summary" role="status" aria-live="polite" hidden></div>
       <div class="cards-grid" id="services-list"></div>
+    </section>
+
+    <!-- ── Activité (tableau de bord, auto-rafraîchi) ───────────────────── -->
+    <section class="panel" id="panel-activity" role="tabpanel" aria-labelledby="tab-activity" hidden>
+      <header class="panel-head">
+        <h2>Activité</h2>
+        <p class="panel-hint">État de la concurrence en direct, chiffres des 24 dernières
+          heures, consommation de tokens par service et par fournisseur, et derniers appels.
+          Rafraîchissement automatique tant que cet onglet est visible.</p>
+      </header>
+
+      <div class="toolbar">
+        <span class="toolbar-status" id="activity-status" role="status" aria-live="polite"></span>
+        <label class="checkbox">
+          <input type="checkbox" id="activity-auto" checked />
+          Rafraîchissement auto (5 s)
+        </label>
+        <button type="button" class="btn" id="activity-reload">Rafraîchir</button>
+      </div>
+
+      <p class="empty" id="activity-empty" hidden>Chargement…</p>
+      <div class="dash" id="dashboard"></div>
     </section>
 
     <!-- ── Fournisseurs ─────────────────────────────────────────────────── -->

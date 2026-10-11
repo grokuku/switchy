@@ -34,6 +34,12 @@ export interface CallLogTokens {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  /**
+   * Tokens de RÉFLEXION (reasoning), quand le fournisseur les expose
+   * (`completion_tokens_details.reasoning_tokens`). Absent = le fournisseur ne
+   * les détaille pas : l'interface affiche « — », jamais un 0 trompeur.
+   */
+  reasoningTokens?: number;
 }
 
 /** Résultat d'une tentative de relais. */
@@ -350,6 +356,183 @@ export interface CallsLogPage {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 
+// ── Agrégations du tableau de bord (fenêtre 24 h) ──
+//
+// Tout est calculé à la lecture depuis le journal : AUCUN cumul persistant.
+// Les appels sont regroupés par `callId` (appel LOGIQUE) afin de ne pas
+// compter un repli comme un appel supplémentaire.
+
+/** Latence (ms) des tentatives RÉUSSIES de la fenêtre. */
+export interface LatencyStats {
+  avgMs: number | null;
+  maxMs: number | null;
+  /** Nombre de tentatives ayant servi au calcul (0 = « — »). */
+  samples: number;
+}
+
+/** Bilan « 24 h » de l'onglet Activité. */
+export interface ActivitySummary {
+  windowHours: number;
+  /** Appels LOGIQUES (identifiants `callId` distincts) dans la fenêtre. */
+  calls: number;
+  /** Tentatives journalisées (principal + replis). */
+  attempts: number;
+  /** Appels logiques terminés par un succès (dernière tentative `ok`). */
+  succeeded: number;
+  /** Appels logiques terminés par un échec/abandon. */
+  failed: number;
+  /** `succeeded / calls`, ou `null` si aucun appel. */
+  successRate: number | null;
+  /** Appels logiques ayant utilisé AU MOINS un repli. */
+  fallbacks: number;
+  /** Tentatives de repli (pour information). */
+  fallbackAttempts: number;
+  /** `fallbacks / calls`, ou `null` si aucun appel. */
+  fallbackRate: number | null;
+  latency: LatencyStats;
+}
+
+/** Totaux de tokens d'un groupe (total, service ou fournisseur). */
+export interface TokenTotals {
+  /** Tentatives de la fenêtre ayant rapporté un `usage` dans ce groupe. */
+  calls: number;
+  /** Tokens d'entrée — `null` si AUCUNE tentative du groupe ne les expose. */
+  prompt: number | null;
+  /** Tokens de sortie — `null` si inconnu. */
+  completion: number | null;
+  /** Tokens de réflexion — `null` si le fournisseur ne les expose pas. */
+  reasoning: number | null;
+}
+
+/** Consommation de tokens : total, puis par service et par fournisseur. */
+export interface TokenBreakdown {
+  total: TokenTotals;
+  byService: Record<string, TokenTotals>;
+  byProvider: Record<string, TokenTotals>;
+}
+
+/** Vrai si l'horodatage tombe dans la fenêtre (horodatage illisible = inclus). */
+function withinWindow(ts: unknown, cutoff: number): boolean {
+  const parsed = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed >= cutoff : true;
+}
+
+interface CallGroup {
+  last: CallLogEntry;
+  lastAttempt: number;
+  hasFallback: boolean;
+}
+
+/**
+ * Résumé « 24 h » : appels, réussite, replis et latence. Les appels sont
+ * regroupés par `callId` (un repli n'est PAS un appel de plus) ; les entrées
+ * sans `callId` (journal antérieur) comptent individuellement. La latence ne
+ * porte que sur les tentatives RÉUSSIES (un échec immédiat ne reflète pas la
+ * latence de service).
+ */
+export function summarizeActivity(
+  entries: CallLogEntry[],
+  windowHours = 24,
+  now: number = Date.now(),
+): ActivitySummary {
+  const cutoff = now - Math.max(0, windowHours) * 3_600_000;
+  const groups = new Map<string, CallGroup>();
+  let attempts = 0;
+  let fallbackAttempts = 0;
+  let latencySum = 0;
+  let latencyMax: number | null = null;
+  let latencySamples = 0;
+
+  entries.forEach((entry, index) => {
+    if (!withinWindow(entry.ts, cutoff)) return;
+    attempts += 1;
+    const attempt = typeof entry.attempt === "number" ? entry.attempt : 0;
+    const isFallback = entry.isFallback === true || attempt > 0;
+    if (isFallback) fallbackAttempts += 1;
+
+    const key = typeof entry.callId === "string" && entry.callId !== "" ? entry.callId : `__${index}`;
+    const group = groups.get(key);
+    if (!group) {
+      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback });
+    } else {
+      if (attempt >= group.lastAttempt) {
+        group.last = entry;
+        group.lastAttempt = attempt;
+      }
+      if (isFallback) group.hasFallback = true;
+    }
+
+    const ms = entry.durationMs;
+    if (entry.result === "ok" && typeof ms === "number" && Number.isFinite(ms) && ms >= 0) {
+      latencySum += ms;
+      latencySamples += 1;
+      if (latencyMax === null || ms > latencyMax) latencyMax = ms;
+    }
+  });
+
+  let succeeded = 0;
+  let fallbacks = 0;
+  for (const group of groups.values()) {
+    if (group.last.result === "ok") succeeded += 1;
+    if (group.hasFallback) fallbacks += 1;
+  }
+  const calls = groups.size;
+  return {
+    windowHours,
+    calls,
+    attempts,
+    succeeded,
+    failed: calls - succeeded,
+    successRate: calls > 0 ? succeeded / calls : null,
+    fallbacks,
+    fallbackAttempts,
+    fallbackRate: calls > 0 ? fallbacks / calls : null,
+    latency: {
+      avgMs: latencySamples > 0 ? Math.round(latencySum / latencySamples) : null,
+      maxMs: latencyMax,
+      samples: latencySamples,
+    },
+  };
+}
+
+function emptyTokenTotals(): TokenTotals {
+  return { calls: 0, prompt: null, completion: null, reasoning: null };
+}
+
+/** Additionne les tokens d'une entrée dans un accumulateur (champ par champ). */
+function addTokens(target: TokenTotals, entry: CallLogEntry): void {
+  const tokens = entry.tokens;
+  if (!tokens) return;
+  target.calls += 1;
+  if (typeof tokens.promptTokens === "number") target.prompt = (target.prompt ?? 0) + tokens.promptTokens;
+  if (typeof tokens.completionTokens === "number") target.completion = (target.completion ?? 0) + tokens.completionTokens;
+  if (typeof tokens.reasoningTokens === "number") target.reasoning = (target.reasoning ?? 0) + tokens.reasoningTokens;
+}
+
+/**
+ * Agrège les tokens de la fenêtre : total, par service et par fournisseur.
+ * Chaque champ (entrée/sortie/réflexion) reste `null` tant qu'AUCUNE tentative
+ * du groupe ne l'expose → l'interface affiche « — » (jamais un 0 trompeur).
+ * Les groupes sans aucun `usage` rapporté ne créent pas de ligne.
+ */
+export function summarizeTokens(
+  entries: CallLogEntry[],
+  windowHours = 24,
+  now: number = Date.now(),
+): TokenBreakdown {
+  const cutoff = now - Math.max(0, windowHours) * 3_600_000;
+  const total = emptyTokenTotals();
+  const byService: Record<string, TokenTotals> = {};
+  const byProvider: Record<string, TokenTotals> = {};
+  for (const entry of entries) {
+    if (!entry.tokens || !withinWindow(entry.ts, cutoff)) continue;
+    addTokens(total, entry);
+    addTokens((byService[String(entry.service ?? "?")] ??= emptyTokenTotals()), entry);
+    addTokens((byProvider[String(entry.provider ?? "?")] ??= emptyTokenTotals()), entry);
+  }
+  return { total, byService, byProvider };
+}
+
 /** Vue publique d'une entrée : whitelist stricte des champs (fichier non fiable). */
 function toPublicEntry(raw: CallLogEntry): CallLogEntry {
   const out: Partial<CallLogEntry> = {};
@@ -363,6 +546,34 @@ function toPublicEntry(raw: CallLogEntry): CallLogEntry {
 }
 
 /**
+ * Lit TOUTES les entrées publiques du journal (ordre chronologique croissant,
+ * whitelist appliquée). Base commune de la pagination et des agrégations.
+ */
+function readPublicEntries(): CallLogEntry[] {
+  const file = getCallsLogFile();
+  try {
+    if (!existsSync(file)) return [];
+    return readFileSync(file, "utf-8")
+      .split("\n")
+      .map(parseLine)
+      .filter((e): e is CallLogEntry => e !== null)
+      .map(toPublicEntry);
+  } catch (err) {
+    console.error("[calls-log] Failed to read:", err);
+    return [];
+  }
+}
+
+/**
+ * Toutes les entrées du journal (pour les agrégations du tableau de bord).
+ * Le fichier est borné par la compaction : une lecture complète reste
+ * raisonnable.
+ */
+export function readAllCallsLog(): CallLogEntry[] {
+  return readPublicEntries();
+}
+
+/**
  * Lit le journal, du PLUS RÉCENT au plus ancien, avec pagination et filtres
  * facultatifs (`service`, `result`). Le fichier est borné par la compaction :
  * une lecture complète reste raisonnable.
@@ -370,21 +581,7 @@ function toPublicEntry(raw: CallLogEntry): CallLogEntry {
 export function readCallsLog(query: CallsLogQuery = {}): CallsLogPage {
   const limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(query.limit ?? DEFAULT_LIMIT)));
   const offset = Math.max(0, Math.floor(query.offset ?? 0));
-  const file = getCallsLogFile();
-
-  let entries: CallLogEntry[] = [];
-  try {
-    if (existsSync(file)) {
-      entries = readFileSync(file, "utf-8")
-        .split("\n")
-        .map(parseLine)
-        .filter((e): e is CallLogEntry => e !== null)
-        .map(toPublicEntry);
-    }
-  } catch (err) {
-    console.error("[calls-log] Failed to read:", err);
-    return { entries: [], total: 0, limit, offset, summary: summarizeFallbacks([]) };
-  }
+  let entries = readPublicEntries();
 
   // Le bilan des replis porte sur TOUT le journal (non filtré) : c'est un
   // compteur de référence, pas une vue de la page courante.

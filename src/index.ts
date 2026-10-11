@@ -28,6 +28,7 @@ import keysRouter from "./routes/keys.js";
 import { llmRouter, openaiRouter } from "./routes/llm.js";
 import nativeRouter from "./routes/native.js";
 import callsRouter from "./routes/calls.js";
+import dashboardRouter from "./routes/dashboard.js";
 
 /** Version du package, lue à côté du point d'entrée (src/ comme dist/). */
 export const version: string = (() => {
@@ -92,6 +93,8 @@ export function createApp(): express.Express {
   app.use("/v1", requireApiAuth, openaiRouter);
   app.use("/api/native", requireApiAuth, nativeRouter);
   app.use("/api/calls", requireApiAuth, callsRouter);
+  // Tableau de bord d'activité : une SEULE requête pour tout l'onglet.
+  app.use("/api/dashboard", requireApiAuth, dashboardRouter);
 
   // ── Interface web statique (coquille de configuration) ──
   // Montée APRÈS le rate-limit et APRÈS /health et /api/* : `public/` est

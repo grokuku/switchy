@@ -218,6 +218,27 @@ export class ProviderSlotQueue {
     };
   }
 
+  /**
+   * État par fournisseur pour une liste EXPLICITE d'identifiants : les
+   * fournisseurs sans aucune activité sont présents à zéro (contrairement à
+   * `getStats().providers`, qui n'énumère que les fournisseurs sollicités).
+   * C'est ce dont le tableau de bord a besoin pour afficher « occupées / total »
+   * de CHAQUE fournisseur configuré. `limit` reste `null` : la limite effective
+   * appartient au catalogue (elle est relue par l'appelant).
+   */
+  providerStates(providerIds: Iterable<string>): Record<string, ProviderSlotStats> {
+    const out: Record<string, ProviderSlotStats> = {};
+    for (const id of providerIds) out[id] = { limit: null, active: 0, queued: 0 };
+    for (const slot of this.active.values()) {
+      (out[slot.provider] ??= { limit: null, active: 0, queued: 0 }).active++;
+    }
+    for (const [provider, queue] of this.queues) {
+      const entry = (out[provider] ??= { limit: null, active: 0, queued: 0 });
+      entry.queued = queue.priority.length + queue.normal.length;
+    }
+    return out;
+  }
+
   // ── Interne ──
 
   private queueFor(provider: string): ProviderQueue {

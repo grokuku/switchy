@@ -177,11 +177,22 @@ export function normalizeUsage(raw: unknown): CallLogTokens | undefined {
   const promptTokens = positiveInt(obj.prompt_tokens) ?? positiveInt(obj.prompt_eval_count);
   const completionTokens = positiveInt(obj.completion_tokens) ?? positiveInt(obj.eval_count);
   const totalTokens = positiveInt(obj.total_tokens);
-  if (promptTokens === undefined && completionTokens === undefined && totalTokens === undefined) return undefined;
+  // Tokens de RÉFLEXION : détaillés par certains fournisseurs (OpenAI/OpenRouter/
+  // DeepSeek) sous `completion_tokens_details.reasoning_tokens`. Absent = le
+  // fournisseur ne les expose pas (l'interface affiche « — »).
+  const details = obj.completion_tokens_details;
+  const reasoningTokens =
+    details && typeof details === "object" && !Array.isArray(details)
+      ? positiveInt((details as Record<string, unknown>).reasoning_tokens)
+      : positiveInt(obj.reasoning_tokens);
+  if (promptTokens === undefined && completionTokens === undefined && totalTokens === undefined && reasoningTokens === undefined) {
+    return undefined;
+  }
   return {
     ...(promptTokens !== undefined ? { promptTokens } : {}),
     ...(completionTokens !== undefined ? { completionTokens } : {}),
     ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
   };
 }
 
