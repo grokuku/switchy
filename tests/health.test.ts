@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
-import { makeTestEnv, type TestEnv } from "./helpers.js";
+import { makeTestEnv, createApiKey, type TestEnv } from "./helpers.js";
 
 const pkg = JSON.parse(
   readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf-8"),
@@ -21,11 +21,24 @@ beforeEach(() => {
 afterEach(() => env.cleanup());
 
 describe("GET /health", () => {
-  it("renvoie le contrat {service, status, version}", async () => {
+  it("renvoie le contrat {service, status, version} + compteurs", async () => {
     const res = await request(env.app).get("/health");
     expect(res.status).toBe(200);
     expect(res.headers["content-type"]).toMatch(/application\/json/);
-    expect(res.body).toEqual({ service: "switchy", status: "ok", version: pkg.version });
+    // Forme de base INCHANGÉE ; les compteurs du Lot 2 s'ajoutent sans la casser.
+    expect(res.body).toMatchObject({ service: "switchy", status: "ok", version: pkg.version });
+    expect(res.body.providers).toBe(0);
+    expect(res.body.services).toBe(0);
+  });
+
+  it("les compteurs reflètent le catalogue", async () => {
+    const key = await createApiKey(env.app);
+    await request(env.app)
+      .post("/api/providers")
+      .set("X-API-Key", key)
+      .send({ id: "p1", label: "P1", type: "openai-compatible", baseUrl: "https://example.com/v1" });
+    const res = await request(env.app).get("/health");
+    expect(res.body.providers).toBe(1);
   });
 
   it("la version servie est celle de package.json (format MAJOR.MINOR.PATCH)", async () => {

@@ -54,9 +54,18 @@ describe("socle statique — pas de fallback SPA", () => {
     expect(res.status).toBe(404);
   });
 
-  it("préfixe réservé /api (non implémenté en Lot 1) → 404, pas l'index", async () => {
-    const res = await request(env.app).get("/api/services");
+  it("préfixe réservé /api (route inconnue) → 404, pas l'index", async () => {
+    const res = await request(env.app).get("/api/nimportequoi");
     expect(res.status).toBe(404);
+    expect(res.text).not.toContain("Passerelle LLM");
+  });
+
+  it("route /api protégée par clé : JSON 401, jamais l'index", async () => {
+    // Mode amorçage : aucune clé n'existe → l'API est OUVERTE, mais répond en
+    // JSON (Lot 2). La route n'est jamais capturée par le statique.
+    const res = await request(env.app).get("/api/services");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/application\/json/);
     expect(res.text).not.toContain("Passerelle LLM");
   });
 });

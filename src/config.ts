@@ -1,20 +1,20 @@
 /**
  * Configuration de Switchy — lecture PARESSEUSE et À CHAUD des réglages.
  *
- * Les getters relisent l'environnement à CHAQUE appel : les tests peuvent donc
+ * Les getters relisent l'environnement à chaque appel (et consultent le fichier
+ * de réglages `$SWITCHY_DATA_DIR/config.json` en repli) : les tests peuvent donc
  * isoler chaque suite dans un répertoire de données temporaire sans recharger
- * les modules. Quand l'écran de configuration arrivera (Lot 2), la résolution
- * deviendra `env ?? fichier ?? défaut` (modèle Libry) — les noms de variables
- * et les défauts de ce fichier ne changeront pas.
+ * les modules, et une valeur écrite via l'API de configuration est prise en
+ * compte SANS redémarrage. Modèle de résolution : `env ?? fichier ?? défaut`.
  *
- * ⚠️ Réglages « redémarrage requis » (lus UNE fois au démarrage) :
- * SWITCHY_HOST, SWITCHY_PORT et SWITCHY_RATE_LIMIT_PER_MIN.
+ * ⚠️ Réglages « redémarrage requis » (lus UNE fois au démarrage, hors getters) :
+ * SWITCHY_HOST, SWITCHY_PORT, SWITCHY_RATE_LIMIT_PER_MIN et SWITCHY_DATA_DIR.
  */
 import path from "path";
+import { resolveSetting } from "./settings-store.js";
 
 function readEnv(name: string, fallback: string): string {
-  const value = process.env[name];
-  return value !== undefined && value !== "" ? value : fallback;
+  return resolveSetting(name, fallback);
 }
 
 /** Interface d'écoute (redémarrage requis). */
@@ -37,4 +37,59 @@ export function getDataDir(): string {
 export function getRateLimitPerMin(): number {
   const parsed = Number.parseInt(readEnv("SWITCHY_RATE_LIMIT_PER_MIN", "600"), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 600;
+}
+
+/** Fichier de la collection fournisseurs + services (source de vérité versionnable). */
+export function getCatalogFile(): string {
+  return path.resolve(readEnv("SWITCHY_CATALOG_FILE", path.join(getDataDir(), "catalog.json")));
+}
+
+/** Fichier JSON des clés d'API de Switchy. */
+export function getKeysFile(): string {
+  return path.resolve(readEnv("SWITCHY_KEYS_FILE", path.join(getDataDir(), "switchy-keys.json")));
+}
+
+/**
+ * Clé d'API d'amorçage fournie par l'environnement ou le fichier (secret). Tant
+ * qu'aucune clé n'existe (ni ici, ni dans le fichier de clés), l'API est OUVERTE
+ * — c'est ce qui permet de tout configurer depuis l'interface (v1).
+ */
+export function getApiKey(): string {
+  return readEnv("SWITCHY_API_KEY", "");
+}
+
+export function getLogLevel(): string {
+  return readEnv("SWITCHY_LOG_LEVEL", "info");
+}
+
+/**
+ * Limite globale de concurrence (requêtes LLM simultanées), appliquée à chaud.
+ * Défaut 3 : l'abonnement Ollama Cloud Pro autorise 3 requêtes simultanées par
+ * compte, toutes clés confondues.
+ */
+export function getConcurrency(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_CONCURRENCY", "3"), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3;
+}
+
+/** Mode du journal d'appels : « off », « summary » (défaut) ou « full ». */
+export function getCallsLogMode(): string {
+  return readEnv("SWITCHY_CALLS_LOG_MODE", "summary");
+}
+
+/** Durée de rétention du journal d'appels, en jours (0 = aucune purge). */
+export function getCallsLogRetentionDays(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_CALLS_LOG_RETENTION_DAYS", "7"), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 7;
+}
+
+/** Nombre maximal d'entrées conservées dans le journal d'appels (0 = illimité). */
+export function getCallsLogMaxEntries(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_CALLS_LOG_MAX_ENTRIES", "10000"), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10000;
+}
+
+/** Fichier du journal d'appels (JSONL). */
+export function getCallsLogFile(): string {
+  return path.resolve(readEnv("SWITCHY_CALLS_LOG_FILE", path.join(getDataDir(), "calls.jsonl")));
 }

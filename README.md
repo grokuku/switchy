@@ -22,12 +22,22 @@ Objectifs du service :
 > **pas** une brique holaf — les conventions communes vivent dans `holaf-lib`
 > (voir [`AGENTS.md`](./AGENTS.md)).
 
-## État actuel — Lot 1 (fondations)
+## État actuel — Lot 1 (fondations) + Lot 2 (modèle de données & configuration)
 
 - Socle serveur Express, limitation de débit, `GET /health`, port **3008**.
-- Interface web **pleine largeur** servie sans build : coquille (en-tête,
-  onglets Services / Réglages, sélecteur de thème holaf) — zones préparées,
-  **sans logique métier**.
+- **Modèle de données** (Lot 2) : fournisseurs et services nommés vivent dans
+  `$SWITCHY_DATA_DIR/catalog.json` (source de vérité versionnable, écriture
+  atomique, permissions `0600`). Réglages scalaires dans `config.json`
+  (`env ?? fichier ?? défaut`). Clés d'API hachées (scrypt) dans
+  `switchy-keys.json`.
+- **API de configuration** (Lot 2) : `GET/POST/PUT/DELETE /api/providers`,
+  `GET/POST/PUT/DELETE /api/services`, `GET/POST /api/settings`,
+  `GET/POST/DELETE /api/keys` — protégées par la clé d'API Switchy (mode
+  amorçage tant qu'aucune clé n'existe). Les secrets ne sont jamais réaffichés.
+- Interface web **pleine largeur** servie sans build : onglets **Services**
+  (CRUD, principal + replis ordonnés, capacités), **Fournisseurs** (CRUD, clé
+  jamais réaffichée) et **Réglages** (badges source, « redémarrage requis »,
+  secrets masqués) — **toute la configuration se fait depuis l'interface**.
 - Cinq briques holaf-lib **vendorisées** (`public/vendor/holaf/`), avec
   empreintes pinnées et garde-fou CI hors réseau.
 - Image Docker **non-root**, `HEALTHCHECK` sur `/health`, publiée par GitHub
@@ -35,9 +45,8 @@ Objectifs du service :
   reconstruit pas en production.
 - Tests vitest + supertest, **aucun accès réseau**.
 
-À venir : **cœur du gateway** (services nommés, relais + comptage global,
-journal), **interface de configuration** (fournisseurs, clés, services,
-journal), **pilote Yuki**.
+À venir : **cœur du gateway** (relais transparent + comptage global, journal,
+replis), **tableau de bord**, **pilote Yuki**.
 
 ## Démarrage
 
@@ -141,19 +150,36 @@ l'**interface** (v1) — jamais par édition de fichier à la main.
 | `SWITCHY_PORT` | `3008` | Port (Pi-Web 3000/3005, WebClaw 3006, Libry 3007). |
 | `SWITCHY_DATA_DIR` | `/app/data` | Répertoire de données persistant (volume). |
 | `SWITCHY_RATE_LIMIT_PER_MIN` | `600` | Requêtes/minute/IP. |
+| `SWITCHY_API_KEY` | — | Clé d'API d'amorçage (secret ; sinon l'API est ouverte au 1er démarrage). |
+| `SWITCHY_CONCURRENCY` | `3` | Limite globale de concurrence (à chaud). |
+| `SWITCHY_LOG_LEVEL` | `info` | Niveau de log (à chaud). |
+| `SWITCHY_CALLS_LOG_MODE` | `summary` | Journal d'appels : `off` \| `summary` \| `full`. |
+| `SWITCHY_CALLS_LOG_RETENTION_DAYS` | `7` | Rétention du journal (jours). |
+| `SWITCHY_CATALOG_FILE` | `$DATA_DIR/catalog.json` | Fournisseurs + services. |
+| `SWITCHY_KEYS_FILE` | `$DATA_DIR/switchy-keys.json` | Clés d'API Switchy. |
+
+Les réglages listés ci-dessus (sauf ceux marqués « redémarrage requis ») sont
+**modifiables depuis l'onglet Réglages** (résolution `env ?? fichier ?? défaut`).
 
 ## Structure
 
 ```
 src/
-  index.ts        # serveur Express + /health + statique (le cœur /api/* s'y montera)
-  config.ts       # lecture des variables SWITCHY_*
+  index.ts          # serveur Express + /health (+ compteurs) + montage /api/* + statique
+  config.ts         # getters de configuration (env ?? fichier ?? défaut)
+  settings-store.ts # réglages scalaires ($DATA_DIR/config.json, catalogue déclaratif)
+  catalog-store.ts  # fournisseurs + services ($DATA_DIR/catalog.json) + validation
+  switchy-auth.ts   # clés d'API nommées/hachées/révocables (mode amorçage)
+  middleware/       # garde d'authentification des routes /api
+  routes/           # providers, services, settings, keys
+  utils/            # hachage scrypt, erreurs HTTP typées
 public/
-  index.html      # coquille (onglets Services / Réglages)
+  index.html      # onglets Services / Fournisseurs / Réglages
   styles.css      # plein largeur, alias des jetons --holaf-*
-  app.js          # onglets + thème (aucune logique métier)
+  app.js          # onglets, thème, configuration (CRUD via /api/*)
   vendor/holaf/   # briques holaf-lib copiées verbatim (pinnées)
 scripts/          # toolchain vendor holaf (extraction CSS, empreintes, garde-fou)
-tests/            # santé, statique, mise en page, vendor holaf (hors réseau)
-docs/api.md       # contrat d'API (santé pour l'instant)
+tests/            # santé, catalogue, réglages, auth, statique, mise en page, vendor
+            #   (hors réseau)
+docs/api.md       # contrat d'API (santé + configuration)
 ```

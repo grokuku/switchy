@@ -15,6 +15,12 @@ import rateLimit from "express-rate-limit";
 import { readFileSync } from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getHost, getPort, getRateLimitPerMin } from "./config.js";
+import { catalogCounts } from "./catalog-store.js";
+import { requireApiKey } from "./middleware/require-key.js";
+import providersRouter from "./routes/providers.js";
+import servicesRouter from "./routes/services.js";
+import settingsRouter from "./routes/settings.js";
+import keysRouter from "./routes/keys.js";
 
 /** Version du package, lue à côté du point d'entrée (src/ comme dist/). */
 export const version: string = (() => {
@@ -43,13 +49,25 @@ export function createApp(): express.Express {
   );
 
   // ── Santé (liveness, aligné sur les services de l'écosystème) ──
+  // Compteurs utiles sans casser la forme { service, status, version }.
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ service: "switchy", status: "ok", version });
+    const counts = catalogCounts();
+    res.json({
+      service: "switchy",
+      status: "ok",
+      version,
+      providers: counts.providers,
+      services: counts.services,
+    });
   });
 
-  // ── Passerelle LLM (Lot 2) ──
-  // app.use("/api", ...) se monte ICI : l'API garde la priorité sur le
-  // statique, elle n'est jamais capturée par une route inconnue.
+  // ── API de configuration (Lot 2) — protégée par la clé d'API Switchy ──
+  // Montée AVANT le statique : `/api/*` garde toujours la priorité (aucune
+  // route API n'est capturée par le service de fichiers).
+  app.use("/api/providers", requireApiKey, providersRouter);
+  app.use("/api/services", requireApiKey, servicesRouter);
+  app.use("/api/settings", requireApiKey, settingsRouter);
+  app.use("/api/keys", requireApiKey, keysRouter);
 
   // ── Interface web statique (coquille de configuration) ──
   // Montée APRÈS le rate-limit et APRÈS /health et /api/* : `public/` est

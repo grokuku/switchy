@@ -2,7 +2,11 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { Express } from "express";
+import request from "supertest";
 import { createApp } from "../src/index.js";
+import { resetSettingsCache } from "../src/settings-store.js";
+import { resetCatalogCache } from "../src/catalog-store.js";
+import { resetAuthCaches } from "../src/switchy-auth.js";
 
 export interface TestEnv {
   app: Express;
@@ -12,18 +16,22 @@ export interface TestEnv {
 
 /**
  * Prépare un environnement de test isolé : répertoire de données temporaire,
- * variables SWITCHY_* nettoyées (les défauts du service s'appliquent).
+ * variables SWITCHY_* nettoyées (les défauts du service s'appliquent), caches
+ * mémo réinitialisés.
  *
- * Le socle du Lot 1 n'émet AUCUNE requête sortante : aucun mock réseau n'est
- * nécessaire (le cœur de la passerelle, lui, sera testé avec `fetch` mocké).
+ * Le socle n'émet AUCUNE requête sortante : aucun mock réseau n'est nécessaire.
  */
 export function makeTestEnv(overrides: Record<string, string> = {}): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "switchy-test-"));
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("SWITCHY_")) delete process.env[key];
+  }
   process.env.SWITCHY_DATA_DIR = dir;
-  delete process.env.SWITCHY_HOST;
-  delete process.env.SWITCHY_PORT;
-  delete process.env.SWITCHY_RATE_LIMIT_PER_MIN;
   for (const [key, value] of Object.entries(overrides)) process.env[key] = value;
+
+  resetSettingsCache();
+  resetCatalogCache();
+  resetAuthCaches();
 
   return {
     app: createApp(),
@@ -32,4 +40,18 @@ export function makeTestEnv(overrides: Record<string, string> = {}): TestEnv {
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Crée une clé d'API via l'API (mode amorçage : l'API est ouverte tant qu'aucune
+ * clé n'existe) et renvoie son secret, à présenter ensuite en en-tête. Rend la
+ * clé d'amorçage PERSISTÉE (le fichier de clés existe désormais) : l'API exige
+ * alors une clé.
+ */
+export async function createApiKey(app: Express, name = "test"): Promise<string> {
+  const res = await request(app).post("/api/keys").send({ name });
+  if (res.status !== 201 || typeof res.body?.secret !== "string") {
+    throw new Error(`createApiKey failed: ${res.status} ${JSON.stringify(res.body)}`);
+  }
+  return res.body.secret as string;
 }

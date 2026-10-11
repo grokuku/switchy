@@ -1,4 +1,4 @@
-/* Switchy — habillage du socle statique.
+/* Switchy — habillage de l'interface (Lot 2 : configuration).
    DOCTRINE « ALIAS + REPLI » (comme Pi-Web et Libry) : les variables locales
    sont des ALIAS des jetons --holaf-* posés au runtime par la brique `tokens`
    (seule autorisée à écrire sur :root). Le 2e argument de var() est le REPLI
@@ -21,6 +21,8 @@
   --switchy-text-muted: var(--holaf-text-muted, #93a0b8);
   --switchy-accent: var(--holaf-accent, #5aa9ff);
   --switchy-danger: var(--holaf-danger, #ff6b6b);
+  --switchy-ok: #34d399;
+  --switchy-warn: #fbbf24;
   --switchy-radius: var(--holaf-radius, 10px);
 
   /* Fond accentué translucide : repli rgba() puis color-mix() (dérivé de
@@ -249,6 +251,11 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-size: 13.5px;
 }
 
+.panel-hint code,
+.muted code {
+  font-size: 12.5px;
+}
+
 /* ── Cartes ───────────────────────────────────────────────────────────── */
 
 .card {
@@ -273,6 +280,501 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   padding: 18px 0;
   text-align: center;
   color: var(--switchy-text-muted);
+}
+
+/* ── Barre d'outils ───────────────────────────────────────────────────── */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: var(--switchy-gap);
+}
+
+.toolbar-status {
+  color: var(--switchy-text-muted);
+  font-size: 12.5px;
+}
+
+.field--grow {
+  flex: 1 1 260px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field label {
+  font-size: 12.5px;
+  color: var(--switchy-text-muted);
+}
+
+.field input,
+.field select,
+.field textarea {
+  padding: 8px 10px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 14px;
+  width: 100%;
+}
+
+.field textarea {
+  resize: vertical;
+}
+
+.field input:focus-visible,
+.field select:focus-visible,
+.field textarea:focus-visible {
+  outline: 2px solid var(--switchy-accent);
+  outline-offset: 1px;
+}
+
+.field input:disabled,
+.field select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.field-hint {
+  font-size: 12px;
+}
+
+.field-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* Dans un champ en colonne, la case à cocher ne s'étire pas (reste à gauche). */
+.field > .checkbox {
+  align-self: flex-start;
+}
+
+/* ── Boutons ──────────────────────────────────────────────────────────── */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: var(--switchy-bg-hover);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--switchy-accent);
+  outline-offset: 1px;
+}
+
+.btn .icon {
+  display: inline-flex;
+}
+
+.btn--accent {
+  background: var(--switchy-accent-soft);
+  border-color: color-mix(in srgb, var(--switchy-accent) 45%, var(--switchy-border));
+  color: var(--switchy-accent);
+}
+
+.btn--danger {
+  color: var(--switchy-danger);
+  border-color: color-mix(in srgb, var(--switchy-danger) 40%, var(--switchy-border));
+}
+
+.btn--danger:hover {
+  background: color-mix(in srgb, var(--switchy-danger) 12%, transparent);
+}
+
+.btn--ghost {
+  background: transparent;
+}
+
+.btn--icon {
+  padding: 5px 9px;
+}
+
+/* ── Grille de cartes ─────────────────────────────────────────────────── */
+
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr));
+  gap: var(--switchy-gap);
+}
+
+.item-card {
+  margin: 0;
+}
+
+.card + .cards-grid,
+.toolbar + .cards-grid {
+  margin: 0;
+}
+
+.item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.item-title {
+  margin: 0;
+  font-size: 15.5px;
+}
+
+.item-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.item-desc {
+  margin: 0 0 10px;
+  font-size: 13.5px;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--switchy-border);
+  border-radius: 999px;
+  background: var(--switchy-bg);
+  color: var(--switchy-text-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.badge--id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.badge--env {
+  color: var(--switchy-accent);
+  border-color: color-mix(in srgb, var(--switchy-accent) 45%, var(--switchy-border));
+}
+
+.badge--ok {
+  color: var(--switchy-ok);
+  border-color: color-mix(in srgb, var(--switchy-ok) 45%, var(--switchy-border));
+}
+
+.badge--warn {
+  color: var(--switchy-warn);
+  border-color: color-mix(in srgb, var(--switchy-warn) 45%, var(--switchy-border));
+}
+
+/* ── Listes clé/valeur ────────────────────────────────────────────────── */
+
+.kv {
+  margin: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 13.5px;
+}
+
+.kv > div {
+  display: flex;
+  gap: 8px;
+}
+
+.kv dt {
+  flex: 0 0 110px;
+  color: var(--switchy-text-muted);
+}
+
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ── Étapes d'un service (principal + replis) ─────────────────────────── */
+
+.steps {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+
+.step {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+  font-size: 13.5px;
+}
+
+.step-role {
+  flex: 0 0 80px;
+  color: var(--switchy-accent);
+  font-size: 12px;
+}
+
+.step-model {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.step-provider,
+.step-reason {
+  font-size: 12.5px;
+}
+
+/* ── Formulaires (modales) ────────────────────────────────────────────── */
+
+.form-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.form-col {
+  display: grid;
+  gap: 12px;
+}
+
+.form-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 12px;
+}
+
+.form-section-title {
+  margin: 8px 0 0;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--switchy-text-muted);
+}
+
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.step-editor {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1.4fr) minmax(110px, 0.8fr);
+  gap: 8px;
+}
+
+.fallbacks {
+  display: grid;
+  gap: 8px;
+}
+
+.fallback-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.fallback-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1.4fr) minmax(100px, 0.8fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+}
+
+.fallback-row select,
+.fallback-row input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 6px);
+  background: var(--switchy-bg-raised);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.fallback-tools {
+  display: flex;
+  gap: 4px;
+}
+
+/* ── Réglages ─────────────────────────────────────────────────────────── */
+
+.settings-group {
+  margin-bottom: 18px;
+}
+
+.settings-group h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--switchy-text-muted);
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1.2fr);
+  gap: 12px;
+  align-items: start;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--switchy-border);
+}
+
+.setting-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.setting-label .name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.setting-help {
+  flex: 1 1 100%;
+  font-size: 12px;
+  color: var(--switchy-text-muted);
+}
+
+.setting-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.setting-control input,
+.setting-control select {
+  flex: 1 1 180px;
+  padding: 7px 10px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 13.5px;
+}
+
+/* ── Bandeaux, listes de clés, secret ─────────────────────────────────── */
+
+.banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 12px 16px;
+  margin-bottom: var(--switchy-gap);
+  border: 1px solid var(--switchy-border);
+  border-radius: var(--switchy-radius);
+  font-size: 13.5px;
+}
+
+.banner--danger {
+  border-color: color-mix(in srgb, var(--switchy-danger) 45%, var(--switchy-border));
+  background: color-mix(in srgb, var(--switchy-danger) 10%, transparent);
+}
+
+.list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.list-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+}
+
+.list-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13.5px;
+}
+
+.list-main .muted {
+  font-size: 12.5px;
+}
+
+.list-actions {
+  margin-left: auto;
+}
+
+.secret-box {
+  display: grid;
+  gap: 10px;
+}
+
+.secret-value {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  user-select: all;
 }
 
 /* ── Pied de page ─────────────────────────────────────────────────────── */
@@ -303,5 +805,11 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 
   .tabs {
     order: 2;
+  }
+
+  .setting-row,
+  .step-editor,
+  .fallback-row {
+    grid-template-columns: 1fr;
   }
 }

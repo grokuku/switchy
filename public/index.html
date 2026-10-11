@@ -79,6 +79,10 @@
               data-tab="services" aria-selected="true" aria-controls="panel-services">
         Services
       </button>
+      <button type="button" class="tab" role="tab" id="tab-providers"
+              data-tab="providers" aria-selected="false" aria-controls="panel-providers">
+        Fournisseurs
+      </button>
       <button type="button" class="tab" role="tab" id="tab-settings"
               data-tab="settings" aria-selected="false" aria-controls="panel-settings">
         Réglages
@@ -87,35 +91,116 @@
   </header>
 
   <main class="content">
+    <!-- ── Services ─────────────────────────────────────────────────────── -->
     <section class="panel" id="panel-services" role="tabpanel" aria-labelledby="tab-services">
       <header class="panel-head">
         <h2>Services LLM</h2>
-        <p class="panel-hint">Les services nommés exposés aux autres projets
-          (principal, replis ordonnés, limites) seront listés ici ; les clients
-          appelleront le nom du service, jamais un modèle de fournisseur.</p>
+        <p class="panel-hint">Services nommés exposés aux autres projets : fournisseur
+          principal, replis ordonnés, taille de contexte, tokens de sortie, vision et
+          réservations. Les clients appellent <em>le nom du service</em>, jamais un
+          modèle de fournisseur.</p>
       </header>
 
-      <!-- Zone préparée pour le Lot 2 (cœur de la passerelle) : aucun contenu
-           métier pour l'instant, seulement l'état vide. -->
-      <div class="card">
-        <p class="empty" id="services-empty">Aucun service pour l'instant. La
-          configuration des services arrive avec le cœur de la passerelle.</p>
+      <div class="toolbar">
+        <div class="field field--grow">
+          <label class="sr-only" for="services-filter">Filtrer les services</label>
+          <input type="search" id="services-filter" autocomplete="off"
+                 placeholder="Filtrer par nom, modèle, fournisseur…" />
+        </div>
+        <span class="toolbar-status" id="services-status" role="status" aria-live="polite"></span>
+        <button type="button" class="btn" id="services-reload">Rafraîchir</button>
+        <button type="button" class="btn btn--accent" id="services-new">Nouveau service</button>
       </div>
+
+      <p class="empty" id="services-empty">Chargement…</p>
+      <div class="cards-grid" id="services-list"></div>
     </section>
 
+    <!-- ── Fournisseurs ─────────────────────────────────────────────────── -->
+    <section class="panel" id="panel-providers" role="tabpanel" aria-labelledby="tab-providers" hidden>
+      <header class="panel-head">
+        <h2>Fournisseurs</h2>
+        <p class="panel-hint">Fournisseurs LLM joignables (Ollama Cloud, OpenAI,
+          OpenRouter, Anthropic, Google, un autre Ollama…). L'URL <code>/v1</code>
+          est OpenAI-compatible ; l'URL native sert à la découverte des modèles.
+          La clé d'API n'est jamais réaffichée après enregistrement.</p>
+      </header>
+
+      <div class="toolbar">
+        <div class="field field--grow">
+          <label class="sr-only" for="providers-filter">Filtrer les fournisseurs</label>
+          <input type="search" id="providers-filter" autocomplete="off"
+                 placeholder="Filtrer par identifiant, libellé, type…" />
+        </div>
+        <span class="toolbar-status" id="providers-status" role="status" aria-live="polite"></span>
+        <button type="button" class="btn" id="providers-reload">Rafraîchir</button>
+        <button type="button" class="btn btn--accent" id="providers-new">Nouveau fournisseur</button>
+      </div>
+
+      <p class="empty" id="providers-empty">Chargement…</p>
+      <div class="cards-grid" id="providers-list"></div>
+    </section>
+
+    <!-- ── Réglages ─────────────────────────────────────────────────────── -->
     <section class="panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <header class="panel-head">
         <h2>Réglages</h2>
-        <p class="panel-hint">Configuration du service, sans édition de fichier :
-          fournisseurs et clés, limites, journal d'appels.</p>
+        <p class="panel-hint">Configuration du service, accès à l'API et clés —
+          sans jamais éditer un fichier à la main.</p>
       </header>
 
-      <!-- Zone préparée pour le Lot 2 (réglages + secrets jamais réaffichés).
-           Aucun contenu métier pour l'instant. -->
-      <div class="card">
-        <p class="empty" id="settings-empty">La configuration arrive avec le
-          cœur de la passerelle.</p>
+      <div class="banner banner--danger" id="auth-banner" role="alert" hidden>
+        <strong>Clé d'API requise.</strong>
+        <span>Renseignez la clé d'accès à Switchy ci-dessous (section « Accès à
+          l'API »). Elle est conservée localement par ce navigateur.</span>
       </div>
+
+      <!-- Accès à l'API (clé du navigateur courant) -->
+      <section class="card" id="access-card">
+        <h3 class="card-title">Accès à l'API</h3>
+        <p class="muted">Clé que ce navigateur présente à l'API de Switchy
+          (en-tête <code>X-API-Key</code>). Tant qu'aucune clé n'existe côté
+          serveur, l'API répond sans clé (mode amorçage) : c'est le moment de
+          créer la première.</p>
+        <form id="api-key-form" class="form-row">
+          <div class="field field--grow">
+            <label for="api-key-input">Clé d'API (ce navigateur)</label>
+            <input type="password" id="api-key-input" autocomplete="off"
+                   placeholder="switchy_…" />
+          </div>
+          <button type="submit" class="btn btn--accent">Utiliser cette clé</button>
+          <button type="button" class="btn btn--ghost" id="api-key-clear">Effacer</button>
+        </form>
+        <p class="muted" id="api-key-state"></p>
+      </section>
+
+      <!-- Clés d'API serveur -->
+      <section class="card" id="keys-card">
+        <h3 class="card-title">Clés d'API</h3>
+        <p class="muted">Clés nommées et révocables. Le secret complet n'est
+          affiché qu'une seule fois, à la création — conservez-le en lieu sûr.</p>
+        <form id="key-form" class="form-row">
+          <div class="field field--grow">
+            <label for="key-name">Nom de la nouvelle clé</label>
+            <input type="text" id="key-name" autocomplete="off" placeholder="ex. pi-web" />
+          </div>
+          <button type="submit" class="btn btn--accent">Créer la clé</button>
+        </form>
+        <p class="empty" id="keys-empty" hidden>Aucune clé pour l'instant.</p>
+        <ul class="list" id="keys-list"></ul>
+      </section>
+
+      <!-- Paramètres globaux -->
+      <section class="card" id="settings-card">
+        <h3 class="card-title">Paramètres</h3>
+        <p class="muted">Valeurs résolues par <code>env&nbsp;→&nbsp;fichier&nbsp;→&nbsp;défaut</code>.
+          Un réglage fourni par l'environnement (badge <em>env</em>) est en lecture seule.
+          Les secrets ne sont jamais réaffichés.</p>
+        <div id="settings-form"></div>
+        <div class="form-actions">
+          <button type="button" class="btn btn--accent" id="settings-save">Enregistrer</button>
+        </div>
+      </section>
     </section>
   </main>
 
