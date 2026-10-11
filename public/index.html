@@ -55,6 +55,34 @@
   </script>
 </head>
 <body>
+  <!-- ══ Écran de connexion — SEUL élément visible avant authentification ══
+       Aucun contenu applicatif (en-tête, onglets, listes, modales) n'est
+       affiché tant que la session n'est pas valide : `#app-shell` est masqué
+       par défaut et app.js ne le révèle qu'après une session authentifiée. -->
+  <div class="login-screen" id="login-screen">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <div class="brand-text">
+          <h1>Switchy</h1>
+          <p>Passerelle LLM — connexion</p>
+        </div>
+      </div>
+      <form id="login-form" class="login-form" autocomplete="on">
+        <div class="field field--grow">
+          <label for="login-password">Mot de passe administrateur</label>
+          <input type="password" id="login-password" name="password"
+                 autocomplete="current-password" required autofocus />
+        </div>
+        <button type="submit" class="btn btn--accent" id="login-submit">Se connecter</button>
+      </form>
+      <p class="login-error" id="login-error" role="alert" hidden></p>
+      <p class="muted login-hint">Première utilisation : mot de passe par défaut
+        <code>admin</code> — changez-le dès la connexion, dans l'onglet Réglages.</p>
+    </div>
+  </div>
+
+  <div id="app-shell" hidden>
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">S</span>
@@ -149,29 +177,39 @@
           sans jamais éditer un fichier à la main.</p>
       </header>
 
-      <div class="banner banner--danger" id="auth-banner" role="alert" hidden>
-        <strong>Clé d'API requise.</strong>
-        <span>Renseignez la clé d'accès à Switchy ci-dessous (section « Accès à
-          l'API »). Elle est conservée localement par ce navigateur.</span>
+      <!-- Bandeau rouge : visible tant que le mot de passe admin est le défaut. -->
+      <div class="banner banner--danger" id="default-password-banner" role="alert" hidden>
+        <strong>Mot de passe administrateur par défaut.</strong>
+        <span>Les actions sensibles (gestion des clés, modification des fournisseurs,
+          des services et des réglages) sont bloquées tant que le mot de passe n'a pas
+          été changé. Utilisez « Changer le mot de passe » ci-dessous.</span>
       </div>
 
-      <!-- Accès à l'API (clé du navigateur courant) -->
-      <section class="card" id="access-card">
-        <h3 class="card-title">Accès à l'API</h3>
-        <p class="muted">Clé que ce navigateur présente à l'API de Switchy
-          (en-tête <code>X-API-Key</code>). Tant qu'aucune clé n'existe côté
-          serveur, l'API répond sans clé (mode amorçage) : c'est le moment de
-          créer la première.</p>
-        <form id="api-key-form" class="form-row">
-          <div class="field field--grow">
-            <label for="api-key-input">Clé d'API (ce navigateur)</label>
-            <input type="password" id="api-key-input" autocomplete="off"
-                   placeholder="switchy_…" />
-          </div>
-          <button type="submit" class="btn btn--accent">Utiliser cette clé</button>
-          <button type="button" class="btn btn--ghost" id="api-key-clear">Effacer</button>
-        </form>
-        <p class="muted" id="api-key-state"></p>
+      <!-- Session administrateur (la connexion se fait sur l'écran d'entrée) -->
+      <section class="card" id="session-card">
+        <h3 class="card-title">Session administrateur</h3>
+        <p class="session-line">
+          <span class="badge badge--ok">Connecté</span>
+          <button type="button" class="btn btn--ghost" id="logout-btn">Déconnexion</button>
+        </p>
+        <details class="disclosure" id="password-change">
+          <summary>Changer le mot de passe</summary>
+          <form id="password-form" class="form-col">
+            <div class="field">
+              <label for="pwd-current">Mot de passe actuel</label>
+              <input type="password" id="pwd-current" autocomplete="current-password" required />
+            </div>
+            <div class="field">
+              <label for="pwd-next">Nouveau mot de passe</label>
+              <input type="password" id="pwd-next" autocomplete="new-password" required minlength="4" />
+            </div>
+            <div class="field">
+              <label for="pwd-confirm">Confirmer le nouveau mot de passe</label>
+              <input type="password" id="pwd-confirm" autocomplete="new-password" required minlength="4" />
+            </div>
+            <button type="submit" class="btn btn--accent">Changer le mot de passe</button>
+          </form>
+        </details>
       </section>
 
       <!-- Clés d'API serveur -->
@@ -208,6 +246,8 @@
     <span>Switchy — service de l'écosystème holaf</span>
     <span class="muted">Port 3008 · aucune obligation : chaque projet peut rester en direct.</span>
   </footer>
+  </div>
+  <!-- /#app-shell (contenu applicatif, masqué jusqu'à la connexion) -->
 
   <!-- Briques holaf-lib vendorisées (copiées VERBATIM par le CLI de la
        librairie ; versions et empreintes dans vendor/holaf/). Chargées en

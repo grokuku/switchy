@@ -8,9 +8,11 @@
  *      `<famille>-<mode>`, le persiste (`localStorage["switchy.theme"]`) et
  *      ALIGNE les briques modal/toast sur le même preset ;
  *   3. la configuration (Lot 2) : CRUD fournisseurs & services, réglages
- *      globaux, clés d'API — via l'API `/api/*` protégée par la clé d'API ;
- *   4. l'accès : la clé que CE navigateur présente (localStorage) est réglée
- *      dans l'onglet Réglages (le serveur signale l'absence de clé par un 401).
+ *      globaux, clés d'API — via l'API `/api/*` ;
+ *   4. l'ACCÈS : un écran de CONNEXION (mot de passe admin + session, cookie
+ *      signé HMAC) est la page d'entrée ; AUCUN contenu applicatif n'est
+ *      affiché avant authentification. Les clés d'API des outils restent
+ *      gérées dans l'onglet Réglages.
  *
  * Le premier rendu (anti-flash) est déjà posé par le boot inline du <head>.
  *
@@ -349,26 +351,6 @@
   // Client API (brique fetch ; repli natif si absente)
   // ════════════════════════════════════════════════════════════════════════
 
-  /** Clé que ce navigateur présente à l'API (jamais envoyée au serveur pour stockage). */
-  const API_KEY_STORAGE = "switchy.apiKey";
-
-  function getApiKey() {
-    try {
-      return window.localStorage.getItem(API_KEY_STORAGE) || "";
-    } catch {
-      return "";
-    }
-  }
-
-  function setApiKey(value) {
-    try {
-      if (value) window.localStorage.setItem(API_KEY_STORAGE, value);
-      else window.localStorage.removeItem(API_KEY_STORAGE);
-    } catch {
-      /* Mode privé : la clé ne survit pas au rechargement. */
-    }
-  }
-
   /** Repli sans dépendance : fetch natif + JSON vérifié + erreur typée. */
   async function nativeRequest(path, init) {
     const opts = {
@@ -398,17 +380,24 @@
     return data;
   }
 
-  /** Appel API JSON : clé du navigateur en `X-API-Key` si présente. */
+  /**
+   * Appel API JSON. Le navigateur s'authentifie par SA SESSION (cookie) : aucun
+   * en-tête de clé n'est posé (les clés d'API restent réservées aux outils).
+   * Sur les mutations, le jeton CSRF de session est renvoyé en `X-CSRF-Token`
+   * (double-submit avec le cookie `switchy_csrf`).
+   */
   function apiRequest(path, options) {
     options = options || {};
+    const method = String(options.method || "GET").toUpperCase();
     const init = {
-      method: options.method || "GET",
+      method,
       headers: {},
       credentials: "same-origin",
       timeout: 20000,
     };
-    const key = getApiKey();
-    if (key) init.headers["X-API-Key"] = key;
+    if (state.csrfToken && method !== "GET" && method !== "HEAD") {
+      init.headers["X-CSRF-Token"] = state.csrfToken;
+    }
     if (options.body !== undefined) init.body = options.body;
     if (http && typeof http.request === "function") {
       return Promise.resolve(http.request(path, init));
@@ -416,18 +405,24 @@
     return nativeRequest(path, init);
   }
 
-  /** 401 → l'onglet Réglages affiche la bande d'alerte (clé requise). */
-  function showAuthBanner(show) {
-    const banner = $("auth-banner");
+  /** Affiche/masque le bandeau « mot de passe par défaut » (session requise). */
+  function showDefaultPasswordBanner(show) {
+    const banner = $("default-password-banner");
     if (banner) banner.hidden = !show;
   }
 
   function handleApiError(err, fallbackMessage) {
     const status = err && err.status;
+    const code = err && err.data && err.data.code;
     if (status === 401) {
-      state.authRequired = true;
-      showAuthBanner(true);
-      notify(fallbackMessage || "Clé d'API requise — renseignez-la dans l'onglet Réglages.", "error");
+      // Session absente/expirée : retour à l'écran de connexion SEUL.
+      showLogin();
+      notify(fallbackMessage || "Session expirée — reconnectez-vous.", "error");
+      return;
+    }
+    if (status === 403 && code === "PASSWORD_NOT_CHANGED") {
+      showDefaultPasswordBanner(true);
+      notify("Changez le mot de passe administrateur par défaut avant cette action.", "error");
       return;
     }
     if (status === 400 || status === 409) {
@@ -451,7 +446,9 @@
     services: [],
     settingsGroups: [],
     keys: [],
-    authRequired: false,
+    authenticated: false,
+    passwordIsDefault: false,
+    csrfToken: null,
   };
 
   const PROVIDER_TYPES = [
@@ -574,7 +571,6 @@
     try {
       const data = await apiRequest("/api/providers");
       state.providers = Array.isArray(data && data.providers) ? data.providers : [];
-      showAuthBanner(false);
       renderProviders();
     } catch (err) {
       handleApiError(err, "Impossible de charger les fournisseurs.");
@@ -755,7 +751,6 @@
       ]);
       state.services = Array.isArray(servicesData && servicesData.services) ? servicesData.services : [];
       if (providersData && Array.isArray(providersData.providers)) state.providers = providersData.providers;
-      showAuthBanner(false);
       renderServices();
     } catch (err) {
       handleApiError(err, "Impossible de charger les services.");
@@ -1180,11 +1175,9 @@
     try {
       const data = await apiRequest("/api/settings");
       state.settingsGroups = Array.isArray(data && data.groups) ? data.groups : [];
-      state.authRequired = Boolean(data && data.authRequired);
       renderSettings(state.settingsGroups);
-      showAuthBanner(false);
+      showDefaultPasswordBanner(state.authenticated && state.passwordIsDefault);
       await loadKeys();
-      renderApiKeyState();
     } catch (err) {
       handleApiError(err, "Impossible de charger les paramètres.");
     }
@@ -1212,14 +1205,12 @@
       const data = await apiRequest("/api/settings", { method: "POST", body: { settings: payload } });
       const updated = Array.isArray(data && data.updated) ? data.updated : [];
       notify(`Réglages enregistrés (${updated.length}).`);
-      state.authRequired = Boolean(data && data.authRequired);
       if (Array.isArray(data && data.groups)) {
         state.settingsGroups = data.groups;
         renderSettings(state.settingsGroups);
       } else {
         await loadSettings();
       }
-      renderApiKeyState();
     } catch (err) {
       handleApiError(err, "Échec de l'enregistrement des paramètres.");
     }
@@ -1278,8 +1269,6 @@
       const data = await apiRequest("/api/keys", { method: "POST", body: { name } });
       if (input) input.value = "";
       await loadKeys();
-      state.authRequired = true;
-      renderApiKeyState();
       showSecret(data, name);
     } catch (err) {
       handleApiError(err, "Échec de la création de la clé.");
@@ -1297,14 +1286,7 @@
       const ok = await copyText(secret);
       notify(ok ? "Clé copiée." : "Copie impossible — sélectionnez le texte à la main.", ok ? "success" : "warning");
     });
-    const useBtn = h("button", { class: "btn", text: "Utiliser dans ce navigateur", attrs: { type: "button" } });
-    useBtn.addEventListener("click", () => {
-      setApiKey(secret);
-      renderApiKeyState();
-      notify("Clé enregistrée pour ce navigateur.");
-      loadSettings();
-    });
-    const btns = h("div", { class: "form-row" }, copyBtn, useBtn);
+    const btns = h("div", { class: "form-row" }, copyBtn);
     box.append(btns);
     box.append(
       h("p", {
@@ -1338,60 +1320,164 @@
       await apiRequest(`/api/keys/${encodeURIComponent(k.id)}`, { method: "DELETE" });
       notify("Clé révoquée.");
       await loadKeys();
-      state.authRequired = state.keys.length > 0;
-      renderApiKeyState();
     } catch (err) {
       handleApiError(err, "Échec de la révocation.");
     }
   }
 
   // ════════════════════════════════════════════════════════════════════════
-  // Clé du navigateur (accès à l'API)
+  // Connexion / session (accès de l'humain)
+  //
+  // L'écran de connexion est la PAGE D'ENTRÉE. Tant qu'aucune session valide
+  // n'existe, `#app-shell` reste masqué : aucun contenu applicatif n'est
+  // visible (pas d'en-tête, d'onglets, de listes ni de modale).
   // ════════════════════════════════════════════════════════════════════════
 
-  function renderApiKeyState() {
-    const el = $("api-key-state");
-    if (!el) return;
-    const has = getApiKey() !== "";
-    if (has) {
-      el.textContent = state.authRequired
-        ? "Clé locale enregistrée. L'API exige une clé."
-        : "Clé locale enregistrée.";
-    } else {
-      el.textContent = state.authRequired
-        ? "Aucune clé locale : l'API refusera les requêtes (401). Créez une clé ci-dessous puis « Utiliser dans ce navigateur »."
-        : "Aucune clé locale. Le serveur est en mode amorçage : l'API répond sans clé — créez la première clé ci-dessous.";
-    }
-    const input = $("api-key-input");
-    if (input && has && !input.value) input.placeholder = "clé enregistrée — saisir une nouvelle clé pour la remplacer";
+  const loginScreen = $("login-screen");
+  const appShell = $("app-shell");
+
+  /** Affiche l'écran de connexion SEUL (aucun contenu applicatif derrière). */
+  function showLogin() {
+    state.authenticated = false;
+    state.passwordIsDefault = false;
+    state.csrfToken = null;
+    state.providers = [];
+    state.services = [];
+    state.settingsGroups = [];
+    state.keys = [];
+    if (appShell) appShell.hidden = true;
+    if (loginScreen) loginScreen.hidden = false;
+    const input = $("login-password");
+    if (input) input.focus();
   }
 
-  function wireApiKeyForm() {
-    const form = $("api-key-form");
-    if (form) {
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const input = $("api-key-input");
-        const value = input ? input.value.trim() : "";
-        if (!value) {
-          notify("Saisissez une clé.", "warning");
-          return;
-        }
-        setApiKey(value);
-        if (input) input.value = "";
-        renderApiKeyState();
-        notify("Clé enregistrée pour ce navigateur.");
-        await loadSettings();
-      });
+  /** Révèle l'application (après authentification) et charge l'onglet courant. */
+  function showApp() {
+    if (loginScreen) loginScreen.hidden = true;
+    if (appShell) appShell.hidden = false;
+    showDefaultPasswordBanner(state.authenticated && state.passwordIsDefault);
+    activate(tabFromHash());
+  }
+
+  /** Applique la réponse de `GET /api/session` (ou de `POST /login`). */
+  function applySession(data) {
+    state.authenticated = Boolean(data && data.authenticated);
+    state.passwordIsDefault = Boolean(data && data.passwordIsDefault);
+    if (data && typeof data.csrfToken === "string" && data.csrfToken) {
+      state.csrfToken = data.csrfToken;
     }
-    const clear = $("api-key-clear");
-    if (clear) {
-      clear.addEventListener("click", () => {
-        setApiKey("");
-        renderApiKeyState();
-        notify("Clé locale effacée.", "info");
-      });
+    return state.authenticated;
+  }
+
+  /** Interroge l'état de session ; bascule écran de connexion OU application. */
+  async function initSession() {
+    try {
+      const data = await apiRequest("/api/session");
+      if (applySession(data)) showApp();
+      else showLogin();
+    } catch {
+      showLogin();
     }
+  }
+
+  /** Rafraîchit l'état de session (jeton CSRF, bandeau mot de passe par défaut). */
+  async function refreshSession() {
+    try {
+      return applySession(await apiRequest("/api/session"));
+    } catch {
+      return false;
+    }
+  }
+
+  /** Soumission du mot de passe : connexion ou message d'erreur clair. */
+  async function submitLogin(event) {
+    event.preventDefault();
+    const input = $("login-password");
+    const error = $("login-error");
+    const button = $("login-submit");
+    const password = input ? input.value : "";
+    if (error) {
+      error.hidden = true;
+      error.textContent = "";
+    }
+    if (!password) return;
+    // GET /api/session (au chargement) a déjà posé le cookie CSRF anonyme.
+    if (!state.csrfToken) await refreshSession();
+    if (button) button.disabled = true;
+    try {
+      const data = await apiRequest("/api/session/login", { method: "POST", body: { password } });
+      if (input) input.value = "";
+      applySession(data);
+      showApp();
+    } catch (err) {
+      const message =
+        err && err.status === 429
+          ? "Trop de tentatives — réessayez dans une minute."
+          : "Mot de passe incorrect.";
+      if (error) {
+        error.textContent = message;
+        error.hidden = false;
+      }
+      if (input) {
+        input.value = "";
+        input.focus();
+      }
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  /** Déconnexion : retour EXACT à l'écran de connexion. */
+  async function logout() {
+    try {
+      await apiRequest("/api/session/logout", { method: "POST" });
+    } catch {
+      /* Même en cas d'erreur réseau, on revient à l'écran de connexion. */
+    }
+    showLogin();
+    notify("Déconnecté.", "info");
+  }
+
+  /** Changement du mot de passe admin (invalide la session → reconnexion). */
+  async function changePassword(event) {
+    event.preventDefault();
+    const current = $("pwd-current");
+    const next = $("pwd-next");
+    const confirm = $("pwd-confirm");
+    const currentValue = current ? current.value : "";
+    const nextValue = next ? next.value : "";
+    const confirmValue = confirm ? confirm.value : "";
+    if (nextValue.trim().length < 4) {
+      notify("Le nouveau mot de passe doit faire au moins 4 caractères.", "warning");
+      return;
+    }
+    if (nextValue !== confirmValue) {
+      notify("Les deux saisies du nouveau mot de passe diffèrent.", "warning");
+      return;
+    }
+    try {
+      await apiRequest("/api/session/password", {
+        method: "POST",
+        body: { current: currentValue, next: nextValue },
+      });
+      if (current) current.value = "";
+      if (next) next.value = "";
+      if (confirm) confirm.value = "";
+      notify("Mot de passe changé — reconnectez-vous.", "success");
+      showLogin();
+    } catch (err) {
+      handleApiError(err, "Échec du changement de mot de passe.");
+    }
+  }
+
+  /** Câble les contrôles de session (connexion, déconnexion, mot de passe). */
+  function wireSession() {
+    const loginForm = $("login-form");
+    if (loginForm) loginForm.addEventListener("submit", submitLogin);
+    const logoutBtn = $("logout-btn");
+    if (logoutBtn) logoutBtn.addEventListener("click", () => logout());
+    const passwordForm = $("password-form");
+    if (passwordForm) passwordForm.addEventListener("submit", changePassword);
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1434,10 +1520,9 @@
     return hash === "settings" || hash === "providers" ? hash : "services";
   }
 
+  wireSession();
   initTheme();
   wireTabs();
   wireToolbars();
-  wireApiKeyForm();
-  renderApiKeyState();
-  activate(tabFromHash());
+  initSession();
 })();

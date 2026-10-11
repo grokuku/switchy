@@ -20,7 +20,7 @@ import {
   type SettingSpec,
 } from "../settings-store.js";
 import { getConcurrency } from "../config.js";
-import { isAuthRequired } from "../switchy-auth.js";
+import { requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 
 const router = Router();
 
@@ -68,13 +68,14 @@ function buildGroups(): { id: string; settings: Record<string, unknown>[] }[] {
 router.get("/", (_req: Request, res: Response) => {
   res.json({
     groups: buildGroups(),
-    authRequired: isAuthRequired(),
     concurrency: getConcurrency(),
   });
 });
 
 // POST /api/settings — met à jour `$SWITCHY_DATA_DIR/config.json`.
-router.post("/", (req: Request, res: Response) => {
+// CSRF si session ; refusé tant que le mot de passe par défaut n'a pas changé
+// POUR UNE SESSION (les accès scriptés par clé d'API restent inchangés).
+router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { settings?: unknown };
   const incoming = body.settings;
   if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
@@ -129,7 +130,6 @@ router.post("/", (req: Request, res: Response) => {
     success: true,
     updated: changed,
     groups: buildGroups(),
-    authRequired: isAuthRequired(),
     concurrency: getConcurrency(),
   });
 });

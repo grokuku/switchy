@@ -15,6 +15,7 @@ import {
   toPublicProvider,
 } from "../catalog-store.js";
 import { errorBody } from "../utils/api-error.js";
+import { requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 
 const router = Router();
 
@@ -22,7 +23,7 @@ router.get("/", (_req: Request, res: Response) => {
   res.json({ providers: listProviders().map(toPublicProvider) });
 });
 
-router.post("/", (req: Request, res: Response) => {
+router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     const provider = createProvider(req.body);
     res.status(201).json({ provider: toPublicProvider(provider) });
@@ -32,7 +33,7 @@ router.post("/", (req: Request, res: Response) => {
   }
 });
 
-router.put("/:id", (req: Request, res: Response) => {
+router.put("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     const provider = updateProvider(String(req.params.id), req.body);
     res.json({ provider: toPublicProvider(provider) });
@@ -42,7 +43,7 @@ router.put("/:id", (req: Request, res: Response) => {
   }
 });
 
-router.delete("/:id", (req: Request, res: Response) => {
+router.delete("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     deleteProvider(String(req.params.id));
     res.status(204).end();

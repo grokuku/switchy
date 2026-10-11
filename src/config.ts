@@ -72,6 +72,31 @@ export function getConcurrency(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 3;
 }
 
+/**
+ * Nombre maximal de demandes en attente d'un slot LLM (0 = pas d'attente :
+ * 429 immédiat dès que la limite globale est atteinte).
+ */
+export function getQueueMax(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_QUEUE_MAX", "100"), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
+}
+
+/** Attente maximale d'un slot LLM dans la file, en millisecondes (0 = illimité). */
+export function getQueueTimeoutMs(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_QUEUE_TIMEOUT_MS", "3600000"), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3_600_000;
+}
+
+/**
+ * Délai au-delà duquel un slot LLM est libéré de FORCE par le watchdog, en
+ * millisecondes (0 = watchdog désactivé). Filet de sécurité : un client planté
+ * ne doit pas bloquer définitivement une place de la limite globale.
+ */
+export function getSlotWatchdogMs(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_SLOT_WATCHDOG_MS", "1800000"), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1_800_000;
+}
+
 /** Mode du journal d'appels : « off », « summary » (défaut) ou « full ». */
 export function getCallsLogMode(): string {
   return readEnv("SWITCHY_CALLS_LOG_MODE", "summary");

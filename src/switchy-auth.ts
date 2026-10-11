@@ -4,14 +4,13 @@
  * Reprend le patron de Libry (`src/libry-auth.ts`) et de Pi-Web. Différences :
  *   - secrets préfixés « switchy_ » + 32 hex ; identifiant NON secret
  *     préfixé « switchyk_ » ;
- *   - pas de sessions ni de comptes : Switchy est appelé PAR des services
- *     (Pi-Web, Yuki, …) avec une clé, jamais par un navigateur authentifié.
+ *   - ces CLÉS D'API servent aux OUTILS (Pi-Web, Yuki, Kinoscribe…) : elles
+ *     s'ajoutent à la SESSION d'administration du navigateur (voir
+ *     `session-store.ts`), elles ne la remplacent pas.
  *
- * ⚠️ MODE AMORÇAGE : tant qu'AUCUNE clé n'existe (ni dans le fichier de clés,
- * ni via le secret d'environnement SWITCHY_API_KEY), l'API est OUVERTE — c'est
- * ce qui permet de tout configurer depuis l'interface dès la v1 (l'utilisateur
- * n'édite jamais un fichier à la main). Dès qu'une clé existe, l'accès est
- * exigé. Voir `isAuthRequired()`.
+ * ⚠️ Plus de MODE AMORÇAGE : l'API n'est jamais ouverte. La toute première clé
+ * se crée depuis l'interface APRÈS connexion (mot de passe admin), une fois le
+ * mot de passe par défaut changé — voir `middleware/api-auth.ts`.
  *
  * Le fichier de clés et son répertoire sont créés avec des permissions
  * restrictives (respectivement 0600 et 0700). Le secret n'existe en clair qu'au
@@ -168,8 +167,8 @@ function matchFileKey(secret: string, keys: ApiKeyRecord[]): ApiKeyRecord | null
 }
 
 /**
- * Résout un secret présenté en identité : clé du fichier OU clé d'amorçage
- * fournie par l'environnement/le fichier de réglages (SWITCHY_API_KEY).
+ * Résout un secret présenté en identité : clé du fichier OU clé fournie par
+ * l'environnement/le fichier de réglages (SWITCHY_API_KEY), pour les outils.
  */
 export function resolveIdentity(secret: string): ResolvedIdentity | null {
   const found = matchFileKey(secret, loadKeys());
@@ -212,15 +211,6 @@ export function recordUsage(id: string): void {
 }
 
 // ── Mode amorçage ──
-
-/**
- * Vrai si l'API exige une clé : au moins une clé existe (fichier) OU un secret
- * d'amorçage est configuré. Faux au tout premier démarrage → API ouverte, pour
- * permettre la configuration depuis l'interface.
- */
-export function isAuthRequired(): boolean {
-  return loadKeys().length > 0 || getApiKey() !== "";
-}
 
 /** Réinitialise les caches mémo (outil de test). */
 export function resetAuthCaches(): void {

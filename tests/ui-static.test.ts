@@ -60,11 +60,10 @@ describe("socle statique — pas de fallback SPA", () => {
     expect(res.text).not.toContain("Passerelle LLM");
   });
 
-  it("route /api protégée par clé : JSON 401, jamais l'index", async () => {
-    // Mode amorçage : aucune clé n'existe → l'API est OUVERTE, mais répond en
-    // JSON (Lot 2). La route n'est jamais capturée par le statique.
+  it("route /api protégée : JSON 401 sans clé ni session, jamais l'index", async () => {
+    // Plus de mode amorçage : sans clé ni session, l'API répond 401 en JSON.
     const res = await request(env.app).get("/api/services");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
     expect(res.headers["content-type"]).toMatch(/application\/json/);
     expect(res.text).not.toContain("Passerelle LLM");
   });

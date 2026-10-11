@@ -12,7 +12,7 @@
  *   compte sans redémarrage (sauf réglages dits « redémarrage requis ») ;
  * — le défaut est le dernier recours.
  *
- * Sécurité : `config.json` peut contenir des secrets (clé d'API d'amorçage de
+ * Sécurité : `config.json` peut contenir des secrets (clé d'API des outils de
  * Switchy). Il est écrit en ATOMIQUE (tmp + rename) avec les permissions 0600,
  * et son répertoire est ramené en 0700 — même pattern que `switchy-auth.ts`.
  *
@@ -201,6 +201,30 @@ export const SETTINGS_SPEC: readonly SettingSpec[] = [
     min: 1,
     max: 1000,
   },
+  {
+    name: "SWITCHY_QUEUE_MAX",
+    group: "runtime",
+    type: "number",
+    default: "100",
+    min: 0,
+    max: 100_000,
+  },
+  {
+    name: "SWITCHY_QUEUE_TIMEOUT_MS",
+    group: "runtime",
+    type: "number",
+    default: "3600000",
+    min: 0,
+    max: 86_400_000,
+  },
+  {
+    name: "SWITCHY_SLOT_WATCHDOG_MS",
+    group: "runtime",
+    type: "number",
+    default: "1800000",
+    min: 0,
+    max: 86_400_000,
+  },
 
   // ── Journal d'appels (Lot 3) ──
   {
@@ -228,7 +252,17 @@ export const SETTINGS_SPEC: readonly SettingSpec[] = [
   },
 
   // ── Sécurité / accès ──
+  // Clé d'API optionnelle fournie par l'environnement, acceptée pour les OUTILS
+  // (en plus des clés nommées créées depuis l'interface).
   { name: "SWITCHY_API_KEY", group: "security", type: "secret", default: "" },
+  {
+    name: "SWITCHY_SESSION_TTL_HOURS",
+    group: "security",
+    type: "number",
+    default: "12",
+    min: 1,
+    max: 720,
+  },
   { name: "SWITCHY_RATE_LIMIT_PER_MIN", group: "security", type: "number", default: "600", restartRequired: true, min: 1, max: 1_000_000 },
 ];
 

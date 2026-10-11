@@ -9,6 +9,7 @@
 import { Router, type Request, type Response } from "express";
 import { listServices, createService, updateService, deleteService } from "../catalog-store.js";
 import { errorBody } from "../utils/api-error.js";
+import { requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 
 const router = Router();
 
@@ -16,7 +17,7 @@ router.get("/", (_req: Request, res: Response) => {
   res.json({ services: listServices() });
 });
 
-router.post("/", (req: Request, res: Response) => {
+router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     const service = createService(req.body);
     res.status(201).json({ service });
@@ -26,7 +27,7 @@ router.post("/", (req: Request, res: Response) => {
   }
 });
 
-router.put("/:name", (req: Request, res: Response) => {
+router.put("/:name", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     const service = updateService(String(req.params.name), req.body);
     res.json({ service });
@@ -36,7 +37,7 @@ router.put("/:name", (req: Request, res: Response) => {
   }
 });
 
-router.delete("/:name", (req: Request, res: Response) => {
+router.delete("/:name", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     deleteService(String(req.params.name));
     res.status(204).end();

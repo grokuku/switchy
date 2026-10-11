@@ -1,8 +1,9 @@
 /**
- * Authentification par clé d'API (Lot 2). Aucun accès réseau.
+ * Authentification par clé d'API (outils) — Lot 2, révisé Lot 4.
  *
- * Mode amorçage : tant qu'aucune clé n'existe, l'API est ouverte (configuration
- * possible depuis l'interface). Dès qu'une clé existe, elle est exigée.
+ * ⚠️ Plus de « mode amorçage » : l'API n'est jamais ouverte. Elle accepte une
+ * clé d'API (outils : `Authorization: Bearer` ou `X-API-Key`) OU une session
+ * d'administration (navigateur, voir `session.test.ts`). Aucun accès réseau.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
@@ -16,28 +17,27 @@ beforeEach(() => {
 
 afterEach(() => env.cleanup());
 
-describe("clés d'API — amorçage & protection", () => {
-  it("API ouverte tant qu'aucune clé n'existe (mode amorçage)", async () => {
+describe("clés d'API — protection (plus de mode amorçage)", () => {
+  it("sans clé ni session → 401 JSON (l'API n'est jamais ouverte)", async () => {
     const res = await request(env.app).get("/api/services");
-    expect(res.status).toBe(200);
-    expect(res.body.services).toEqual([]);
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("UNAUTHORIZED");
+    expect(res.headers["content-type"]).toMatch(/application\/json/);
   });
 
   it("la clé n'est renvoyée qu'à la création ; l'aperçu est masqué ensuite", async () => {
-    const created = await request(env.app).post("/api/keys").send({ name: "pi-web" });
-    expect(created.status).toBe(201);
-    expect(created.body.secret).toMatch(/^switchy_[0-9a-f]{32}$/);
-    expect(created.body.key.keyPreview).toMatch(/…$/);
+    const secret = await createApiKey(env.app, "pi-web");
+    expect(secret).toMatch(/^switchy_[0-9a-f]{32}$/);
 
-    const list = await request(env.app).get("/api/keys").set("X-API-Key", created.body.secret);
+    const list = await request(env.app).get("/api/keys").set("X-API-Key", secret);
     expect(list.status).toBe(200);
-    expect(list.body.authRequired).toBe(true);
-    expect(list.body.keys[0].keyPreview).toBe(created.body.key.keyPreview);
-    expect(JSON.stringify(list.body)).not.toContain(created.body.secret);
+    expect(list.body.keys).toHaveLength(1);
+    expect(list.body.keys[0].keyPreview).toMatch(/…$/);
+    expect(JSON.stringify(list.body)).not.toContain(secret);
     expect(JSON.stringify(list.body)).not.toContain("scrypt:");
   });
 
-  it("sans clé (après création) → 401 ; avec la bonne clé → 200", async () => {
+  it("sans clé → 401 ; avec la bonne clé → 200", async () => {
     const key = await createApiKey(env.app, "yuki");
 
     const missing = await request(env.app).get("/api/settings");
@@ -69,8 +69,20 @@ describe("clés d'API — amorçage & protection", () => {
     }
   });
 
-  it("révocation d'une clé → 404 sur une clé inconnue", async () => {
-    const res = await request(env.app).delete("/api/keys/switchyk_inconnu");
+  it("les clés d'API des outils écrivent les réglages SANS CSRF ni garde-fou mot de passe", async () => {
+    const key = await createApiKey(env.app, "pi-web");
+    // Mot de passe admin resté au défaut : les accès scriptés restent inchangés.
+    const res = await request(env.app)
+      .post("/api/settings")
+      .set("X-API-Key", key)
+      .send({ settings: { SWITCHY_CONCURRENCY: "7" } });
+    expect(res.status).toBe(200);
+    expect(res.body.updated).toContain("SWITCHY_CONCURRENCY");
+  });
+
+  it("révocation d'une clé inconnue → 404", async () => {
+    const key = await createApiKey(env.app, "temp");
+    const res = await request(env.app).delete("/api/keys/switchyk_inconnu").set("X-API-Key", key);
     expect(res.status).toBe(404);
   });
 });

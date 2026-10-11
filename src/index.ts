@@ -16,11 +16,15 @@ import { readFileSync } from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getHost, getPort, getRateLimitPerMin } from "./config.js";
 import { catalogCounts } from "./catalog-store.js";
-import { requireApiKey } from "./middleware/require-key.js";
+import { requireApiAuth } from "./middleware/api-auth.js";
+import sessionRouter from "./routes/session.js";
 import providersRouter from "./routes/providers.js";
 import servicesRouter from "./routes/services.js";
 import settingsRouter from "./routes/settings.js";
 import keysRouter from "./routes/keys.js";
+import { llmRouter, openaiRouter } from "./routes/llm.js";
+import nativeRouter from "./routes/native.js";
+import callsRouter from "./routes/calls.js";
 
 /** Version du package, lue à côté du point d'entrée (src/ comme dist/). */
 export const version: string = (() => {
@@ -61,13 +65,30 @@ export function createApp(): express.Express {
     });
   });
 
-  // ── API de configuration (Lot 2) — protégée par la clé d'API Switchy ──
+  // ── Connexion / session (Lot 4) — PUBLIQUE (aucune clé ni session exigée) ──
+  // POST /api/session/login, POST /api/session/logout, GET /api/session,
+  // POST /api/session/password. Monté AVANT les routes protégées : c'est le
+  // point d'entrée de l'HUMAIN (mot de passe + cookie de session signé HMAC).
+  app.use("/api/session", sessionRouter);
+
+  // ── API de configuration (Lot 2) — session d'admin OU clé d'API des outils ──
   // Montée AVANT le statique : `/api/*` garde toujours la priorité (aucune
-  // route API n'est capturée par le service de fichiers).
-  app.use("/api/providers", requireApiKey, providersRouter);
-  app.use("/api/services", requireApiKey, servicesRouter);
-  app.use("/api/settings", requireApiKey, settingsRouter);
-  app.use("/api/keys", requireApiKey, keysRouter);
+  // route API n'est capturée par le service de fichiers). La clé d'API
+  // (`Authorization: Bearer` / `X-API-Key`) reste le contrat des outils ; la
+  // session (cookie) est celui du navigateur.
+  app.use("/api/providers", requireApiAuth, providersRouter);
+  app.use("/api/services", requireApiAuth, servicesRouter);
+  app.use("/api/settings", requireApiAuth, settingsRouter);
+  app.use("/api/keys", requireApiAuth, keysRouter);
+
+  // ── Cœur du gateway (Lot 3) ──
+  // Relais LLM (services nommés + replis + concurrence globale + journal),
+  // relais de l'API NATIVE des fournisseurs (découverte des modèles), et
+  // consultation du journal d'appels.
+  app.use("/api/llm", requireApiAuth, llmRouter);
+  app.use("/v1", requireApiAuth, openaiRouter);
+  app.use("/api/native", requireApiAuth, nativeRouter);
+  app.use("/api/calls", requireApiAuth, callsRouter);
 
   // ── Interface web statique (coquille de configuration) ──
   // Montée APRÈS le rate-limit et APRÈS /health et /api/* : `public/` est
