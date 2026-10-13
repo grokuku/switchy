@@ -3,9 +3,12 @@
  * replis, et PASS-THROUGH fidèle vers le fournisseur.
  *
  * Règles tenues par ce module :
- *   - le corps relayé est celui du client, au SEUL champ `model` près (remplacé
- *     par le modèle de l'étape courante) : aucune autre transformation, aucune
- *     normalisation de format ;
+ *   - le corps relayé est celui du client, au SEUL champ `model` (remplacé par
+ *     le modèle de l'étape courante) et au champ `reasoning_effort` près :
+ *     Switchy IMPOSE le niveau de réflexion du service (`step.reasoning`) et
+ *     ÉCRASE la valeur éventuelle du client (Switchy = point de contrôle
+ *     central). Si le service ne définit aucun niveau, le corps passe tel quel.
+ *     Aucune autre transformation, aucune normalisation de format ;
  *   - le streaming SSE est relayé CHUNK PAR CHUNK, sans tampon ; l'annulation
  *     du client interrompt l'appel amont (AbortController) et libère le slot ;
  *   - le tool-calling et les canaux de réflexion passent tels quels : Switchy
@@ -32,6 +35,7 @@ import { getProvider, getService, type ProviderRecord, type ServiceRecord, type 
 import { getConcurrency } from "../config.js";
 import { ApiError } from "../utils/api-error.js";
 import { classifyReason, logCall, newCallId, type CallLogTokens } from "./calls-log.js";
+import { isReasoningLevel, normalizeMessagesForProvider, reasoningWireValue } from "./reasoning.js";
 import { llmSlots, QueueFullError, QueueTimeoutError } from "./slot-queue.js";
 
 // ── Entrées / sorties ──
@@ -323,6 +327,34 @@ type StepOutcome =
   | { ok: true; output: RelayOutput }
   | { ok: false; failure: UpstreamFailure; fallbackable: boolean };
 
+/**
+ * Corps RÉELLEMENT envoyé au fournisseur : copie du corps client, `model`
+ * remplacé par celui de l'étape courante, puis le niveau de réflexion du
+ * service IMPOSÉ (`reasoning_effort`) — y compris quand il vaut `off`, qui doit
+ * sortir en `"none"` (sinon Ollama réactive la réflexion : contrôle fantôme).
+ *
+ * ⚠️ RÈGLE D'ARBITRAGE (décision utilisateur) : Switchy est le point de contrôle
+ * central, il IMPOSE toujours son niveau et ÉCRASE la valeur du client. Le corps
+ * n'est laissé intact que si le service ne définit AUCUN niveau (`step.reasoning`
+ * absent) — c'est alors le mode pass-through.
+ *
+ * Petit plus : le rôle `developer` est neutralisé pour un fournisseur Ollama
+ * (sinon HTTP 400).
+ */
+export function buildUpstreamBody(
+  body: Record<string, unknown>,
+  step: ServiceStep,
+  provider: ProviderRecord,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...body, model: step.model };
+  if (isReasoningLevel(step.reasoning)) {
+    out.reasoning_effort = reasoningWireValue(step.reasoning, provider);
+  }
+  const messages = normalizeMessagesForProvider(out.messages, provider);
+  if (messages) out.messages = messages;
+  return out;
+}
+
 async function attemptStep(params: StepParams): Promise<StepOutcome> {
   const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint } = params;
   const startedAt = Date.now();
@@ -357,7 +389,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     const upstream = await fetch(joinUrl(provider.baseUrl, "chat/completions"), {
       method: "POST",
       headers: buildUpstreamHeaders(provider, headers),
-      body: JSON.stringify({ ...body, model: step.model }),
+      body: JSON.stringify(buildUpstreamBody(body, step, provider)),
       signal,
     });
     const responseHeaders = filterResponseHeaders(upstream.headers);

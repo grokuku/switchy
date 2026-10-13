@@ -17,8 +17,9 @@
  * ⚠️ CACHE COURT (pour ne pas interroger le fournisseur à chaque frappe) ;
  * `refresh: true` le contourne (bouton « rafraîchir » de l'interface).
  */
-import { getProvider, REASONING_LEVELS, type ProviderRecord, type ReasoningLevel } from "../catalog-store.js";
+import { getProvider, type ProviderRecord, type ReasoningLevel } from "../catalog-store.js";
 import { ApiError } from "../utils/api-error.js";
+import { normalizeReasoningLevel, STANDARD_REASONING_LEVELS } from "./reasoning.js";
 import { nativeBaseUrl } from "../routes/native.js";
 
 export type ModelSource = "ollama-native" | "openai-compatible";
@@ -51,8 +52,10 @@ export interface ProviderModelDetails {
   capabilities?: ProviderCapabilities;
   contextWindow?: number;
   maxOutputTokens?: number;
-  /** Niveaux de réflexion proposables (déduits des capacités). */
+  /** Niveaux de réflexion RÉELLEMENT supportés (détectés), sinon standard. */
   reasoningLevels: ReasoningLevel[];
+  /** Niveau par défaut du modèle quand le fournisseur le déclare. */
+  reasoningDefault?: ReasoningLevel;
   /** Explication affichée dans l'interface quand rien n'a été détecté. */
   note?: string;
 }
@@ -195,9 +198,83 @@ export function capabilitiesFromList(list: unknown): ProviderCapabilities | unde
   return { completion: has("completion"), tools: has("tools"), thinking: has("thinking"), vision: has("vision") };
 }
 
-/** Niveaux de réflexion déduits des capacités (tous si le modèle « pense »). */
-export function reasoningLevelsFor(caps: ProviderCapabilities | undefined): ReasoningLevel[] {
-  return caps && caps.thinking ? [...REASONING_LEVELS] : ["off"];
+/**
+ * Niveaux de réflexion déduits des capacités — repli quand le fournisseur ne
+ * déclare qu'une capacité « thinking » globale sans la liste exacte des niveaux.
+ * `thinking` (bloc Ollama parsé) PRIME : il porte les niveaux réels.
+ */
+export function reasoningLevelsFor(
+  caps: ProviderCapabilities | undefined,
+  thinking?: ParsedThinking | null,
+): ReasoningLevel[] {
+  if (thinking) return thinking.levels;
+  return caps && caps.thinking ? [...STANDARD_REASONING_LEVELS] : ["off"];
+}
+
+/** Bloc `thinking` d'Ollama (`POST /api/show`) : niveaux réels + défaut. */
+export interface ParsedThinking {
+  levels: ReasoningLevel[];
+  default?: ReasoningLevel;
+}
+
+/**
+ * Lit le bloc `thinking` d'Ollama (`POST /api/show`) — source AUTORITAIRE des
+ * niveaux réellement supportés :
+ *   thinking = { values: [false, "low", "high", "max"], default: "high" }
+ * Le booléen `false` = extinction supportée → niveau interne `off` ; chaque
+ * chaîne est un niveau wire conservé tel quel. Une valeur non reconnue est
+ * IGNORÉE (jamais inventée). Renvoie `null` si le bloc est absent/invalide ou
+ * sans valeur exploitable.
+ */
+export function parseOllamaThinking(thinking: unknown): ParsedThinking | null {
+  if (!thinking || typeof thinking !== "object" || Array.isArray(thinking)) return null;
+  const values = (thinking as { values?: unknown }).values;
+  if (!Array.isArray(values)) return null;
+  const levels: ReasoningLevel[] = [];
+  let offSupported = false;
+  for (const v of values) {
+    if (v === false) {
+      offSupported = true;
+      continue;
+    }
+    const level = normalizeReasoningLevel(v);
+    if (level && level !== "off" && !levels.includes(level)) levels.push(level);
+  }
+  const exposed: ReasoningLevel[] = offSupported ? ["off", ...levels] : [...levels];
+  if (exposed.length === 0) return null;
+  const def = normalizeReasoningLevel((thinking as { default?: unknown }).default);
+  return { levels: exposed, ...(def && exposed.includes(def) ? { default: def } : {}) };
+}
+
+/**
+ * Lit `effort.supported_levels` (DeepSeek et autres compatibles OpenAI qui
+ * l'exposent, via `GET {baseUrl}/models`). Accepte aussi bien un tableau qu'un
+ * objet `{ supported_levels | supportedLevels | levels }`. Renvoie `null` si
+ * rien d'exploitable (le fournisseur n'expose pas de niveaux).
+ */
+export function parseEffortLevels(effort: unknown): ReasoningLevel[] | null {
+  let supported: unknown;
+  if (Array.isArray(effort)) supported = effort;
+  else if (effort && typeof effort === "object") {
+    const obj = effort as Record<string, unknown>;
+    supported = obj.supported_levels ?? obj.supportedLevels ?? obj.levels;
+  }
+  if (!Array.isArray(supported)) return null;
+  const levels: ReasoningLevel[] = [];
+  for (const raw of supported) {
+    const level = normalizeReasoningLevel(raw);
+    if (level && !levels.includes(level)) levels.push(level);
+  }
+  return levels.length > 0 ? levels : null;
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined;
+}
+
+function inputModalitiesIncludeImage(value: unknown): boolean | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.some((v) => typeof v === "string" && /image|vision/i.test(v));
 }
 
 /**
@@ -234,26 +311,66 @@ export async function describeProviderModel(
       "reading model capabilities",
     );
     if (!res.ok) throw upstreamError(provider, "reading model capabilities", res.status);
-    const data = (await parseJson(res)) as { capabilities?: unknown; model_info?: unknown };
+    const data = (await parseJson(res)) as { capabilities?: unknown; model_info?: unknown; thinking?: unknown };
     const capabilities = capabilitiesFromList(data.capabilities);
     const contextWindow = extractContextLength(data.model_info);
+    const thinking = parseOllamaThinking(data.thinking);
     details = {
       model,
       providerId,
       source,
-      detected: capabilities !== undefined,
+      detected: capabilities !== undefined || thinking !== null,
       ...(capabilities ? { capabilities } : {}),
       ...(contextWindow !== undefined ? { contextWindow } : {}),
-      reasoningLevels: reasoningLevelsFor(capabilities),
+      reasoningLevels: reasoningLevelsFor(capabilities, thinking),
+      ...(thinking?.default ? { reasoningDefault: thinking.default } : {}),
     };
   } else {
+    // Beaucoup de fournisseurs OpenAI-compatible n'exposent RIEN d'utile : on
+    // TENTE `GET {baseUrl}/models` (endpoint standard, quasi toujours présent)
+    // et on lit, par modèle, `effort.supported_levels` (niveaux de réflexion
+    // réels, ex. DeepSeek), `context_window`, `max_output_tokens` et
+    // `input_modalities`. Rien trouvé → liste standard + `detected: false` et
+    // note honnête : on n'invente JAMAIS de niveau.
+    const res = await safeFetch(
+      provider,
+      `${joinBase(provider.baseUrl)}/models`,
+      { headers: authHeaders(provider) },
+      "reading model capabilities",
+    );
+    if (!res.ok) throw upstreamError(provider, "reading model capabilities", res.status);
+    const data = (await parseJson(res)) as { data?: unknown; models?: unknown };
+    const raw = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : [];
+    const entry = raw.find(
+      (m): m is Record<string, unknown> =>
+        Boolean(m) &&
+        typeof m === "object" &&
+        !Array.isArray(m) &&
+        ((m as Record<string, unknown>).id === model || (m as Record<string, unknown>).model === model),
+    );
+    const effortLevels = entry ? parseEffortLevels(entry.effort) : null;
+    const contextWindow = entry ? positiveNumber(entry.context_window ?? entry.context_length) : undefined;
+    const maxOutputTokens = entry ? positiveNumber(entry.max_output_tokens) : undefined;
+    const vision = entry ? inputModalitiesIncludeImage(entry.input_modalities) : undefined;
+    const detected =
+      Boolean(entry) &&
+      (effortLevels !== null || contextWindow !== undefined || maxOutputTokens !== undefined || vision !== undefined);
     details = {
       model,
       providerId,
       source,
-      detected: false,
-      reasoningLevels: [...REASONING_LEVELS],
-      note: "Capacités non exposées par ce fournisseur (API OpenAI-compatible) — renseignez-les à la main.",
+      detected,
+      ...(detected && vision !== undefined
+        ? { capabilities: { completion: true, tools: true, thinking: effortLevels !== null, vision } }
+        : {}),
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+      reasoningLevels: effortLevels ?? [...STANDARD_REASONING_LEVELS],
+      ...(detected
+        ? {}
+        : {
+            note: "Capacités non exposées par ce fournisseur (API OpenAI-compatible) — liste standard proposée, renseignez à la main.",
+          }),
     };
   }
 

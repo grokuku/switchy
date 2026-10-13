@@ -28,8 +28,17 @@ import { ApiError } from "./utils/api-error.js";
 export const PROVIDER_TYPES = ["openai-compatible", "ollama-native", "anthropic", "google"] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
 
-/** Niveaux de réflexion admis pour un modèle. */
-export const REASONING_LEVELS = ["off", "low", "medium", "high"] as const;
+/**
+ * Vocabulaire CANONIQUE des niveaux de réflexion — SUPERSET des valeurs
+ * acceptées au stockage. La liste RÉELLEMENT proposée pour un modèle vient de la
+ * DÉTECTION du fournisseur (`reasoningLevels`, `reasoningDefault` de
+ * `src/llm/model-catalog.ts`) ; ce superset ne sert qu'à VALIDER ce qui est
+ * enregistré et à TOLÉRER les niveaux d'un catalogue antérieur (ex. `medium`),
+ * pour ne jamais casser un service existant. Les niveaux non déclarés par un
+ * fournisseur sont repliés au plus proche à l'envoi (`reasoningWireValue`,
+ * `src/llm/reasoning.ts`).
+ */
+export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 /** Bornes numériques. */

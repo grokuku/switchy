@@ -108,7 +108,7 @@ describe("relais — principal, fidélité, tool-calling", () => {
     expect(missing.body.code).toBe("VALIDATION_ERROR");
   });
 
-  it("pass-through : tools, champs inconnus et canal de réflexion ne sont PAS transformés", async () => {
+  it("pass-through des champs inconnus MAIS le niveau de réflexion du SERVICE écrase celui du client", async () => {
     await seedChat();
     mock = installMockFetch(() => jsonResponse({ choices: [] }));
 
@@ -124,10 +124,12 @@ describe("relais — principal, fidélité, tool-calling", () => {
     expect(res.status).toBe(200);
 
     const sent = JSON.parse(mock.calls[0].init.body ?? "{}") as Record<string, unknown>;
-    expect(sent.model).toBe("model-a"); // SEUL champ remplacé
+    expect(sent.model).toBe("model-a"); // remplacé par le modèle de l'étape
     expect(sent.tools).toEqual(body.tools);
     expect(sent.tool_choice).toBe("auto");
-    expect(sent.reasoning_effort).toBe("high");
+    // Règle d'arbitrage : Switchy IMPOSE le niveau du service (ici « off » →
+    // "none", valeur qui coupe réellement la réflexion) et ÉCRASE le client.
+    expect(sent.reasoning_effort).toBe("none");
     expect(sent.extra_personnalise).toEqual({ imbrique: [1, 2, 3] });
   });
 });

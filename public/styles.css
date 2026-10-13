@@ -917,6 +917,16 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   gap: 4px;
 }
 
+/* Ligne d'état des niveaux de réflexion d'un repli (prend toute la largeur). */
+.fallback-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+}
+.fallback-hint[hidden] {
+  display: none;
+}
+
 /* ── Combobox de modèle (formulaire de service) ───────────────────────── */
 
 .model-combo {

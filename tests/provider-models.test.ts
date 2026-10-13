@@ -136,7 +136,57 @@ describe("capacités d'un modèle", () => {
     expect(res.body.model.reasoningLevels).toEqual(["off"]);
   });
 
-  it("OpenAI-compatible : capacités non exposées → detected=false + note (saisie manuelle)", async () => {
+  it("Ollama natif : le bloc `thinking` fixe les VRAIS niveaux (false → off, default)", async () => {
+    await seedOllama();
+    mock = installMockFetch(() =>
+      jsonResponse({
+        capabilities: ["completion", "tools", "thinking"],
+        model_info: { "qwen3.context_length": 32768 },
+        thinking: { values: [false, "low", "high", "max"], default: "high" },
+      }),
+    );
+    const res = await api(env.app).get("/api/providers/ollama/models/qwen3:8b");
+    expect(res.status).toBe(200);
+    expect(res.body.model.reasoningLevels).toEqual(["off", "low", "high", "max"]);
+    expect(res.body.model.reasoningDefault).toBe("high");
+  });
+
+  it("Ollama natif : bloc `thinking` sans `false` → pas de niveau « off »", async () => {
+    await seedOllama();
+    mock = installMockFetch(() =>
+      jsonResponse({ capabilities: ["thinking"], thinking: { values: ["low", "high"] } }),
+    );
+    const res = await api(env.app).get("/api/providers/ollama/models/m");
+    expect(res.body.model.reasoningLevels).toEqual(["low", "high"]);
+    expect(res.body.model.reasoningDefault).toBeUndefined();
+  });
+
+  it("OpenAI-compatible exposant `effort.supported_levels` (DeepSeek) : niveaux réels respectés", async () => {
+    await seedOpenAi();
+    mock = installMockFetch((url) => {
+      expect(url).toBe("https://api.openai.example/v1/models");
+      return jsonResponse({
+        data: [
+          { id: "autre-modele" },
+          {
+            id: "deepseek-chat",
+            effort: { supported_levels: ["low", "medium", "high"] },
+            context_window: 65536,
+            max_output_tokens: 8192,
+            input_modalities: ["text"],
+          },
+        ],
+      });
+    });
+    const res = await api(env.app).get("/api/providers/openai/models/deepseek-chat");
+    expect(res.status).toBe(200);
+    expect(res.body.model.detected).toBe(true);
+    expect(res.body.model.reasoningLevels).toEqual(["low", "medium", "high"]);
+    expect(res.body.model.contextWindow).toBe(65536);
+    expect(res.body.model.maxOutputTokens).toBe(8192);
+  });
+
+  it("OpenAI-compatible : capacités non exposées → detected=false + note (liste standard, saisie manuelle)", async () => {
     await seedOpenAi();
     mock = installMockFetch(() => jsonResponse({}));
     const res = await api(env.app).get("/api/providers/openai/models/gpt-x");
@@ -144,7 +194,7 @@ describe("capacités d'un modèle", () => {
     expect(res.body.model.detected).toBe(false);
     expect(res.body.model.note).toMatch(/non exposées/);
     expect(res.body.model.reasoningLevels).toEqual(["off", "low", "medium", "high"]);
-    expect(mock.calls).toHaveLength(0); // aucune requête réseau pour l'OpenAI-compatible
+    expect(mock.calls).toHaveLength(1); // un seul GET /models tenté, puis repli standard
   });
 
   it("identifiant de modèle encodé avec `/` (route wildcard)", async () => {

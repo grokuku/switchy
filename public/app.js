@@ -468,12 +468,66 @@
     { value: "google", label: "Google" },
   ];
 
-  const REASONING_LEVELS = [
-    { value: "off", label: "désactivée" },
-    { value: "low", label: "faible" },
-    { value: "medium", label: "moyenne" },
-    { value: "high", label: "élevée" },
-  ];
+  // ════════════════════════════════════════════════════════════════════════
+  // Niveaux de réflexion
+  //
+  // La LISTE proposée vient de la DÉTECTION du fournisseur (`reasoningLevels`
+  // et `reasoningDefault` renvoyés par `/api/providers/:id/models/:model`) ;
+  // il n'y a donc AUCUNE liste figée en dur. Le standard OpenAI ne sert que de
+  // repli quand le fournisseur n'expose rien. Ce bloc ne fait que NOMMER les
+  // niveaux (le vocabulaire interne est partagé avec le serveur).
+  // ════════════════════════════════════════════════════════════════════════
+
+  const REASONING_LABELS = {
+    off: "désactivée",
+    minimal: "minimale",
+    low: "faible",
+    medium: "moyenne",
+    high: "élevée",
+    xhigh: "très élevée",
+    max: "maximale",
+  };
+
+  /** Repli quand le fournisseur n'expose rien (affiché honnêtement, jamais « détecté »). */
+  const STANDARD_REASONING_LEVELS = ["off", "low", "medium", "high"];
+
+  function reasoningLabel(value) {
+    return REASONING_LABELS[value] || value;
+  }
+
+  function reasoningOptions(levels) {
+    const list = Array.isArray(levels) && levels.length ? levels : STANDARD_REASONING_LEVELS;
+    return list.map((value) => ({ value, label: reasoningLabel(value) }));
+  }
+
+  /**
+   * Remplit un <select> depuis la DÉTECTION serveur et renvoie une phrase d'état,
+   * ou `null` si le fournisseur n'a rien exposé (on laisse le sélecteur tel quel).
+   *
+   * `preserve` = ne JAMAIS remplacer le niveau enregistré (édition) ; sinon on
+   * propose le niveau par défaut du modèle quand il est connu et supporté.
+   * ⚠️ Un niveau enregistré absent de la détection est CONSERVÉ (tolérance : un
+   * service antérieur ne doit jamais être modifié en silence — le serveur le
+   * replie à l'envoi sur le niveau supporté le plus proche).
+   */
+  function applyDetectedReasoning(select, info, preserve) {
+    const detected = Array.isArray(info && info.reasoningLevels)
+      ? info.reasoningLevels.filter(Boolean)
+      : [];
+    if (detected.length === 0) return null;
+    const current = select.value;
+    const list = detected.slice();
+    if (current && !list.includes(current)) list.unshift(current);
+    select.replaceChildren();
+    for (const value of list) select.append(h("option", { value, text: reasoningLabel(value) }));
+    const def = info.reasoningDefault;
+    if (!preserve && def && list.includes(def)) select.value = def;
+    else if (list.includes(current)) select.value = current;
+    else select.value = list[0];
+    const labels = detected.map(reasoningLabel).join(", ");
+    const defNote = def ? ` — défaut du modèle : ${reasoningLabel(def)}` : "";
+    return `réflexion : ${labels}${defNote}`;
+  }
 
   function providerLabel(id) {
     const found = state.providers.find((p) => p.id === id);
@@ -1063,9 +1117,46 @@
         step ? step.providerId : providerSel.value,
         step ? step.model : "",
       );
-      providerSel.addEventListener("change", () => model.setProvider(providerSel.value));
-      const reasoningSel = buildSelect(REASONING_LEVELS, step ? step.reasoning : "off");
+      providerSel.addEventListener("change", () => {
+        model.setProvider(providerSel.value);
+        void detect();
+      });
+      const reasoningSel = buildSelect(reasoningOptions(null), step ? step.reasoning : "off");
       reasoningSel.setAttribute("aria-label", "réflexion du repli");
+      // Édition : ne pas écraser le niveau enregistré (défaut proposé en création).
+      let reasoningTouched = !!step;
+      reasoningSel.addEventListener("change", () => {
+        reasoningTouched = true;
+      });
+      const reasoningHint = h("p", { class: "fallback-hint field-hint muted", attrs: { hidden: "hidden" } });
+      model.input.addEventListener("change", () => {
+        void detect();
+      });
+      model.input.addEventListener("blur", () => {
+        void detect();
+      });
+
+      /** Interroge le fournisseur pour les niveaux de réflexion RÉELS de ce repli. */
+      async function detect() {
+        const providerId = providerSel.value;
+        const modelId = model.input.value.trim();
+        reasoningHint.hidden = true;
+        reasoningHint.textContent = "";
+        if (!providerId || !modelId) return;
+        try {
+          const data = await apiRequest(
+            `/api/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}`,
+          );
+          const info = data && data.model ? data.model : null;
+          const note = info && info.detected ? applyDetectedReasoning(reasoningSel, info, reasoningTouched) : null;
+          if (note) reasoningHint.textContent = note;
+          else if (info) reasoningHint.textContent = info.note || "réflexion non exposée — liste standard.";
+          reasoningHint.hidden = reasoningHint.textContent === "";
+        } catch (err) {
+          reasoningHint.textContent = (err && err.message) || "Niveaux de réflexion indisponibles.";
+          reasoningHint.hidden = false;
+        }
+      }
 
       const tools = h("div", { class: "fallback-tools" });
       tools.append(
@@ -1097,7 +1188,8 @@
         }),
       );
 
-      li.append(providerSel, model.input, model.datalist, reasoningSel, tools);
+      li.append(providerSel, model.input, model.datalist, reasoningSel, reasoningHint, tools);
+      void detect();
       return li;
     }
 
@@ -1174,9 +1266,21 @@
       field("modèle", principalModel.wrap, "Liste fournie par le fournisseur ; saisie libre possible si le modèle n'y figure pas."),
     );
 
-    const principalReasoning = buildSelect(REASONING_LEVELS, principal.reasoning);
+    const principalReasoning = buildSelect(reasoningOptions(null), principal.reasoning);
     principalReasoning.setAttribute("aria-label", "réflexion principale");
-    form.append(field("niveau de réflexion", principalReasoning));
+    // En édition, on ne RÉÉCRIT jamais le niveau enregistré ; le défaut du modèle
+    // n'est proposé que sur une création (ou après un changement manuel).
+    let reasoningTouched = editing;
+    principalReasoning.addEventListener("change", () => {
+      reasoningTouched = true;
+    });
+    form.append(
+      field(
+        "niveau de réflexion",
+        principalReasoning,
+        "Liste issue de la détection du fournisseur (repli : standard OpenAI).",
+      ),
+    );
 
     // Capacités
     form.append(formSection("Capacités"));
@@ -1224,11 +1328,8 @@
             maxOutInput.value = String(info.maxOutputTokens);
             detected.push(`tokens max : ${formatNumber(info.maxOutputTokens)}`);
           }
-          if (Array.isArray(info.reasoningLevels) && info.reasoningLevels.length) {
-            principalReasoning.value = info.reasoningLevels.includes(principalReasoning.value)
-              ? principalReasoning.value
-              : info.reasoningLevels[info.reasoningLevels.length - 1];
-          }
+          const reasonNote = applyDetectedReasoning(principalReasoning, info, reasoningTouched);
+          if (reasonNote) detected.push(reasonNote);
           capStatus.textContent = `Détecté chez le fournisseur — ${detected.join(" · ")}. Champs pré-remplis, corrigez si besoin.`;
         } else {
           capStatus.textContent =
