@@ -65,20 +65,44 @@ function sanitizeObject(raw: unknown): SettingsObject {
   return out;
 }
 
-/** Contenu brut du fichier (objet plat, jamais `null`). Cache invalidé au mtime. */
+/**
+ * Contenu brut du fichier (objet plat, jamais `null`). Cache invalidé au mtime.
+ *
+ * ⚠️ Deux familles d'échecs DISTINCTES (elles n'ont pas la même conséquence) :
+ *   - ERREUR DE FICHIER (stat/lecture : ENOENT, ENOTDIR, EACCES, EPERM, EISDIR…)
+ *     → repli sur un objet vide. Le fichier absent est le cas normal du premier
+ *     lancement, et un dossier de données MAL FORMÉ (ex. chemin sous un fichier
+ *     → ENOTDIR) ne doit PAS empêcher l'app de démarrer : le refus viendra de
+ *     l'écriture (503 `STORAGE_NOT_WRITABLE`), pas de la construction de l'app.
+ *   - ERREUR DE CONTENU (le fichier est lisible mais son contenu est invalide :
+ *     JSON illisible, ou valeur qui n'est pas un objet) → refus EXPLICITE. On ne
+ *     retombe JAMAIS sur `{}` ici : sinon un `config.json` corrompu ferait
+ *     disparaître le hash du mot de passe admin, qui retomberait au défaut
+ *     `admin` — c'est précisément la faille corrigée.
+ */
 export function readSettingsFile(): SettingsObject {
   const file = settingsFilePath();
+  // ── 1) Lecture : tout échec ICI est une erreur de FICHIER → repli ──
+  let raw: string;
+  let mtimeMs: number;
   try {
     const stat = statSync(file);
     if (cache && cache.mtimeMs === stat.mtimeMs) return cache.data;
-    const data = sanitizeObject(JSON.parse(readFileSync(file, "utf-8")));
-    cache = { mtimeMs: stat.mtimeMs, data };
+    mtimeMs = stat.mtimeMs;
+    raw = readFileSync(file, "utf-8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn("[settings] config.json unreadable, falling back to defaults:", e);
+    }
+    cache = null;
+    return {};
+  }
+  // ── 2) Décodage : tout échec ICI est une erreur de CONTENU → refus explicite ──
+  try {
+    const data = sanitizeObject(JSON.parse(raw));
+    cache = { mtimeMs, data };
     return data;
   } catch (e) {
-    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
-      cache = null;
-      return {};
-    }
     console.error("[settings] Failed to load config.json:", e);
     throw new ApiError(503, "CONFIG_UNREADABLE", "Cannot read config.json; restore a valid configuration before continuing");
   }

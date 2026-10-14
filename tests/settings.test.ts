@@ -4,9 +4,12 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
-import { readFileSync, statSync } from "fs";
+import { readFileSync, statSync, writeFileSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
 import { join } from "path";
 import { makeTestEnv, createApiKey, type TestEnv } from "./helpers.js";
+import { readSettingsFile, resetSettingsCache } from "../src/settings-store.js";
+import { DEFAULT_ADMIN_PASSWORD } from "../src/session-store.js";
 
 let env: TestEnv;
 let key: string;
@@ -95,6 +98,49 @@ describe("POST /api/settings", () => {
     expect(JSON.parse(readFileSync(file, "utf-8")).SWITCHY_CONCURRENCY).toBe("4");
     if (process.platform !== "win32") {
       expect(statSync(file).mode & 0o777).toBe(0o600);
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PORTÉE de CONFIG_UNREADABLE — la règle figée par ce bloc : SEUL un CONTENU
+// invalide refuse ; une ERREUR DE FICHIER (dossier mal formé, permissions…)
+// retombe en repli `{}` et laisse l'app démarrer (le refus 503
+// STORAGE_NOT_WRITABLE, lui, vient de l'écriture — jamais d'un plantage).
+// ────────────────────────────────────────────────────────────────────────────
+describe("config.json : contenu invalide vs erreur de fichier", () => {
+  it("contenu illisible ou non-objet → refus CONFIG_UNREADABLE", () => {
+    for (const contents of ["{broken", "null", "[]"]) {
+      writeFileSync(join(env.dir, "config.json"), contents);
+      resetSettingsCache();
+      expect(() => readSettingsFile()).toThrow(
+        expect.objectContaining({ code: "CONFIG_UNREADABLE", status: 503 }),
+      );
+    }
+  });
+
+  it("dossier de données mal formé (ENOTDIR) → repli {} : l'app démarre et répond 503 JSON", async () => {
+    const root = mkdtempSync(join(tmpdir(), "switchy-bad-dir-"));
+    const blocker = join(root, "not-a-directory");
+    writeFileSync(blocker, "x");
+    const bad = makeTestEnv({ SWITCHY_DATA_DIR: join(blocker, "data") });
+    try {
+      // Aucune exception de CONTENU ne remonte : la lecture retombe en repli.
+      expect(readSettingsFile()).toEqual({});
+      // L'app est bien construite et la route répond en JSON (jamais un 500 HTML).
+      const ag = request.agent(bad.app);
+      const state = await ag.get("/api/session");
+      expect(state.status).toBe(200);
+      const res = await ag
+        .post("/api/session/login")
+        .set("X-CSRF-Token", state.body.csrfToken as string)
+        .send({ password: DEFAULT_ADMIN_PASSWORD });
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe("STORAGE_NOT_WRITABLE");
+      expect(String(res.headers["content-type"])).toContain("json");
+    } finally {
+      bad.cleanup();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
