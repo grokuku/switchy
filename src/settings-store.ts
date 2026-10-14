@@ -56,7 +56,7 @@ function nonEmptyString(value: unknown): string | null {
 
 /** Ne conserve que les entrées non vides sous forme de chaîne (robustesse fichier). */
 function sanitizeObject(raw: unknown): SettingsObject {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("config.json must contain an object");
   const out: SettingsObject = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof v === "string") out[k] = v;
@@ -69,18 +69,18 @@ function sanitizeObject(raw: unknown): SettingsObject {
 export function readSettingsFile(): SettingsObject {
   const file = settingsFilePath();
   try {
-    if (!existsSync(file)) {
-      cache = null;
-      return {};
-    }
     const stat = statSync(file);
     if (cache && cache.mtimeMs === stat.mtimeMs) return cache.data;
     const data = sanitizeObject(JSON.parse(readFileSync(file, "utf-8")));
     cache = { mtimeMs: stat.mtimeMs, data };
     return data;
   } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+      cache = null;
+      return {};
+    }
     console.error("[settings] Failed to load config.json:", e);
-    return {};
+    throw new ApiError(503, "CONFIG_UNREADABLE", "Cannot read config.json; restore a valid configuration before continuing");
   }
 }
 

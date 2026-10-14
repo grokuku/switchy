@@ -16,7 +16,7 @@ import { makeTestEnv, type TestEnv } from "./helpers.js";
 const run = promisify(execFile);
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
-const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+const sha256 = (text: string) => createHash("sha256").update(text.replace(/\r\n/g, "\n"), "utf8").digest("hex");
 
 let env: TestEnv;
 

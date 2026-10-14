@@ -19,7 +19,9 @@ import { Readable } from "node:stream";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { getProvider, type ProviderRecord } from "../catalog-store.js";
 import { logCall } from "../llm/calls-log.js";
-import { filterResponseHeaders } from "../llm/relay.js";
+import { filterResponseHeaders, instrumentStream } from "../llm/relay.js";
+import { llmSlots, QueueFullError, QueueTimeoutError } from "../llm/slot-queue.js";
+import { getConcurrency } from "../config.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
 
 /** Base de l'API native : `nativeUrl` sinon `baseUrl` privée d'un suffixe `/v1`. */
@@ -41,6 +43,11 @@ router.all("/:provider/*", async (req: Request, res: Response) => {
   const startedAt = Date.now();
   const providerId = String(req.params.provider);
   const controller = new AbortController();
+  let slotKey: string | undefined;
+  const release = (): void => {
+    if (slotKey) llmSlots.release(slotKey);
+    slotKey = undefined;
+  };
   res.on("close", () => {
     if (!res.writableEnded) controller.abort();
   });
@@ -64,6 +71,15 @@ router.all("/:provider/*", async (req: Request, res: Response) => {
     if (hasRequestBody(req.method)) headers["content-type"] = "application/json";
     if (provider.apiKey) headers["authorization"] = `Bearer ${provider.apiKey}`;
 
+    slotKey = await llmSlots.acquire({
+      service: `native:${provider.id}`,
+      provider: provider.id,
+      limit: provider.maxConcurrency ?? getConcurrency(),
+      prioritaire: false,
+      signal: controller.signal,
+      onExpire: () => controller.abort(new DOMException("LLM slot watchdog expired", "AbortError")),
+    });
+    controller.signal.throwIfAborted();
     const upstream = await fetch(`${base}/${rest}${query}`, {
       method: req.method,
       headers,
@@ -71,34 +87,61 @@ router.all("/:provider/*", async (req: Request, res: Response) => {
       signal: controller.signal,
     });
 
-    logCall({
-      service: `native:${provider.id}`,
-      attempt: 0,
-      provider: provider.id,
-      model: "-",
-      result: upstream.ok ? "ok" : "error",
-      status: upstream.status,
-      durationMs: Date.now() - startedAt,
-      endpoint: `${req.method} /api/native/:provider/*`,
-      providerType: provider.type,
-    });
+    const finish = (aborted: boolean, error?: string): void => {
+      logCall({
+        service: `native:${provider.id}`,
+        attempt: 0,
+        provider: provider.id,
+        model: "-",
+        result: aborted ? "aborted" : upstream.ok && !error ? "ok" : "error",
+        ...(error ? { error, reason: "upstream_error" as const } : {}),
+        status: upstream.status,
+        durationMs: Date.now() - startedAt,
+        endpoint: `${req.method} /api/native/:provider/*`,
+        providerType: provider.type,
+      });
+      release();
+    };
 
     res.status(upstream.status);
     for (const [name, value] of Object.entries(filterResponseHeaders(upstream.headers))) {
       res.setHeader(name, value);
     }
     if (upstream.body) {
-      const nodeStream = Readable.fromWeb(upstream.body as unknown as WebReadableStream<Uint8Array>);
+      const payload = instrumentStream(upstream.body, () => controller.signal.aborted,
+        (report) => finish(report.aborted, report.error), controller.signal);
+      const nodeStream = Readable.fromWeb(payload as unknown as WebReadableStream<Uint8Array>);
+      res.once("close", () => nodeStream.destroy());
       nodeStream.on("error", () => {
         if (!res.writableEnded) res.destroy();
       });
       nodeStream.pipe(res);
     } else {
+      finish(false);
       res.end();
     }
   } catch (err) {
+    if (slotKey) {
+      logCall({
+        service: `native:${providerId}`, provider: providerId, model: "-", attempt: 0,
+        result: controller.signal.aborted ? "aborted" : "error",
+        ...(controller.signal.aborted ? {} : { reason: "network_error", error: err instanceof Error ? err.message : String(err) }),
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    release();
     if (controller.signal.aborted) {
       if (!res.writableEnded) res.destroy();
+      return;
+    }
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    if (err instanceof QueueFullError || err instanceof QueueTimeoutError) {
+      const retryAfterMs = err instanceof QueueFullError ? err.retryAfterMs : 5000;
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+      res.status(429).json({ error: err.message, code: err instanceof QueueFullError ? "QUEUE_FULL" : "QUEUE_TIMEOUT", retryAfterMs });
       return;
     }
     const { status, body } = errorBody(err);

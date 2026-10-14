@@ -237,6 +237,7 @@ export function instrumentStream(
   source: ReadableStream<Uint8Array>,
   isAborted: () => boolean,
   onFinish: (report: StreamReport) => void,
+  signal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -244,46 +245,68 @@ export function instrumentStream(
   let bytes = 0;
   let usage: CallLogTokens | undefined;
   let finished = false;
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const reader = source.getReader();
+  let stopping = false;
+  let stopPromise: Promise<void> | undefined;
 
   const finish = (report: StreamReport): void => {
     if (finished) return;
     finished = true;
+    signal?.removeEventListener("abort", abort);
     onFinish({ ...report, usage: report.usage ?? usage, bytes });
   };
 
+  const stop = (reason: unknown): Promise<void> => {
+    stopping = true;
+    return stopPromise ??= Promise.resolve(reader.cancel(reason)).catch(() => {}).then(() => {
+      finish({ aborted: true, error: undefined, usage, bytes });
+    });
+  };
+  let streamController: ReadableStreamDefaultController<Uint8Array>;
+  const abort = (): void => {
+    if (finished || stopping) return;
+    streamController.error(signal?.reason ?? new DOMException("Request aborted", "AbortError"));
+    void stop(signal?.reason);
+  };
+
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      reader = source.getReader();
+    start(controller) {
+      streamController = controller;
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+    },
+    async pull(controller) {
       try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!value) continue;
-          controller.enqueue(value); // relais immédiat — le client reçoit le morceau tel quel
-          bytes += value.byteLength;
-          if (!observing) continue;
-          try {
-            buffer += decoder.decode(value, { stream: true });
-            let idx: number;
-            while ((idx = buffer.indexOf("\n")) >= 0) {
-              const line = buffer.slice(0, idx).replace(/\r$/, "");
-              buffer = buffer.slice(idx + 1);
-              const found = usageFromSseLine(line);
-              if (found) usage = found;
-            }
-            if (buffer.length > USAGE_SNIFF_MAX_CHARS) {
-              observing = false;
-              buffer = "";
-            }
-          } catch {
+        const { done, value } = await reader.read();
+        if (stopping || finished) return;
+        if (done) {
+          controller.close();
+          finish({ aborted: false, error: undefined, usage, bytes });
+          return;
+        }
+        if (!value) return;
+        controller.enqueue(value);
+        bytes += value.byteLength;
+        if (!observing) return;
+        try {
+          buffer += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, idx).replace(/\r$/, "");
+            buffer = buffer.slice(idx + 1);
+            const found = usageFromSseLine(line);
+            if (found) usage = found;
+          }
+          if (buffer.length > USAGE_SNIFF_MAX_CHARS) {
             observing = false;
             buffer = "";
           }
+        } catch {
+          observing = false;
+          buffer = "";
         }
-        controller.close();
-        finish({ aborted: false, error: undefined, usage, bytes });
       } catch (err) {
+        if (stopping || finished) return;
         const aborted = isAborted() || (err instanceof Error && err.name === "AbortError");
         if (aborted) controller.close();
         else controller.error(err);
@@ -291,10 +314,7 @@ export function instrumentStream(
       }
     },
     cancel(reason) {
-      finish({ aborted: true, error: undefined, usage, bytes });
-      const active = reader;
-      const cancelPromise = active ? active.cancel(reason) : source.cancel(reason);
-      void Promise.resolve(cancelPromise).catch(() => {});
+      return stop(reason);
     },
   });
 }
@@ -361,17 +381,14 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
 
   // Slot du seau DU FOURNISSEUR : sa `maxConcurrency` (ou le défaut global)
   // s'applique, et la priorité est INTRINSÈQUE au service (pas d'en-tête client).
-  const slotKey = await llmSlots.acquire({
-    service: service.name,
-    provider: provider.id,
-    limit: provider.maxConcurrency ?? getConcurrency(),
-    prioritaire,
-  });
+  const watchdog = new AbortController();
+  const attemptSignal = signal ? AbortSignal.any([signal, watchdog.signal]) : watchdog.signal;
+  let slotKey: string | undefined;
   let released = false;
   const release = (): void => {
     if (released) return;
     released = true;
-    llmSlots.release(slotKey);
+    if (slotKey) llmSlots.release(slotKey);
   };
 
   const common = {
@@ -386,11 +403,20 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
   };
 
   try {
+    slotKey = await llmSlots.acquire({
+      service: service.name,
+      provider: provider.id,
+      limit: provider.maxConcurrency ?? getConcurrency(),
+      prioritaire,
+      signal: attemptSignal,
+      onExpire: () => watchdog.abort(new DOMException("LLM slot watchdog expired", "AbortError")),
+    });
+    attemptSignal.throwIfAborted();
     const upstream = await fetch(joinUrl(provider.baseUrl, "chat/completions"), {
       method: "POST",
       headers: buildUpstreamHeaders(provider, headers),
       body: JSON.stringify(buildUpstreamBody(body, step, provider)),
-      signal,
+      signal: attemptSignal,
     });
     const responseHeaders = filterResponseHeaders(upstream.headers);
 
@@ -417,7 +443,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
 
     const streaming = wantsStream(body) || (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
     if (streaming && upstream.body) {
-      const payload = instrumentStream(upstream.body, () => signal?.aborted === true, (report) => {
+      const payload = instrumentStream(upstream.body, () => attemptSignal.aborted, (report) => {
         logCall({
           ...common,
           result: report.aborted ? "aborted" : report.error ? "error" : "ok",
@@ -428,7 +454,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
           stream: true,
         });
         release();
-      });
+      }, attemptSignal);
       return { ok: true, output: { status: upstream.status, headers: responseHeaders, payload, streaming: true } };
     }
 
@@ -445,7 +471,8 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     release();
     return { ok: true, output: { status: upstream.status, headers: responseHeaders, payload: buffer, streaming: false } };
   } catch (err) {
-    const aborted = signal?.aborted === true || (err instanceof Error && err.name === "AbortError");
+    if (err instanceof QueueFullError || err instanceof QueueTimeoutError) throw err;
+    const aborted = attemptSignal.aborted || (err instanceof Error && err.name === "AbortError");
     logCall({
       ...common,
       result: aborted ? "aborted" : "error",

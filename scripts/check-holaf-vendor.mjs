@@ -133,7 +133,7 @@ for (const [brick, spec] of Object.entries(EXTRACTED_CSS)) {
     fail(`${spec.file} introuvable (lancer scripts/extract-holaf-css.mjs).`);
     continue;
   }
-  if (onDisk !== css) {
+  if (normalizeCss(onDisk) !== css) {
     fail(`${spec.file} diffère de ${brickFile(brick)}.getCss() (ré-extraire via scripts/extract-holaf-css.mjs).`);
   } else {
     ok(`${spec.file} régénérable depuis ${brickFile(brick)} (${Buffer.byteLength(onDisk)} octets).`);

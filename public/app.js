@@ -2049,6 +2049,9 @@
     if (code === "LOGIN_RATE_LIMITED" || status === 429) {
       return "Trop de tentatives — patientez une minute, puis réessayez.";
     }
+    if (code === "CONFIG_UNREADABLE") {
+      return "La configuration de Switchy est illisible ou invalide. Restaurez un fichier config.json valide avant de vous reconnecter.";
+    }
     if (code === "STORAGE_NOT_WRITABLE" || status >= 500) {
       return (
         "Le dossier de données de Switchy n'est pas accessible en écriture : la connexion ne peut pas " +

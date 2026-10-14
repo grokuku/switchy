@@ -19,9 +19,8 @@
  *      fournisseur, les appels des services marqués `prioritaire` passent
  *      AVANT les autres — c'est ainsi qu'« un léger n'attend pas derrière un
  *      lourd », SANS en-tête client. Le client n'a rien à savoir ni à envoyer ;
- *   4. un WATCHDOG qui libère de force un slot détenu anormalement longtemps
- *      (`SWITCHY_SLOT_WATCHDOG_MS`) : un client planté (abort non propagé,
- *      chemin de libération oublié) ne doit jamais figer la capacité ;
+ *   4. un WATCHDOG qui interrompt un appel détenu anormalement longtemps
+ *      (`SWITCHY_SLOT_WATCHDOG_MS`) avant de libérer sa place ;
  *   5. un identifiant de slot UNIQUE par appel, généré ici (`llm:<uuid>`) —
  *      jamais une clé métier : deux appels indépendants ne doivent jamais
  *      partager un slot (leçon de réentrance, pi-sdk.md §6.1).
@@ -30,7 +29,8 @@
  * entre-temps).
  */
 import { randomUUID } from "crypto";
-import { getQueueMax, getQueueTimeoutMs, getSlotWatchdogMs } from "../config.js";
+import { getConcurrency, getQueueMax, getQueueTimeoutMs, getSlotWatchdogMs } from "../config.js";
+import { getProvider } from "../catalog-store.js";
 
 export interface SlotRequest {
   /** Nom du service appelé (ou pseudo-service du relais natif). */
@@ -41,6 +41,9 @@ export interface SlotRequest {
   limit: number;
   /** Priorité intrinsèque du service : ses appels passent avant les autres. */
   prioritaire: boolean;
+  signal?: AbortSignal;
+  /** Interrompt l'appel amont ; le slot reste occupé jusqu'à sa terminaison. */
+  onExpire?: () => void;
 }
 
 /** File pleine : la route répond 429 + `Retry-After` (patron Libry). */
@@ -74,6 +77,8 @@ interface ActiveSlot {
   provider: string;
   prioritaire: boolean;
   acquiredAt: number;
+  onExpire?: () => void;
+  expiring?: boolean;
 }
 
 interface ProviderQueue {
@@ -90,6 +95,7 @@ interface Waiter {
   timer: ReturnType<typeof setTimeout> | null;
   resolve: (slotKey: string) => void;
   reject: (err: Error) => void;
+  cleanup: () => void;
 }
 
 export interface ProviderSlotStats {
@@ -116,6 +122,8 @@ export class ProviderSlotQueue {
   /** Une file par fournisseur, chacune scindée prioritaire / ordinaire. */
   private readonly queues = new Map<string, ProviderQueue>();
 
+  constructor(private readonly currentLimit?: (provider: string) => number) {}
+
   /**
    * Acquiert un slot pour un appel sur le seau de SON fournisseur. Résout AVEC
    * l'identifiant de slot généré (à passer à `release`), ou rejette
@@ -123,6 +131,7 @@ export class ProviderSlotQueue {
    * le slot (`finally` ou fin de flux).
    */
   acquire(request: SlotRequest): Promise<string> {
+    if (request.signal?.aborted) return Promise.reject(new DOMException("Request aborted", "AbortError"));
     if (this.canRun(request)) {
       return Promise.resolve(this.take(request));
     }
@@ -142,18 +151,29 @@ export class ProviderSlotQueue {
         timer: null,
         resolve,
         reject,
+        cleanup: () => {
+          if (waiter.timer) clearTimeout(waiter.timer);
+          request.signal?.removeEventListener("abort", abort);
+        },
       };
+      const remove = (error: Error): void => {
+        const idx = bucket.indexOf(waiter);
+        if (idx < 0) return;
+        bucket.splice(idx, 1);
+        waiter.cleanup();
+        reject(error);
+      };
+      const abort = (): void => remove(new DOMException("Request aborted", "AbortError"));
       const timeoutMs = getQueueTimeoutMs();
       if (timeoutMs > 0) {
         waiter.timer = setTimeout(() => {
-          const idx = bucket.indexOf(waiter);
-          if (idx >= 0) bucket.splice(idx, 1);
-          reject(new QueueTimeoutError(Date.now() - waiter.enqueuedAt));
+          remove(new QueueTimeoutError(Date.now() - waiter.enqueuedAt));
         }, timeoutMs);
         // Ne jamais retenir le process (arrêt propre, tests vitest).
         (waiter.timer as { unref?: () => void })?.unref?.();
       }
       bucket.push(waiter);
+      request.signal?.addEventListener("abort", abort, { once: true });
     });
   }
 
@@ -166,21 +186,26 @@ export class ProviderSlotQueue {
   }
 
   /**
-   * Libère de FORCE les slots détenus au-delà du seuil du watchdog. Retourne
-   * les identifiants libérés (utile aux tests). Le détenteur qui libérera plus
-   * tard devient un no-op idempotent.
+   * Interrompt les appels dépassant le watchdog. Leur place reste occupée
+   * jusqu'à la fin de l'appel ; seuls les slots sans appel associé sont
+   * libérés immédiatement. Retourne les identifiants expirés.
    */
   forceReleaseStale(now: number = Date.now()): string[] {
     const threshold = getSlotWatchdogMs();
     if (threshold <= 0) return [];
     const stale: ActiveSlot[] = [];
     for (const slot of this.active.values()) {
-      if (now - slot.acquiredAt > threshold) stale.push(slot);
+      if (!slot.expiring && now - slot.acquiredAt > threshold) stale.push(slot);
     }
     const freedProviders = new Set<string>();
     for (const slot of stale) {
-      this.active.delete(slot.slotKey);
-      freedProviders.add(slot.provider);
+      slot.expiring = true;
+      if (slot.onExpire) {
+        slot.onExpire();
+      } else {
+        this.active.delete(slot.slotKey);
+        freedProviders.add(slot.provider);
+      }
     }
     for (const provider of freedProviders) this.drain(provider);
     return stale.map((slot) => slot.slotKey);
@@ -272,13 +297,14 @@ export class ProviderSlotQueue {
       provider: request.provider,
       prioritaire: request.prioritaire,
       acquiredAt: Date.now(),
+      onExpire: request.onExpire,
     });
     return slotKey;
   }
 
   /** Le seau du fournisseur a-t-il encore une place libre ? (borne min 1) */
   private canRun(request: SlotRequest): boolean {
-    return this.countActiveFor(request.provider) < Math.max(1, request.limit);
+    return this.countActiveFor(request.provider) < Math.max(1, this.currentLimit?.(request.provider) ?? request.limit);
   }
 
   /**
@@ -297,19 +323,20 @@ export class ProviderSlotQueue {
           const waiter = bucket[i];
           if (!this.canRun(waiter.request)) continue;
           bucket.splice(i, 1);
-          if (waiter.timer) clearTimeout(waiter.timer);
+          waiter.cleanup();
           waiter.slotKey = this.take(waiter.request);
           waiter.resolve(waiter.slotKey);
           progressed = true;
           break;
         }
+        if (progressed) break;
       }
     }
   }
 }
 
 /** Instance partagée du service (limites relues à chaud depuis le catalogue). */
-export const llmSlots = new ProviderSlotQueue();
+export const llmSlots = new ProviderSlotQueue((id) => getProvider(id)?.maxConcurrency ?? getConcurrency());
 
 // Watchdog périodique : libère les slots détenus anormalement longtemps.
 // `unref()` pour ne jamais retenir le process ; le seuil est relu à chaud.
@@ -331,7 +358,7 @@ export function resetLlmSlots(): void {
   };
   for (const queue of internals.queues.values()) {
     for (const waiter of [...queue.priority, ...queue.normal]) {
-      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.cleanup();
       waiter.reject(new QueueTimeoutError(0));
     }
     queue.priority.length = 0;

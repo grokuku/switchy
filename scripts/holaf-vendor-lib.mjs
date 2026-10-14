@@ -53,14 +53,14 @@ export const EXTRACTED_CSS = {
   toast: { file: "holaf-toast.css", export: "HolafToast" },
 };
 
-/** Empreinte SHA-256 (hex) d'une chaîne. */
+/** Empreinte SHA-256 (hex), avec fins de ligne LF comme dans le dépôt. */
 export function sha256(text) {
-  return createHash("sha256").update(text, "utf8").digest("hex");
+  return createHash("sha256").update(text.replace(/\r\n/g, "\n"), "utf8").digest("hex");
 }
 
 /** Contenu canonique d'un CSS extrait : fin normalisée (un seul \n final). */
 export function normalizeCss(css) {
-  return String(css).replace(/\s+$/, "") + "\n";
+  return String(css).replace(/\r\n/g, "\n").replace(/\s+$/, "") + "\n";
 }
 
 /**

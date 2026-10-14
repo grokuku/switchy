@@ -38,6 +38,7 @@ function sendRelay(res: Response, out: RelayOutput): void {
     res.setHeader("x-accel-buffering", "no"); // jamais de tampon côté proxy
     res.flushHeaders();
     const nodeStream = Readable.fromWeb(out.payload as unknown as WebReadableStream<Uint8Array>);
+    res.once("close", () => nodeStream.destroy());
     nodeStream.on("error", () => {
       if (!res.writableEnded) res.destroy();
     });
