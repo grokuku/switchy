@@ -90,6 +90,9 @@ export function createApp(): express.Express {
   // relais de l'API NATIVE des fournisseurs (découverte des modèles), et
   // consultation du journal d'appels.
   app.use("/api/llm", requireApiAuth, llmRouter);
+  // `/v1` = surface compatible OpenAI : POST /chat/completions (relais) ET
+  // GET /models + GET /models/:id (liste des services activés). Un SEUL routeur
+  // monté : aucun ordre de handler à surveiller entre les deux familles.
   app.use("/v1", requireApiAuth, openaiRouter);
   app.use("/api/native", requireApiAuth, nativeRouter);
   app.use("/api/calls", requireApiAuth, callsRouter);

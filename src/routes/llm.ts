@@ -5,6 +5,8 @@
  *
  *   POST /api/llm/:service       → nom de service dans l'URL (canonique)
  *   POST /v1/chat/completions    → compatible OpenAI, `model` = nom du service
+ *   GET  /v1/models              → liste des services ACTIVÉS au format OpenAI
+ *   GET  /v1/models/:id          → détail d'un service (`id` = nom du service)
  *
  * Les deux relaient le corps du client tel quel (seul `model` est remplacé par
  * le modèle de l'étape choisie dans le catalogue) vers le fournisseur du
@@ -21,6 +23,7 @@ import { Router, type Request, type Response } from "express";
 import { Readable } from "node:stream";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { relayServiceChat, UpstreamFailure, QueueFullError, QueueTimeoutError, type RelayOutput } from "../llm/relay.js";
+import { listOpenAiModels, getOpenAiModel } from "../llm/openai-models.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
 
 /** Estimation Retry-After (ms) quand la file d'attente est saturée. */
@@ -119,6 +122,30 @@ openaiRouter.post("/chat/completions", (req: Request, res: Response) => {
     return;
   }
   void handleRelay(req, res, model.trim(), "POST /v1/chat/completions");
+});
+
+// ── GET /v1/models — services ACTIVÉS au format OpenAI ──
+// Un SERVICE est le « modèle » du client : son nom est exactement ce qu'il met
+// dans `body.model` de POST /v1/chat/completions. Seuls les services `enabled`
+// sont exposés ; aucune clé, aucun baseUrl, aucun identifiant de fournisseur.
+
+openaiRouter.get("/models", (_req: Request, res: Response) => {
+  res.json(listOpenAiModels());
+});
+
+// ── GET /v1/models/:id — détail d'un service (`id` = nom du service) ──
+// 404 JSON propre si le service n'existe pas OU s'il est désactivé (même
+// réponse dans les deux cas : un client n'a pas à distinguer les deux).
+
+openaiRouter.get("/models/:id", (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const model = getOpenAiModel(id);
+  if (!model) {
+    const { status, body } = errorBody(ApiError.notFound(`model: unknown or disabled service "${id}"`));
+    res.status(status).json(body);
+    return;
+  }
+  res.json(model);
 });
 
 export { llmRouter, openaiRouter };
