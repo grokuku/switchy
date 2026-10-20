@@ -7,7 +7,10 @@
  *   2. « 24 h »          : appels, réussite, replis, latence ;
  *   3. « Tokens (24 h) » : entrée / sortie / réflexion, par service ET par
  *      fournisseur, avec gestion honnête de l'inconnu (`null` → « — ») ;
- *   4. « Derniers appels » : les dernières tentatives, badge repli compris.
+ *   4. « Derniers appels » : les dernières tentatives, badge repli compris ;
+ *   5. « Par clé d'API » : appels, réussite, replis, latence et tokens par NOM
+ *      de clé, PLUS les appels EN VOL de chaque clé (mesure distincte des
+ *      places par fournisseur).
  *
  * AUCUN cumul persistant : tout est recalculé depuis le journal borné à chaque
  * appel. Aucune donnée sensible (le journal n'en contient déjà aucune).
@@ -17,12 +20,17 @@ import { listProviders } from "../catalog-store.js";
 import {
   readAllCallsLog,
   summarizeActivity,
+  summarizeByKey,
   summarizeTokens,
   type ActivitySummary,
   type CallLogEntry,
+  type LatencyStats,
   type TokenBreakdown,
+  type TokenTotals,
 } from "./calls-log.js";
 import { llmSlots } from "./slot-queue.js";
+import { inFlightByKey } from "./inflight-by-key.js";
+import { listKeys } from "../switchy-auth.js";
 
 /** Fenêtre d'analyse figée par la décision produit (pas de cumul journalier). */
 export const DASHBOARD_WINDOW_HOURS = 24;
@@ -47,6 +55,22 @@ export interface LiveProvider {
   state: LiveState;
 }
 
+/** Activité d'une clé d'API (nom lisible — aucun secret, aucun hash). */
+export interface KeyRow {
+  /** Nom de la clé (`"session"` = interface web, `"inconnu"` = indéterminé). */
+  key: string;
+  /** Appels EN VOL de cette clé à l'instant du calcul. */
+  inFlight: number;
+  /** Appels logiques (24 h). */
+  calls: number;
+  attempts: number;
+  successRate: number | null;
+  /** Appels logiques ayant utilisé au moins un repli. */
+  fallbacks: number;
+  latency: LatencyStats;
+  tokens: TokenTotals;
+}
+
 export interface Dashboard {
   generatedAt: string;
   windowHours: number;
@@ -57,6 +81,12 @@ export interface Dashboard {
   };
   activity: ActivitySummary;
   tokens: TokenBreakdown;
+  /**
+   * Statistiques PAR CLÉ (nom), triées par appels décroissants. Contient toutes
+   * les clés configurées (même à zéro) et `"session"` / `"inconnu"` dès qu'ils
+   * ont de l'activité (appel journalisé ou appel en vol).
+   */
+  byKey: KeyRow[];
   /** Dernières tentatives, la plus récente d'abord (plafonné). */
   recent: CallLogEntry[];
 }
@@ -91,12 +121,50 @@ export function buildDashboard(now: number = Date.now()): Dashboard {
     { active: 0, queued: 0 },
   );
 
+  // ── Statistiques par clé d'API (nom lisible uniquement) ──
+  const knownKeys = listKeys()
+    .map((key) => key.name)
+    .filter((name) => typeof name === "string" && name.trim() !== "");
+  const inFlight = inFlightByKey();
+  const rows = summarizeByKey(entries, {
+    windowHours: DASHBOARD_WINDOW_HOURS,
+    now,
+    knownKeys,
+  });
+  const byKey: KeyRow[] = rows.map((row) => ({
+    key: row.keyName,
+    inFlight: inFlight[row.keyName] ?? 0,
+    calls: row.calls,
+    attempts: row.attempts,
+    successRate: row.successRate,
+    fallbacks: row.fallbacks,
+    latency: row.latency,
+    tokens: row.tokens,
+  }));
+  // Une clé peut avoir un appel EN VOL sans tentative encore journalisée :
+  // on ajoute sa ligne (zéro appel) pour que le total reste cohérent.
+  for (const [name, count] of Object.entries(inFlight)) {
+    if (count <= 0 || byKey.some((row) => row.key === name)) continue;
+    byKey.push({
+      key: name,
+      inFlight: count,
+      calls: 0,
+      attempts: 0,
+      successRate: null,
+      fallbacks: 0,
+      latency: { avgMs: null, maxMs: null, samples: 0 },
+      tokens: { calls: 0, prompt: null, completion: null, reasoning: null },
+    });
+  }
+  byKey.sort((a, b) => b.calls - a.calls || a.key.localeCompare(b.key, "fr"));
+
   return {
     generatedAt: new Date(now).toISOString(),
     windowHours: DASHBOARD_WINDOW_HOURS,
     live: { ...live, providers: liveProviders },
     activity: summarizeActivity(entries, DASHBOARD_WINDOW_HOURS, now),
     tokens: summarizeTokens(entries, DASHBOARD_WINDOW_HOURS, now),
+    byKey,
     // Le journal est chronologique croissant : les dernières entrées sont en fin.
     recent: entries.slice(-DASHBOARD_RECENT_LIMIT).reverse(),
   };

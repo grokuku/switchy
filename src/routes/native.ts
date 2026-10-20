@@ -23,6 +23,8 @@ import { filterResponseHeaders, instrumentStream } from "../llm/relay.js";
 import { llmSlots, QueueFullError, QueueTimeoutError } from "../llm/slot-queue.js";
 import { getConcurrency } from "../config.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
+import { requestKeyName } from "../middleware/api-auth.js";
+import { beginCall, endCall } from "../llm/inflight-by-key.js";
 
 /** Base de l'API native : `nativeUrl` sinon `baseUrl` privée d'un suffixe `/v1`. */
 export function nativeBaseUrl(provider: ProviderRecord): string | null {
@@ -42,6 +44,15 @@ const router = Router();
 router.all("/:provider/*", async (req: Request, res: Response) => {
   const startedAt = Date.now();
   const providerId = String(req.params.provider);
+  // Nom de la clé appelante (jamais un secret) : journal + compteur en vol.
+  const keyName = requestKeyName(req);
+  beginCall(keyName);
+  let counted = false;
+  const finishCount = (): void => {
+    if (counted) return;
+    counted = true;
+    endCall(keyName);
+  };
   const controller = new AbortController();
   let slotKey: string | undefined;
   const release = (): void => {
@@ -90,6 +101,7 @@ router.all("/:provider/*", async (req: Request, res: Response) => {
     const finish = (aborted: boolean, error?: string): void => {
       logCall({
         service: `native:${provider.id}`,
+        keyName,
         attempt: 0,
         provider: provider.id,
         model: "-",
@@ -123,7 +135,7 @@ router.all("/:provider/*", async (req: Request, res: Response) => {
   } catch (err) {
     if (slotKey) {
       logCall({
-        service: `native:${providerId}`, provider: providerId, model: "-", attempt: 0,
+        service: `native:${providerId}`, keyName, provider: providerId, model: "-", attempt: 0,
         result: controller.signal.aborted ? "aborted" : "error",
         ...(controller.signal.aborted ? {} : { reason: "network_error", error: err instanceof Error ? err.message : String(err) }),
         durationMs: Date.now() - startedAt,
@@ -146,6 +158,14 @@ router.all("/:provider/*", async (req: Request, res: Response) => {
     }
     const { status, body } = errorBody(err);
     res.status(status).json(body);
+  } finally {
+    // Le décrément suit la réponse relayée (flux compris) — jamais de fuite.
+    if (res.headersSent && !res.writableFinished) {
+      res.once("finish", finishCount);
+      res.once("close", finishCount);
+    } else {
+      finishCount();
+    }
   }
 });
 

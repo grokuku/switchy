@@ -23,6 +23,31 @@ import { type Request, type Response, type NextFunction } from "express";
 import { extractApiKeys, validateKey, resolveIdentity, recordUsage } from "../switchy-auth.js";
 import { getSessionFromRequest, hasSessionCookie, verifyCsrfToken, isPasswordDefault } from "../session-store.js";
 
+/**
+ * Identité de l'appelant, attachée à la requête par `requireApiAuth` :
+ * le NOM de la clé d'API utilisée (jamais sa valeur ni son hash), `"session"`
+ * pour l'accès depuis l'interface web, `"inconnu"` quand aucune identité n'est
+ * disponible (route non authentifiée, journal antérieur).
+ */
+export const KEY_NAME_SESSION = "session";
+export const KEY_NAME_UNKNOWN = "inconnu";
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      /** Nom lisible de la clé d'API (ou `"session"` / `"inconnu"`) — JAMAIS un secret. */
+      apiKeyName?: string;
+    }
+  }
+}
+
+/** Nom de la clé de la requête (jamais un secret) — `"inconnu"` par défaut. */
+export function requestKeyName(req: Request): string {
+  const name = typeof req.apiKeyName === "string" ? req.apiKeyName.trim() : "";
+  return name === "" ? KEY_NAME_UNKNOWN : name;
+}
+
 /** Vrai si la requête porte une clé d'API valide OU une session admin valide. */
 export function isApiAuthorized(req: Request): boolean {
   if (extractApiKeys(req).some((key) => validateKey(key))) return true;
@@ -35,11 +60,14 @@ export function requireApiAuth(req: Request, res: Response, next: NextFunction):
     if (validateKey(candidate)) {
       const identity = resolveIdentity(candidate);
       if (identity) recordUsage(identity.id);
+      // ⚠️ Seul le NOM est attaché (et journalisé) : jamais la valeur ni le hash.
+      req.apiKeyName = identity?.name ?? KEY_NAME_UNKNOWN;
       next();
       return;
     }
   }
   if (getSessionFromRequest(req) !== null) {
+    req.apiKeyName = KEY_NAME_SESSION;
     next();
     return;
   }

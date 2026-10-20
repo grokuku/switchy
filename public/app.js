@@ -2135,6 +2135,64 @@ import {
     return block;
   }
 
+  /**
+   * Bloc ⑤ — « Par clé d'API » : une ligne par clé (NOM uniquement, jamais un
+   * secret). « en cours » = appels en vol de cette clé (mesure distincte des
+   * places par fournisseur du bloc « En ce moment »).
+   */
+  function renderKeyBlock(byKey) {
+    const block = h("section", { class: "dash-block" });
+    block.append(h("h3", { class: "dash-title", text: "Par clé d'API" }));
+    const rows = Array.isArray(byKey) ? byKey : [];
+    if (rows.length === 0) {
+      block.append(h("p", { class: "muted", text: "Aucune clé d'API utilisée sur la période." }));
+      return block;
+    }
+
+    const table = h("table", { class: "token-table key-table" });
+    const head = h("tr");
+    head.append(h("th", { text: "clé" }));
+    head.append(h("th", { text: "en cours", attrs: { title: "appels en vol de cette clé" } }));
+    head.append(h("th", { text: "appels (24 h)" }));
+    head.append(h("th", { text: "réussite" }));
+    head.append(h("th", { text: "replis" }));
+    head.append(h("th", { text: "latence" }));
+    head.append(h("th", { text: "entrée" }));
+    head.append(h("th", { text: "sortie" }));
+    head.append(h("th", { text: "réflexion" }));
+    const thead = h("thead");
+    thead.append(head);
+    table.append(thead);
+
+    const tbody = h("tbody");
+    for (const row of rows) {
+      const tr = h("tr", { class: "key-row" });
+      tr.append(h("th", { text: row.key || "inconnu", attrs: { scope: "row", title: row.key || "inconnu" } }));
+      const inFlight = Number(row.inFlight) || 0;
+      tr.append(h("td", { class: inFlight > 0 ? "key-inflight key-inflight--on" : "key-inflight", text: String(inFlight) }));
+      tr.append(h("td", { text: formatCompact(row.calls) }));
+      tr.append(h("td", { text: formatPercent(row.successRate) }));
+      const fallbacks = Number(row.fallbacks) || 0;
+      tr.append(h("td", { class: fallbacks > 0 ? "key-fallbacks key-fallbacks--alert" : "key-fallbacks", text: formatCompact(fallbacks) }));
+      const latency = row.latency || {};
+      tr.append(h("td", { text: formatDuration(latency.avgMs) }));
+      const tokens = row.tokens || {};
+      tr.append(h("td", { text: formatTokens(tokens.prompt) }));
+      tr.append(h("td", { text: formatTokens(tokens.completion) }));
+      tr.append(h("td", { text: formatTokens(tokens.reasoning) }));
+      tbody.append(tr);
+    }
+    table.append(tbody);
+    block.append(table);
+    block.append(
+      h("p", {
+        class: "dash-note muted",
+        text: "« en cours » = appels en vol de la clé · « — » = valeur non exposée par le fournisseur.",
+      }),
+    );
+    return block;
+  }
+
   function resultBadge(entry) {
     const result = entry.result || "error";
     const labels = { ok: "OK", error: "erreur", aborted: "interrompu", skipped: "ignoré" };
@@ -2183,7 +2241,12 @@ import {
     const row = h("div", { class: "dash-row" });
     row.append(renderLiveBlock(data.live));
     row.append(renderSummaryBlock(data.activity));
-    host.replaceChildren(row, renderTokensBlock(data.tokens), renderRecentBlock(data.recent));
+    host.replaceChildren(
+      row,
+      renderKeyBlock(data.byKey),
+      renderTokensBlock(data.tokens),
+      renderRecentBlock(data.recent),
+    );
   }
 
   /** Charge (et peint) le tableau de bord — garde anti-réentrance. */

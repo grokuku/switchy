@@ -501,6 +501,33 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   border-bottom: none;
 }
 
+/* Bloc — « Par clé d'API » (mêmes codes visuels que les tokens) */
+.key-table thead th:first-child,
+.key-table th[scope="row"] {
+  text-align: left;
+}
+
+.key-row th[scope="row"] {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.key-inflight {
+  color: var(--switchy-text-muted);
+}
+
+.key-inflight--on {
+  color: var(--switchy-accent);
+  font-weight: 700;
+}
+
+.key-fallbacks--alert {
+  color: var(--switchy-warn);
+  font-weight: 700;
+}
+
 /* Bloc ④ — derniers appels */
 .recent-list {
   list-style: none;

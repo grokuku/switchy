@@ -51,6 +51,11 @@ export interface RelayInput {
   signal?: AbortSignal;
   /** Étiquette de provenance pour le journal (mode `full`). */
   endpoint?: string;
+  /**
+   * NOM de la clé d'API appelante (ou `"session"` / `"inconnu"`) — journalisé
+   * tel quel pour les statistiques par clé. ⚠️ Jamais un secret.
+   */
+  keyName?: string;
 }
 
 export interface RelayOutput {
@@ -341,6 +346,8 @@ interface StepParams {
   prioritaire: boolean;
   signal: AbortSignal | undefined;
   endpoint: string | undefined;
+  /** Nom de la clé appelante (voir `RelayInput.keyName`). */
+  keyName: string | undefined;
 }
 
 type StepOutcome =
@@ -376,7 +383,7 @@ export function buildUpstreamBody(
 }
 
 async function attemptStep(params: StepParams): Promise<StepOutcome> {
-  const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint } = params;
+  const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint, keyName } = params;
   const startedAt = Date.now();
 
   // Slot du seau DU FOURNISSEUR : sa `maxConcurrency` (ou le défaut global)
@@ -394,6 +401,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
   const common = {
     callId,
     service: service.name,
+    keyName,
     attempt,
     provider: provider.id,
     model: step.model,
@@ -529,6 +537,7 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
       // Étape impossible : journalisée (jamais silencieuse), aucun appel réseau.
       logCall({
         callId,
+        keyName: input.keyName,
         service: service.name,
         attempt,
         provider: step.providerId,
@@ -554,6 +563,7 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
       prioritaire,
       signal: input.signal,
       endpoint: input.endpoint,
+      keyName: input.keyName,
     });
     if (outcome.ok) return outcome.output;
     lastFailure = outcome.failure;

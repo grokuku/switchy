@@ -93,6 +93,13 @@ export interface CallLogEntry {
   callId?: string;
   /** Service du catalogue (ou `native:<providerId>` pour le relais natif). */
   service: string;
+  /**
+   * NOM de la clé d'API qui a déclenché l'appel (`"session"` pour l'interface
+   * web, `"inconnu"` si indéterminé). ⚠️ JAMAIS la valeur de la clé ni son
+   * hash : le nom suffit à attribuer l'appel. Absent des entrées antérieures
+   * au champ → comptées sous « inconnu » par le tableau de bord.
+   */
+  keyName?: string;
   /** Rang dans la chaîne : 0 = principal, 1.. = repli n° (repli ⇔ attempt > 0). */
   attempt: number;
   /** Repli ? Explicité (= `attempt > 0`) pour une lecture immédiate, sans calcul. */
@@ -126,6 +133,7 @@ const ESSENTIAL: (keyof CallLogEntry)[] = [
   "ts",
   "callId",
   "service",
+  "keyName",
   "attempt",
   "isFallback",
   "provider",
@@ -531,6 +539,80 @@ export function summarizeTokens(
     addTokens((byProvider[String(entry.provider ?? "?")] ??= emptyTokenTotals()), entry);
   }
   return { total, byService, byProvider };
+}
+
+/** Activité agrégée d'UNE clé d'API (nom, jamais un secret). */
+export interface KeyActivity {
+  keyName: string;
+  /** Appels LOGIQUES (identifiants `callId` distincts) de la fenêtre. */
+  calls: number;
+  /** Tentatives journalisées (principal + replis). */
+  attempts: number;
+  successRate: number | null;
+  /** Appels logiques ayant utilisé AU MOINS un repli. */
+  fallbacks: number;
+  latency: LatencyStats;
+  /** Tokens de la clé (champs `null` si le fournisseur ne les expose pas). */
+  tokens: TokenTotals;
+}
+
+/** Nom affiché pour une entrée dont la clé n'est pas connue. */
+export const UNKNOWN_KEY_NAME = "inconnu";
+
+/**
+ * Agrège l'activité PAR CLÉ D'API (nom de clé) sur la fenêtre :
+ * appels, réussite, replis, latence et tokens. Comptage identique à
+ * `summarizeActivity` (regroupement par `callId`), appliqué à chaque clé.
+ *
+ * `knownKeys` (facultatif) force la présence de lignes à zéro pour les clés
+ * configurées mais inactives : l'addition des lignes couvre alors tout le
+ * total. Les entrées sans `keyName` (journal antérieur) sont comptées sous
+ * « inconnu » — jamais dans une clé arbitraire.
+ */
+export function summarizeByKey(
+  entries: CallLogEntry[],
+  options: { windowHours?: number; now?: number; knownKeys?: Iterable<string> } = {},
+): KeyActivity[] {
+  const windowHours = options.windowHours ?? 24;
+  const now = options.now ?? Date.now();
+  const cutoff = now - Math.max(0, windowHours) * 3_600_000;
+
+  const buckets = new Map<string, CallLogEntry[]>();
+  const bucketFor = (name: string): CallLogEntry[] => {
+    let list = buckets.get(name);
+    if (!list) {
+      list = [];
+      buckets.set(name, list);
+    }
+    return list;
+  };
+  for (const key of options.knownKeys ?? []) {
+    const name = typeof key === "string" ? key.trim() : "";
+    if (name !== "") bucketFor(name);
+  }
+  for (const entry of entries) {
+    if (!withinWindow(entry.ts, cutoff)) continue;
+    const raw = typeof entry.keyName === "string" ? entry.keyName.trim() : "";
+    bucketFor(raw === "" ? UNKNOWN_KEY_NAME : raw).push(entry);
+  }
+
+  const rows: KeyActivity[] = [];
+  for (const [keyName, list] of buckets) {
+    const activity = summarizeActivity(list, windowHours, now);
+    const tokens = summarizeTokens(list, windowHours, now).total;
+    rows.push({
+      keyName,
+      calls: activity.calls,
+      attempts: activity.attempts,
+      successRate: activity.successRate,
+      fallbacks: activity.fallbacks,
+      latency: activity.latency,
+      tokens,
+    });
+  }
+  // Les clés les plus actives d'abord ; à égalité, ordre alphabétique stable.
+  rows.sort((a, b) => b.calls - a.calls || a.keyName.localeCompare(b.keyName, "fr"));
+  return rows;
 }
 
 /** Vue publique d'une entrée : whitelist stricte des champs (fichier non fiable). */

@@ -25,6 +25,8 @@ import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { relayServiceChat, UpstreamFailure, QueueFullError, QueueTimeoutError, type RelayOutput } from "../llm/relay.js";
 import { listOpenAiModels, getOpenAiModel } from "../llm/openai-models.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
+import { requestKeyName } from "../middleware/api-auth.js";
+import { beginCall, endCall } from "../llm/inflight-by-key.js";
 
 /** Estimation Retry-After (ms) quand la file d'attente est saturée. */
 const RETRY_AFTER_FALLBACK_MS = 5000;
@@ -58,6 +60,19 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
     if (!res.writableEnded) controller.abort();
   });
 
+  // Compteur d'appels EN VOL par clé (nom de clé, jamais un secret) : la
+  // mesure est distincte des places par fournisseur (slot-queue). Le décrément
+  // est garanti par le `finally` — succès, erreur, annulation, fermeture.
+  const keyName = requestKeyName(req);
+  beginCall(keyName);
+  let streaming = false;
+  let counted = false;
+  const finishCount = (): void => {
+    if (counted) return;
+    counted = true;
+    endCall(keyName);
+  };
+
   try {
     const out = await relayServiceChat({
       serviceName,
@@ -65,7 +80,9 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
       headers: req.headers,
       signal: controller.signal,
       endpoint,
+      keyName,
     });
+    streaming = out.streaming === true;
     sendRelay(res, out);
   } catch (err) {
     if (err instanceof UpstreamFailure) {
@@ -94,6 +111,14 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
     }
     const { status, body } = errorBody(err);
     res.status(status).json(body);
+  } finally {
+    // Flux SSE : l'appel reste « en vol » jusqu'à la fin de la réponse.
+    if (streaming && !res.writableFinished) {
+      res.once("finish", finishCount);
+      res.once("close", finishCount);
+    } else {
+      finishCount();
+    }
   }
 }
 
