@@ -26,7 +26,20 @@
  * Chargement : ce fichier est un MODULE (comme les briques devant lui dans
  * <body>) — l'exécution est différée et strictement ordonnée, les globales
  * window.Holaf* sont donc déjà posées.
+ *
+ * ORDRE DES ÉTAPES : glisser-déposer, boutons ↑/↓, libellés (« principal »,
+ * « repli n ») et conversion liste ↔ `{principal, fallbacks}` viennent de
+ * `./service-steps.js` — la carte ET la fenêtre « Modifier » partagent donc
+ * exactement la même logique (aucune duplication).
  */
+import {
+  dropToIndex,
+  moveStep,
+  nonEmptySteps,
+  serviceToSteps,
+  stepRoleLabel,
+  stepsToServiceShape,
+} from "./service-steps.js";
 (() => {
   "use strict";
 
@@ -1068,10 +1081,17 @@
 
     if (s.description) card.append(h("p", { class: "item-desc muted", text: s.description }));
 
-    const steps = h("ol", { class: "steps" });
-    steps.append(stepItem("principal", s.principal));
-    (s.fallbacks || []).forEach((f, i) => steps.append(stepItem(`repli ${i + 1}`, f)));
-    card.append(steps);
+    const stepsEl = h("ol", { class: "steps steps--sortable" });
+    let currentSteps = serviceToSteps(s);
+    const drawSteps = () => {
+      stepsEl.replaceChildren();
+      currentSteps.forEach((step, index) => {
+        stepsEl.append(cardStepItem(step, index, currentSteps.length, (from, to) => void reorderServiceSteps(s, from, to)));
+      });
+    };
+    drawSteps();
+    attachStepReordering(stepsEl, (from, to) => void reorderServiceSteps(s, from, to));
+    card.append(stepsEl);
 
     const dl = h("dl", { class: "kv" });
     dl.append(h("div", null, h("dt", { text: "contexte" }), h("dd", { text: formatNumber(s.contextWindow) })));
@@ -1083,14 +1103,234 @@
     return card;
   }
 
-  function stepItem(role, step) {
-    const li = h("li", { class: "step" });
-    li.append(h("span", { class: "step-role", text: role }));
-    li.append(h("span", { class: "step-model", text: step.model }));
-    li.append(h("span", { class: "step-provider muted", text: providerLabel(step.providerId) }));
-    li.append(h("span", { class: "step-reason muted", text: `réflexion: ${step.reasoning || "off"}` }));
+  /**
+   * Une étape de la CARTE : poignée de glisser + boutons ↑/↓.
+   * La persistance est IMMÉDIATE (aucun bouton « Enregistrer ») : `onMove`
+   * remonte des index de liste, traités par `reorderServiceSteps`.
+   */
+  function cardStepItem(step, index, total, onMove) {
+    const li = h("li", { class: "step step--sortable", attrs: { "data-step-index": String(index) } });
+    const role = stepRoleLabel(index);
+    const grip = stepGrip(role);
+    li.append(grip);
+    // Bloc central : libellé + modèle + fournisseur + réflexion (une seule
+    // colonne, pour que les flèches restent TOUJOURS alignées à droite).
+    const main = h("div", { class: "step-main" });
+    main.append(h("span", { class: "step-role", text: role }));
+    main.append(h("span", { class: "step-model", text: step.model }));
+    main.append(h("span", { class: "step-provider muted", text: providerLabel(step.providerId) }));
+    main.append(h("span", { class: "step-reason muted", text: `réflexion: ${step.reasoning || "off"}` }));
+    li.append(main);
+    const tools = stepMoveTools(index, total, role, onMove);
+    li.append(tools.wrap);
+    // Une seule étape : ni poignée ni flèches (rien à déplacer).
+    if (total < 2) {
+      grip.hidden = true;
+      tools.wrap.hidden = true;
+    }
     return li;
   }
+
+  /** Poignée de préhension EXPLICITE : seule zone qui démarre un glisser. */
+  function stepGrip(role) {
+    return h("span", {
+      class: "step-grip",
+      text: "⠿",
+      attrs: {
+        draggable: "true",
+        "aria-hidden": "false",
+        role: "button",
+        tabindex: "-1",
+        title: "Glisser pour changer l'ordre",
+        "aria-label": `Déplacer l'étape ${role} (glisser)`,
+      },
+    });
+  }
+
+  /**
+   * Boutons ↑/↓ d'une étape — OBLIGATOIRES (clavier, mobile, sans souris).
+   * Bornes : les flèches impossibles sont désactivées (et `moveStep` ignore
+   * de toute façon un index hors bornes).
+   */
+  function stepMoveTools(index, total, role, onMove) {
+    const wrap = h("div", { class: "step-tools" });
+    // Flèche seule à l'écran (le libellé complet reste dans aria-label/title).
+    const arrow = (glyph, label, target, disabled) => {
+      const btn = h("button", {
+        class: "btn btn--ghost btn--icon",
+        text: glyph,
+        attrs: { type: "button", "aria-label": `${label} ${role}`, title: `${label} ${role}` },
+        on: { click: () => onMove(index, target) },
+      });
+      btn.disabled = disabled;
+      return btn;
+    };
+    const up = arrow("↑", "Monter", index - 1, index === 0);
+    const down = arrow("↓", "Descendre", index + 1, index >= total - 1);
+    wrap.append(up, down);
+    return { wrap, up, down };
+  }
+
+  /**
+   * Glisser-déposer d'une liste ordonnée d'étapes (`<li data-step-index>` avec
+   * une `.step-grip`). UNE SEULE implémentation : la carte et la fenêtre
+   * « Modifier » l'utilisent toutes les deux.
+   *
+   * Seule la POIGNÉE démarre un glisser (`draggable` sur elle) : un clic sur
+   * « Modifier » / « Supprimer », une sélection de texte ou l'édition d'un
+   * champ ne déplacent donc jamais rien.
+   */
+  function attachStepReordering(listEl, onMove) {
+    let draggingIndex = null;
+
+    const clearMarks = () => {
+      for (const li of listEl.children) li.classList.remove("is-dragging", "insert-before", "insert-after");
+    };
+
+    /** Position d'insertion (0..n) dans la liste ORIGINALE, moitié haute/basse. */
+    const insertionIndexAt = (event, li) => {
+      const rect = li.getBoundingClientRect();
+      const index = Number(li.dataset.stepIndex);
+      const after = event.clientY > rect.top + rect.height / 2;
+      return after ? index + 1 : index;
+    };
+
+    /** `onMove(from, to)` : même contrat que `moveStep`. */
+    const fire = (from, to) => {
+      if (typeof onMove === "function") onMove(from, to);
+    };
+
+    listEl.addEventListener("dragstart", (event) => {
+      const grip = event.target && event.target.closest ? event.target.closest(".step-grip") : null;
+      if (!grip) {
+        // Glisser démarré ailleurs (sélection de texte, bouton…) : on le refuse.
+        event.preventDefault();
+        return;
+      }
+      const li = grip.closest("li");
+      if (!li || !listEl.contains(li)) {
+        event.preventDefault();
+        return;
+      }
+      draggingIndex = Number(li.dataset.stepIndex);
+      li.classList.add("is-dragging");
+      listEl.classList.add("is-dragging-list");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", String(draggingIndex));
+      }
+    });
+
+    listEl.addEventListener("dragover", (event) => {
+      if (draggingIndex === null) return;
+      const li = event.target && event.target.closest ? event.target.closest("li") : null;
+      if (!li || !listEl.contains(li)) return;
+      event.preventDefault(); // « drop » autorisé
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      const index = Number(li.dataset.stepIndex);
+      const insertion = insertionIndexAt(event, li);
+      for (const el of listEl.children) el.classList.remove("insert-before", "insert-after");
+      if (insertion !== draggingIndex && insertion !== draggingIndex + 1) {
+        li.classList.add(insertion > index ? "insert-after" : "insert-before");
+      }
+    });
+
+    listEl.addEventListener("dragleave", (event) => {
+      if (!event.relatedTarget || !listEl.contains(event.relatedTarget)) {
+        for (const el of listEl.children) el.classList.remove("insert-before", "insert-after");
+      }
+    });
+
+    listEl.addEventListener("drop", (event) => {
+      if (draggingIndex === null) return;
+      event.preventDefault();
+      const li = event.target && event.target.closest ? event.target.closest("li") : null;
+      const from = draggingIndex;
+      const to = li ? dropToIndex(from, insertionIndexAt(event, li)) : from;
+      draggingIndex = null;
+      clearMarks();
+      listEl.classList.remove("is-dragging-list");
+      if (to === from) return;
+      fire(from, to);
+    });
+
+    listEl.addEventListener("dragend", () => {
+      draggingIndex = null;
+      clearMarks();
+      listEl.classList.remove("is-dragging-list");
+    });
+  }
+
+  /**
+   * Persistance IMMÉDIATE de l'ordre des étapes d'un service (carte).
+   *
+   * Choix d'annulation : `toast` avec bouton « Annuler » (PAS de délai avant
+   * enregistrement). Raison : un délai laisse une fenêtre où l'écran montre un
+   * ordre non encore enregistré ; ici l'écran bascule tout de suite, puis le
+   * serveur confirme. Et si l'enregistrement ÉCHOUE, l'ordre précédent est
+   * remis à l'écran et une erreur honnête est affichée — jamais un affichage
+   * qui ne correspond pas à ce qui est enregistré.
+   */
+  async function reorderServiceSteps(service, from, to) {
+    const previous = serviceToSteps(service);
+    const next = moveStep(previous, from, to);
+    if (next.length === 0) return; // jamais de liste vide
+    if (sameSteps(previous, next)) return;
+
+    applyStepsToService(service, next); // affichage optimiste
+    renderServices();
+
+    try {
+      await saveServiceSteps(service, next);
+    } catch (err) {
+      applyStepsToService(service, previous); // retour à l'ordre réellement enregistré
+      renderServices();
+      const reason = (err && err.message) || "réseau indisponible";
+      notify(`Ordre non enregistré (${reason}). « ${service.name} » garde son ordre précédent.`, "error");
+      return;
+    }
+
+    notify(`Ordre des étapes de « ${service.name} » enregistré.`, "success", {
+      actions: [{ label: "Annuler", onClick: () => void undoServiceSteps(service, previous) }],
+    });
+  }
+
+  /** « Annuler » du toast : remet l'ordre précédent (et le persiste). */
+  async function undoServiceSteps(service, previous) {
+    const current = serviceToSteps(service);
+    if (sameSteps(current, previous)) return;
+    applyStepsToService(service, previous);
+    renderServices();
+    try {
+      await saveServiceSteps(service, previous);
+      notify(`Ordre précédent rétabli pour « ${service.name} ».`, "info");
+    } catch (err) {
+      applyStepsToService(service, current);
+      renderServices();
+      const reason = (err && err.message) || "réseau indisponible";
+      notify(`Annulation impossible (${reason}) : l'ordre enregistré est conservé.`, "error");
+    }
+  }
+
+  /** Écrit l'ordre dans le service EN MÉMOIRE (l'écran ne ment jamais). */
+  function applyStepsToService(service, steps) {
+    const shape = stepsToServiceShape(steps);
+    if (!shape.principal) return;
+    service.principal = shape.principal;
+    service.fallbacks = shape.fallbacks;
+  }
+
+  /** PUT partiel (le serveur n'exige que les champs fournis). */
+  async function saveServiceSteps(service, steps) {
+    const shape = stepsToServiceShape(steps);
+    if (!shape.principal) throw new Error("un service garde toujours au moins une étape");
+    await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, {
+      method: "PUT",
+      body: { principal: shape.principal, fallbacks: shape.fallbacks },
+    });
+  }
+
+  const sameSteps = (a, b) => a.length === b.length && a.every((step, i) => step === b[i]);
 
   function formatNumber(n) {
     const num = Number(n);
@@ -1098,126 +1338,198 @@
   }
 
   /**
-   * Éditeur de replis : liste ordonnée, ajout / suppression / déplacement.
-   * Chaque ligne porte son propre couple (fournisseur, modèle, réflexion).
+   * ÉDITEUR D'ÉTAPES (fenêtre « Modifier ») : UNE liste ordonnée — la 1re étape
+   * est le PRINCIPAL, les suivantes sont les replis 1, 2… Chaque ligne porte sa
+   * poignée de glisser (⠿), ses boutons ↑/↓ et son couple (fournisseur, modèle,
+   * réflexion). Les libellés sont RENUMÉROTÉS à chaque déplacement.
+   *
+   * `steps()` renvoie la liste ordonnée SANS les lignes restées vides, sauf la
+   * 1re (le principal, toujours conservée pour un message d'erreur explicite) ;
+   * l'appelant la convertit avec `stepsToServiceShape` — aucune logique de
+   * conversion n'est dupliquée ici. `ignoredEmpty()` compte les replis écartés
+   * pour pouvoir prévenir l'utilisateur au lieu de les supprimer en silence.
+   *
+   * `opts.onCapabilities(info)` : capacités du modèle PRINCIPAL (ligne 0),
+   * remontées à l'appelant pour pré-remplir contexte / tokens / vision.
    */
-  function buildFallbacksEditor(initial) {
-    const wrap = h("div", { class: "fallbacks" });
-    const rows = h("ol", { class: "fallback-rows" });
+  function buildStepsEditor(initialSteps, opts) {
+    opts = opts || {};
+    const wrap = h("div", { class: "steps-editor-wrap" });
+    const rows = h("ol", { class: "steps-editor" });
+    const firstProvider = (state.providers[0] && state.providers[0].id) || "";
+    let steps =
+      Array.isArray(initialSteps) && initialSteps.length > 0
+        ? initialSteps.slice()
+        : [{ providerId: firstProvider, model: "", reasoning: "off" }];
 
-    function makeRow(step) {
-      const li = h("li", { class: "fallback-row" });
+    /** Relit une ligne du DOM : une saisie en cours n'est jamais perdue. */
+    function readRow(li) {
+      const providerSel = li.querySelector("select.step-provider-select");
+      const modelInput = li.querySelector("input.step-model-input");
+      const reasoningSel = li.querySelector("select.step-reasoning-select");
+      return {
+        providerId: providerSel ? providerSel.value : "",
+        model: modelInput ? modelInput.value.trim() : "",
+        reasoning: reasoningSel ? reasoningSel.value : "off",
+      };
+    }
+
+    /** Fige les saisies dans le modèle avant tout re-rendu. */
+    function commit() {
+      const read = [];
+      for (const li of rows.children) read.push(readRow(li));
+      if (read.length > 0) steps = read;
+    }
+
+    function move(from, to) {
+      commit();
+      const next = moveStep(steps, from, to);
+      if (next.length === 0 || sameSteps(steps, next)) return;
+      steps = next;
+      draw();
+    }
+
+    function removeAt(index) {
+      commit();
+      if (steps.length <= 1) return; // jamais de liste vide : le principal reste
+      if (index < 0 || index >= steps.length) return;
+      steps = steps.filter((_, i) => i !== index);
+      draw();
+    }
+
+    function makeRow(step, index) {
+      const li = h("li", { class: "step-editor-row", attrs: { "data-step-index": String(index) } });
+      const role = stepRoleLabel(index);
+
+      li.append(stepGrip(role));
+      li.append(h("span", { class: "step-role", text: role }));
+
       const providerSel = buildSelect(
-        state.providers.map((p) => ({ value: p.id, label: `${p.label || p.id}` })),
-        step ? step.providerId : (state.providers[0] && state.providers[0].id) || "",
+        state.providers.map((p) => ({ value: p.id, label: p.label || p.id })),
+        step.providerId || firstProvider,
       );
-      providerSel.setAttribute("aria-label", "fournisseur du repli");
-      // Champ modèle suggéré par le fournisseur choisi (liste + saisie libre).
-      const model = modelInputWithSuggestions(
-        step ? step.providerId : providerSel.value,
-        step ? step.model : "",
-      );
-      providerSel.addEventListener("change", () => {
-        model.setProvider(providerSel.value);
-        void detect();
-      });
-      const reasoningSel = buildSelect(reasoningOptions(null), step ? step.reasoning : "off");
-      reasoningSel.setAttribute("aria-label", "réflexion du repli");
-      // Édition : ne pas écraser le niveau enregistré (défaut proposé en création).
-      let reasoningTouched = !!step;
+      providerSel.className = "step-provider-select";
+      providerSel.setAttribute("aria-label", `fournisseur — ${role}`);
+
+      const model = modelInputWithSuggestions(step.providerId || providerSel.value, step.model);
+      model.input.className = "step-model-input";
+      model.input.setAttribute("aria-label", `modèle — ${role}`);
+
+      const reasoningSel = buildSelect(reasoningOptions(null), step.reasoning || "off");
+      reasoningSel.className = "step-reasoning-select";
+      reasoningSel.setAttribute("aria-label", `réflexion — ${role}`);
       reasoningSel.addEventListener("change", () => {
-        reasoningTouched = true;
-      });
-      const reasoningHint = h("p", { class: "fallback-hint field-hint muted", attrs: { hidden: "hidden" } });
-      model.input.addEventListener("change", () => {
-        void detect();
-      });
-      model.input.addEventListener("blur", () => {
-        void detect();
+        reasoningSel.dataset.touched = "1";
       });
 
-      /** Interroge le fournisseur pour les niveaux de réflexion RÉELS de ce repli. */
-      async function detect() {
+      const hint = h("p", { class: "step-hint muted", attrs: { hidden: "hidden" } });
+
+      /**
+       * Niveaux de réflexion réels du modèle (détection chez le fournisseur).
+       * `userAction` = changement/blur volontaire : seul ce cas remonte les
+       * capacités, pour ne jamais écraser une valeur saisie à la main lors
+       * d'un simple ré-rendu (déplacement d'étape).
+       */
+      async function detect(userAction) {
         const providerId = providerSel.value;
         const modelId = model.input.value.trim();
-        reasoningHint.hidden = true;
-        reasoningHint.textContent = "";
+        hint.hidden = true;
         if (!providerId || !modelId) return;
         try {
           const data = await apiRequest(
             `/api/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}`,
           );
           const info = data && data.model ? data.model : null;
-          const note = info && info.detected ? applyDetectedReasoning(reasoningSel, info, reasoningTouched) : null;
-          if (note) reasoningHint.textContent = note;
-          else if (info) reasoningHint.textContent = info.note || "réflexion non exposée — liste standard.";
-          reasoningHint.hidden = reasoningHint.textContent === "";
+          if (!info) return;
+          // Un niveau déjà enregistré (≠ défaut « off ») n'est jamais écrasé.
+          const preserve =
+            reasoningSel.dataset.touched === "1" || (step.reasoning && step.reasoning !== "off");
+          const note = info.detected ? applyDetectedReasoning(reasoningSel, info, preserve) : null;
+          if (userAction && index === 0 && typeof opts.onCapabilities === "function") opts.onCapabilities(info);
+          hint.textContent = note || info.note || "réflexion non exposée — liste standard.";
+          hint.hidden = hint.textContent === "";
         } catch (err) {
-          reasoningHint.textContent = (err && err.message) || "Niveaux de réflexion indisponibles.";
-          reasoningHint.hidden = false;
+          hint.textContent = (err && err.message) || "Niveaux de réflexion indisponibles.";
+          hint.hidden = false;
         }
       }
 
-      const tools = h("div", { class: "fallback-tools" });
-      tools.append(
-        iconButton("↑", "monter", {
-          class: "btn btn--ghost btn--icon",
-          on: {
-            click: () => {
-              const prev = li.previousElementSibling;
-              if (prev) rows.insertBefore(li, prev);
-            },
-          },
-        }),
-      );
-      tools.append(
-        iconButton("↓", "descendre", {
-          class: "btn btn--ghost btn--icon",
-          on: {
-            click: () => {
-              const next = li.nextElementSibling;
-              if (next) rows.insertBefore(next, li);
-            },
-          },
-        }),
-      );
-      tools.append(
-        iconButton("✕", "retirer", {
-          class: "btn btn--ghost btn--icon",
-          on: { click: () => li.remove() },
-        }),
-      );
+      providerSel.addEventListener("change", () => {
+        model.setProvider(providerSel.value);
+        void detect(true);
+      });
+      model.input.addEventListener("change", () => void detect(true));
+      model.input.addEventListener("blur", () => void detect(true));
 
-      li.append(providerSel, model.input, model.datalist, reasoningSel, reasoningHint, tools);
-      void detect();
+      const tools = stepMoveTools(index, steps.length, role, move);
+      const removeBtn = h("button", {
+        class: "btn btn--ghost btn--icon",
+        text: "✕",
+        attrs: { type: "button", "aria-label": `Retirer ${role}`, title: `Retirer ${role}` },
+        on: { click: () => removeAt(index) },
+      });
+      removeBtn.disabled = steps.length <= 1;
+      tools.wrap.append(removeBtn);
+      if (steps.length < 2) {
+        li.querySelector(".step-grip").hidden = true;
+        tools.up.hidden = true;
+        tools.down.hidden = true;
+      }
+
+      li.append(providerSel, model.input, model.datalist, reasoningSel, tools.wrap, hint);
+      if (step.model) void detect(false);
       return li;
     }
 
-    for (const step of initial || []) rows.append(makeRow(step));
+    function draw() {
+      rows.replaceChildren();
+      steps.forEach((step, index) => rows.append(makeRow(step, index)));
+    }
+
+    draw();
+    attachStepReordering(rows, move);
     wrap.append(rows);
 
-    const add = iconButton("plus", "Ajouter un repli", {
+    const add = iconButton("plus", "Ajouter une étape (repli)", {
       class: "btn",
-      on: { click: () => rows.append(makeRow(null)) },
+      on: {
+        click: () => {
+          commit();
+          const last = steps[steps.length - 1];
+          steps = steps.concat([
+            {
+              providerId: (last && last.providerId) || firstProvider,
+              model: "",
+              reasoning: "off",
+            },
+          ]);
+          draw();
+          const lastRow = rows.lastElementChild;
+          const input = lastRow && lastRow.querySelector("input.step-model-input");
+          if (input) input.focus();
+        },
+      },
     });
     wrap.append(add);
 
-    function collect() {
-      const out = [];
-      for (const li of rows.children) {
-        const [providerSel, modelInput, reasoningSel] = li.querySelectorAll("select, input");
-        const model = modelInput ? modelInput.value.trim() : "";
-        if (!model) continue;
-        out.push({
-          providerId: providerSel ? providerSel.value : "",
-          model,
-          reasoning: reasoningSel ? reasoningSel.value : "off",
-        });
-      }
-      return out;
-    }
-
-    return { wrap, collect };
+    return {
+      wrap,
+      /**
+       * Liste ordonnée finale (1re = principal) — lue au moment d'enregistrer.
+       * Une ligne de repli sans modèle n'est jamais envoyée au serveur (il la
+       * refuserait : `fallbacks[i].model: required`). La 1re ligne est toujours
+       * conservée, même vide : c'est le principal, jamais supprimé en silence.
+       */
+      steps() {
+        commit();
+        return nonEmptySteps(steps);
+      },
+      /** Nombre de lignes de repli écartées à l'enregistrement (sans modèle). */
+      ignoredEmpty() {
+        commit();
+        return steps.filter((step, i) => i > 0 && !step.model).length;
+      },
+    };
   }
 
   function openServiceForm(service) {
@@ -1242,45 +1554,18 @@
     const enabledBox = checkbox(editing ? service.enabled !== false : true, "Activé");
     form.append(enabledBox.wrap);
 
-    // Principal
-    form.append(formSection("Fournisseur principal"));
-    const principal = editing ? service.principal : { providerId: state.providers[0].id, model: "", reasoning: "off" };
-    const principalProvider = buildSelect(
-      state.providers.map((p) => ({ value: p.id, label: p.label || p.id })),
-      principal.providerId,
-    );
-    principalProvider.setAttribute("aria-label", "fournisseur principal");
-    form.append(field("fournisseur", principalProvider));
-
-    // Combobox alimenté par le fournisseur (filtre + liste + saisie libre).
-    const principalModel = modelCombo({
-      providerId: principal.providerId,
-      value: principal.model,
-      label: "modèle principal",
-      onSelect: (model) => {
-        void detectCapabilities(model);
-      },
-    });
-    principalProvider.addEventListener("change", () => principalModel.setProvider(principalProvider.value));
+    // Étapes d'appel : UNE liste ordonnée (1re = principal, puis replis 1, 2…).
+    // Le glisser-déposer, les flèches et la renumérotation viennent de
+    // public/service-steps.js (source de vérité unique, partagée avec la carte).
+    form.append(formSection("Étapes d'appel"));
     form.append(
-      field("modèle", principalModel.wrap, "Liste fournie par le fournisseur ; saisie libre possible si le modèle n'y figure pas."),
+      h("p", {
+        class: "field-hint muted",
+        text: "La 1re étape est le principal ; les suivantes sont les replis, essayés dans cet ordre. Glissez la poignée ⠿ ou utilisez les flèches ↑/↓ (clavier, mobile).",
+      }),
     );
-
-    const principalReasoning = buildSelect(reasoningOptions(null), principal.reasoning);
-    principalReasoning.setAttribute("aria-label", "réflexion principale");
-    // En édition, on ne RÉÉCRIT jamais le niveau enregistré ; le défaut du modèle
-    // n'est proposé que sur une création (ou après un changement manuel).
-    let reasoningTouched = editing;
-    principalReasoning.addEventListener("change", () => {
-      reasoningTouched = true;
-    });
-    form.append(
-      field(
-        "niveau de réflexion",
-        principalReasoning,
-        "Liste issue de la détection du fournisseur (repli : standard OpenAI).",
-      ),
-    );
+    const stepsEditor = buildStepsEditor(editing ? serviceToSteps(service) : [], { onCapabilities });
+    form.append(stepsEditor.wrap);
 
     // Capacités
     form.append(formSection("Capacités"));
@@ -1298,46 +1583,36 @@
 
     const capStatus = h("p", { class: "model-status muted" });
 
-    /** Interroge le fournisseur pour pré-remplir les capacités du modèle choisi. */
-    async function detectCapabilities(model) {
-      const providerId = principalProvider.value;
-      if (!providerId || !model) return;
-      capStatus.textContent = "Interrogation du fournisseur pour les capacités…";
-      try {
-        const data = await apiRequest(
-          `/api/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(model)}`,
-        );
-        const info = data && data.model ? data.model : null;
-        if (!info) {
-          capStatus.textContent = "";
-          return;
-        }
-        if (info.detected) {
-          const detected = [];
-          if (info.capabilities) {
-            visionBox.input.checked = !!info.capabilities.vision;
-            detected.push(`vision : ${info.capabilities.vision ? "oui" : "non"}`);
-            detected.push(`outils : ${info.capabilities.tools ? "oui" : "non"}`);
-            detected.push(`réflexion : ${info.capabilities.thinking ? "oui" : "non"}`);
-          }
-          if (typeof info.contextWindow === "number") {
-            contextInput.value = String(info.contextWindow);
-            detected.push(`contexte : ${formatNumber(info.contextWindow)}`);
-          }
-          if (typeof info.maxOutputTokens === "number") {
-            maxOutInput.value = String(info.maxOutputTokens);
-            detected.push(`tokens max : ${formatNumber(info.maxOutputTokens)}`);
-          }
-          const reasonNote = applyDetectedReasoning(principalReasoning, info, reasoningTouched);
-          if (reasonNote) detected.push(reasonNote);
-          capStatus.textContent = `Détecté chez le fournisseur — ${detected.join(" · ")}. Champs pré-remplis, corrigez si besoin.`;
-        } else {
-          capStatus.textContent =
-            info.note || "Capacités non exposées par ce fournisseur — saisissez-les à la main.";
-        }
-      } catch (err) {
-        capStatus.textContent = (err && err.message) || "Impossible de lire les capacités du modèle.";
+    /**
+     * Pré-remplit les capacités du service d'après le modèle PRINCIPAL (1re
+     * étape), détecté par l'éditeur d'étapes ; aucune valeur n'est imposée.
+     */
+    function onCapabilities(info) {
+      if (!info) {
+        capStatus.textContent = "";
+        return;
       }
+      if (!info.detected) {
+        capStatus.textContent =
+          info.note || "Capacités non exposées par ce fournisseur — saisissez-les à la main.";
+        return;
+      }
+      const detected = [];
+      if (info.capabilities) {
+        visionBox.input.checked = !!info.capabilities.vision;
+        detected.push(`vision : ${info.capabilities.vision ? "oui" : "non"}`);
+        detected.push(`outils : ${info.capabilities.tools ? "oui" : "non"}`);
+        detected.push(`réflexion : ${info.capabilities.thinking ? "oui" : "non"}`);
+      }
+      if (typeof info.contextWindow === "number") {
+        contextInput.value = String(info.contextWindow);
+        detected.push(`contexte : ${formatNumber(info.contextWindow)}`);
+      }
+      if (typeof info.maxOutputTokens === "number") {
+        maxOutInput.value = String(info.maxOutputTokens);
+        detected.push(`tokens max : ${formatNumber(info.maxOutputTokens)}`);
+      }
+      capStatus.textContent = `Détecté chez le fournisseur — ${detected.join(" · ")}. Champs pré-remplis, corrigez si besoin.`;
     }
 
     form.append(capStatus);
@@ -1353,24 +1628,30 @@
       }),
     );
 
-    // Replis
-    form.append(formSection("Replis ordonnés"));
-    const fallbacks = buildFallbacksEditor(editing ? service.fallbacks : []);
-    form.append(fallbacks.wrap);
-
     openForm({
       modalId: "service-form",
       title: editing ? `Service — ${service.name}` : "Nouveau service",
       form,
       save: async () => {
+        // Liste ordonnée → forme du catalogue (une seule conversion, partagée).
+        const shape = stepsToServiceShape(stepsEditor.steps());
+        // Des replis laissés sans modèle sont écartés (comportement historique) :
+        // on le dit explicitement plutôt que de les supprimer en silence.
+        const ignored = stepsEditor.ignoredEmpty();
+        if (ignored > 0) {
+          notify(
+            ignored === 1
+              ? "Une étape de repli sans modèle a été ignorée à l'enregistrement."
+              : `${ignored} étapes de repli sans modèle ont été ignorées à l'enregistrement.`,
+            "warning",
+          );
+        }
+        if (!shape.principal) throw new Error("Ajoutez au moins une étape : le principal est obligatoire.");
+        if (!shape.principal.model) throw new Error("L'étape principale doit avoir un modèle.");
         const body = {
           description: descInput.value.trim(),
-          principal: {
-            providerId: principalProvider.value,
-            model: principalModel.getValue(),
-            reasoning: principalReasoning.value,
-          },
-          fallbacks: fallbacks.collect(),
+          principal: shape.principal,
+          fallbacks: shape.fallbacks,
           contextWindow: Number(contextInput.value),
           maxOutputTokens: Number(maxOutInput.value),
           vision: visionBox.input.checked,

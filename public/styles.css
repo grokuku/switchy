@@ -830,6 +830,176 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-size: 12.5px;
 }
 
+/* ── Étapes réordonnables (carte ET fenêtre « Modifier ») ──────────────
+   La poignée ⠿ est la SEULE zone de préhension : cliquer sur « Modifier »,
+   « Supprimer » ou sélectionner du texte ne déplace jamais une étape. */
+
+.step--sortable .step-grip,
+.step-editor-row .step-grip {
+  cursor: grab;
+}
+
+/* Ligne réordonnable : poignée | contenu | flèches — grille explicite pour que
+   les flèches restent alignées à droite quelle que soit la longueur du texte. */
+.step--sortable {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.step-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+/* Libellé au plus juste : la carte garde ses 3 étapes sur une seule ligne. */
+.step--sortable .step-role {
+  flex: 0 0 auto;
+  min-width: 64px;
+}
+.step--sortable:hover {
+  border-color: var(--switchy-accent);
+}
+
+.step-grip {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: var(--switchy-text-muted);
+  font-size: 15px;
+  line-height: 1;
+  letter-spacing: 1px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none; /* pas de défilement parasite en glissant sur mobile */
+}
+.step-grip:hover {
+  color: var(--switchy-accent);
+  background: var(--switchy-bg-raised);
+}
+.step-grip:active {
+  cursor: grabbing;
+}
+.step-grip[hidden] {
+  display: none;
+}
+/* Appareils TACTILES : le glisser HTML5 n'y existe pas — les flèches ↑/↓
+   restent le seul moyen de réordonner, la poignée serait un contrôle mort. */
+@media (hover: none) and (pointer: coarse) {
+  .step-grip {
+    display: none;
+  }
+}
+
+.step-tools {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  align-self: center;
+}
+.step-tools[hidden] {
+  display: none;
+}
+.step-tools button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Pendant le glisser : pas de sélection de texte dans la liste. */
+.steps.is-dragging-list,
+.steps-editor.is-dragging-list {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Ligne soulevée + semi-transparente pendant le transport. */
+.step.is-dragging,
+.step-editor-row.is-dragging {
+  opacity: 0.45;
+  transform: translateY(-1px);
+  outline: 1px dashed var(--switchy-text-muted);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+  cursor: grabbing;
+  z-index: 2;
+}
+
+/* Indicateur de position d'insertion : trait d'accent + halo, visible en
+   thème sombre comme en thème clair. */
+.step.insert-before,
+.step-editor-row.insert-before {
+  box-shadow:
+    inset 0 3px 0 var(--switchy-accent),
+    0 0 0 1px var(--switchy-accent);
+}
+.step.insert-after,
+.step-editor-row.insert-after {
+  box-shadow:
+    inset 0 -3px 0 var(--switchy-accent),
+    0 0 0 1px var(--switchy-accent);
+}
+
+/* ── Éditeur d'étapes de la fenêtre « Modifier » (liste ordonnée) ─────── */
+
+.steps-editor-wrap {
+  display: grid;
+  gap: 8px;
+}
+
+.steps-editor {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.step-editor-row {
+  display: grid;
+  /* poignée · libellé · fournisseur · modèle · réflexion · outils ↑↓✕ */
+  grid-template-columns:
+    auto minmax(62px, auto) minmax(150px, 1.1fr) minmax(120px, 1.2fr)
+    minmax(110px, 0.6fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+}
+
+/* Un contrôle de grille ne dépasse jamais sa colonne (selects tronqués sinon). */
+.step-editor-row > * {
+  min-width: 0;
+}
+
+.step-editor-row select,
+.step-editor-row input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 6px);
+  background: var(--switchy-bg-raised);
+  color: var(--switchy-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.step-editor-row .step-role {
+  flex: none;
+}
+
+/* Indice de réflexion d'une étape (prend toute la largeur de la ligne). */
+.step-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+}
+.step-hint[hidden] {
+  display: none;
+}
+
 /* ── Formulaires (modales) ────────────────────────────────────────────── */
 
 .form-grid {
@@ -868,63 +1038,6 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 12px;
-}
-
-.step-editor {
-  display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1.4fr) minmax(110px, 0.8fr);
-  gap: 8px;
-}
-
-.fallbacks {
-  display: grid;
-  gap: 8px;
-}
-
-.fallback-rows {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  display: grid;
-  gap: 8px;
-}
-
-.fallback-row {
-  display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1.4fr) minmax(100px, 0.8fr) auto;
-  gap: 8px;
-  align-items: center;
-  padding: 8px;
-  border: 1px solid var(--switchy-border);
-  border-radius: calc(var(--switchy-radius) - 4px);
-  background: var(--switchy-bg);
-}
-
-.fallback-row select,
-.fallback-row input {
-  width: 100%;
-  padding: 7px 9px;
-  border: 1px solid var(--switchy-border);
-  border-radius: calc(var(--switchy-radius) - 6px);
-  background: var(--switchy-bg-raised);
-  color: var(--switchy-text);
-  font: inherit;
-  font-size: 13px;
-}
-
-.fallback-tools {
-  display: flex;
-  gap: 4px;
-}
-
-/* Ligne d'état des niveaux de réflexion d'un repli (prend toute la largeur). */
-.fallback-hint {
-  grid-column: 1 / -1;
-  margin: 0;
-  font-size: 12px;
-}
-.fallback-hint[hidden] {
-  display: none;
 }
 
 /* ── Combobox de modèle (formulaire de service) ───────────────────────── */
@@ -1125,9 +1238,31 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   }
 
   .setting-row,
-  .step-editor,
-  .fallback-row {
+  .step-editor-row {
     grid-template-columns: 1fr;
+  }
+
+  /* Ligne d'étape sur petit écran : poignée + libellé côte à côte, puis les
+     trois sélecteurs pleine largeur, puis les flèches alignées à droite. */
+  .step-editor-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .step-editor-row > .step-grip {
+    grid-column: 1;
+  }
+  .step-editor-row > .step-role {
+    grid-column: 2;
+  }
+  .step-editor-row > select,
+  .step-editor-row > input,
+  .step-editor-row > .step-tools {
+    grid-column: 1 / -1;
+  }
+
+  /* Petits écrans : les flèches restent alignées à droite de la ligne. */
+  .step-tools {
+    margin-left: 0;
+    justify-content: flex-end;
   }
 }
 
