@@ -270,3 +270,91 @@ describe("catalogue — persistance & permissions", () => {
     expect(providers.body.providers[0].maxConcurrency).toBeUndefined();
   });
 });
+
+describe("étapes — bouton on/off par étape (`enabled`)", () => {
+  beforeEach(async () => {
+    await auth(request(env.app).post("/api/providers")).send(validProvider());
+  });
+
+  it("une étape sans `enabled` est ACTIVÉE (rétro-compatibilité)", async () => {
+    const res = await auth(request(env.app).post("/api/services")).send(validService());
+    expect(res.status).toBe(201);
+    expect(res.body.service.principal.enabled).toBe(true);
+    expect(res.body.service.fallbacks[0].enabled).toBe(true);
+  });
+
+  it("`enabled: false` est enregistré et persiste (fichier = source de vérité)", async () => {
+    const created = await auth(request(env.app).post("/api/services")).send(
+      validService({
+        fallbacks: [{ providerId: "ollama-cloud", model: "llama3.3", reasoning: "off", enabled: false }],
+      }),
+    );
+    expect(created.status).toBe(201);
+    expect(created.body.service.fallbacks[0].enabled).toBe(false);
+    // Le principal reste actif : le service continue de fonctionner.
+    expect(created.body.service.principal.enabled).toBe(true);
+
+    const raw = JSON.parse(readFileSync(join(env.dir, "catalog.json"), "utf-8"));
+    expect(raw.services[0].fallbacks[0].enabled).toBe(false);
+  });
+
+  it("bascule d'UNE étape par PUT (sans toucher aux autres étapes)", async () => {
+    await auth(request(env.app).post("/api/services")).send(validService());
+    const upd = await auth(request(env.app).put("/api/services/Deepseek-Fast")).send({
+      principal: { providerId: "ollama-cloud", model: "deepseek-v3", reasoning: "low", enabled: false },
+      fallbacks: [{ providerId: "ollama-cloud", model: "llama3.3", reasoning: "off" }],
+    });
+    expect(upd.status).toBe(200);
+    expect(upd.body.service.principal.enabled).toBe(false);
+    // Un `fallbacks` réenvoyé SANS le champ revient à « activée » (défaut documenté).
+    expect(upd.body.service.fallbacks[0].enabled).toBe(true);
+  });
+
+  it("`enabled` non booléen → 400 (booléen STRICT, pas de coercition)", async () => {
+    const res = await auth(request(env.app).post("/api/services")).send(
+      validService({
+        principal: { providerId: "ollama-cloud", model: "deepseek-v3", reasoning: "low", enabled: "false" },
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.errors.join(" ")).toMatch(/principal\.enabled: required, must be a boolean/);
+  });
+
+  it("catalogue antérieur : une étape sans le champ est ACTIVÉE à la lecture", async () => {
+    const legacy = {
+      version: 1,
+      providers: [
+        {
+          id: "ollama-cloud",
+          label: "Ollama",
+          type: "openai-compatible",
+          baseUrl: "https://ollama.example/v1",
+          enabled: true,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          updatedAt: "2020-01-01T00:00:00.000Z",
+        },
+      ],
+      services: [
+        {
+          name: "Ancien",
+          description: "",
+          principal: { providerId: "ollama-cloud", model: "m", reasoning: "off" },
+          fallbacks: [{ providerId: "ollama-cloud", model: "m2", reasoning: "off" }],
+          contextWindow: 8000,
+          maxOutputTokens: 1000,
+          vision: false,
+          enabled: true,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          updatedAt: "2020-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    writeFileSync(join(env.dir, "catalog.json"), JSON.stringify(legacy), { mode: 0o600 });
+    resetCatalogCache();
+
+    const res = await auth(request(env.app).get("/api/services"));
+    expect(res.status).toBe(200);
+    expect(res.body.services[0].principal.enabled).toBe(true);
+    expect(res.body.services[0].fallbacks[0].enabled).toBe(true);
+  });
+});

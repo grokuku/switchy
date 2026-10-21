@@ -6,11 +6,14 @@
 import { describe, it, expect } from "vitest";
 import {
   dropToIndex,
+  enabledSteps,
+  isStepEnabled,
   moveStep,
   nonEmptySteps,
   serviceToSteps,
   stepRoleLabel,
   stepsToServiceShape,
+  withStepEnabled,
 } from "../public/service-steps.js";
 
 /** Trois étapes distinctes (objets réels, avec leurs réglages). */
@@ -294,5 +297,120 @@ describe("nonEmptySteps — replis vides jamais envoyés à l'API", () => {
     );
     expect(shape.principal.model).toBe("m1");
     expect(shape.fallbacks).toEqual([]);
+  });
+});
+
+describe("isStepEnabled — bouton on/off dune étape", () => {
+  it("seul un `false` EXPLICITE désactive (champ absent = activée)", () => {
+    expect(isStepEnabled({ model: "m" })).toBe(true);
+    expect(isStepEnabled({ model: "m", enabled: true })).toBe(true);
+    expect(isStepEnabled({ model: "m", enabled: false })).toBe(false);
+    // Valeurs non booléennes : jamais interprétées comme « éteinte ».
+    expect(isStepEnabled({ model: "m", enabled: "false" })).toBe(true);
+    expect(isStepEnabled({ model: "m", enabled: 0 })).toBe(true);
+  });
+
+  it("entrée invalide → false (aucune étape à appeler), jamais dexception", () => {
+    expect(isStepEnabled(null)).toBe(false);
+    expect(isStepEnabled(undefined)).toBe(false);
+    expect(isStepEnabled("étape")).toBe(false);
+  });
+});
+
+describe("enabledSteps — ce qui reste réellement appelable", () => {
+  it("filtre les étapes éteintes sans changer lordre des autres", () => {
+    const steps = [
+      { providerId: "p1", model: "a", enabled: false },
+      { providerId: "p2", model: "b" },
+      { providerId: "p3", model: "c", enabled: false },
+      { providerId: "p4", model: "d", enabled: true },
+    ];
+    expect(enabledSteps(steps).map((s) => s.providerId)).toEqual(["p2", "p4"]);
+  });
+
+  it("liste vide / entrée invalide → tableau vide", () => {
+    expect(enabledSteps([])).toEqual([]);
+    expect(enabledSteps(null)).toEqual([]);
+    expect(enabledSteps(undefined)).toEqual([]);
+  });
+});
+
+describe("withStepEnabled — bascule dUNE étape (pure)", () => {
+  const list = () => [
+    { providerId: "p1", model: "a", reasoning: "off" },
+    { providerId: "p2", model: "b", reasoning: "low" },
+    { providerId: "p3", model: "c", reasoning: "high" },
+  ];
+
+  it("éteint uniquement lindex visé, sans muter lentrée", () => {
+    const steps = list();
+    const next = withStepEnabled(steps, 1, false);
+    expect(next[1].enabled).toBe(false);
+    expect(next[0].enabled).toBeUndefined();
+    expect(next[2].enabled).toBeUndefined();
+    // Lordre et les réglages sont intacts, les autres objets sont les mêmes.
+    expect(next.map((s) => s.model)).toEqual(["a", "b", "c"]);
+    expect(next[0]).toBe(steps[0]);
+    expect(steps[1].enabled).toBeUndefined(); // aucune mutation de lentrée
+  });
+
+  it("rallume une étape éteinte", () => {
+    const steps = withStepEnabled(list(), 0, false);
+    const back = withStepEnabled(steps, 0, true);
+    expect(back[0].enabled).toBe(true);
+    expect(isStepEnabled(back[0])).toBe(true);
+  });
+
+  it("booléen STRICT : une valeur non `true` éteint (jamais de coercition)", () => {
+    expect(withStepEnabled(list(), 0, "true")[0].enabled).toBe(false);
+    expect(withStepEnabled(list(), 0, 1)[0].enabled).toBe(false);
+  });
+
+  it("index invalide → copie inchangée, aucune exception", () => {
+    const steps = list();
+    expect(withStepEnabled(steps, 9, false).map((s) => s.enabled)).toEqual([undefined, undefined, undefined]);
+    expect(withStepEnabled(steps, -1, false)).toHaveLength(3);
+    expect(withStepEnabled(steps, 1.5, false)).toHaveLength(3);
+    expect(withStepEnabled(null, 0, false)).toEqual([]);
+  });
+
+  it("combiné à stepsToServiceShape : un état par étape traverse lAPI", () => {
+    const shape = stepsToServiceShape(withStepEnabled(list(), 2, false));
+    expect(shape.principal.enabled).toBeUndefined();
+    expect(shape.fallbacks[1].enabled).toBe(false);
+  });
+});
+
+describe("réordonnancement — létat on/off suit lÉTAPE, le libellé suit lordre", () => {
+  it("une étape désactivée garde son état quand une AUTRE étape bouge", () => {
+    const steps = withStepEnabled(
+      [
+        { providerId: "p1", model: "a" },
+        { providerId: "p2", model: "b" },
+        { providerId: "p3", model: "c" },
+      ],
+      1,
+      false,
+    );
+    const next = moveStep(steps, 0, 2); // le principal passe en dernière position
+    expect(next.map((s) => s.providerId)).toEqual(["p2", "p3", "p1"]);
+    // Létape éteinte (p2) a bien suivi son déplacement ET conservé son état.
+    expect(next[0].providerId).toBe("p2");
+    expect(next[0].enabled).toBe(false);
+    expect(next.filter((s) => s.enabled === false)).toHaveLength(1);
+  });
+
+  it("le libellé dépend de la POSITION, pas de létat : un principal éteint reste « principal »", () => {
+    const steps = withStepEnabled(
+      [
+        { providerId: "p1", model: "a" },
+        { providerId: "p2", model: "b" },
+      ],
+      0,
+      false,
+    );
+    expect(stepRoleLabel(0)).toBe("principal");
+    expect(isStepEnabled(steps[0])).toBe(false);
+    expect(enabledSteps(steps).map((s) => s.providerId)).toEqual(["p2"]);
   });
 });

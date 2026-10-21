@@ -56,7 +56,11 @@ export type CallResult = "ok" | "error" | "aborted" | "skipped";
  *   - `upstream_error`: tout autre code / erreur amont ;
  *   - `saturated`     : AUCUNE place libre chez le fournisseur. Ce n'est PAS une
  *                       erreur du fournisseur mais une bascule pour CHARGE
- *                       (mode rolling) : jamais comptée comme échec fournisseur.
+ *                       (mode rolling) : jamais comptée comme échec fournisseur ;
+ *   - `step_disabled` : l'étape est DÉSACTIVÉE dans le catalogue (bouton on/off
+ *                       de la ligne). Elle est sautée sans aucun appel réseau —
+ *                       motif distinct de `saturated` (ce n'est pas la charge)
+ *                       et des erreurs fournisseur (il n'y a pas eu d'appel).
  */
 export const CALL_REASONS = [
   "quota",
@@ -66,6 +70,7 @@ export const CALL_REASONS = [
   "network_error",
   "upstream_error",
   "saturated",
+  "step_disabled",
 ] as const;
 export type CallReason = (typeof CALL_REASONS)[number];
 

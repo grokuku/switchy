@@ -63,6 +63,24 @@ export interface ServiceStep {
   providerId: string;
   model: string;
   reasoning: ReasoningLevel;
+  /**
+   * Étape ACTIVÉE (défaut `true`).
+   *
+   * `false` = l'étape est CONSERVÉE dans la liste (ordre, libellé
+   * `principal`/`repli n` inchangés) mais n'est JAMAIS appelée : la chaîne la
+   * saute comme une étape saturée en mode rolling, avec un motif DISTINCT
+   * (`reason: "step_disabled"`). Sert à éteindre temporairement un modèle sans
+   * perdre sa configuration.
+   *
+   * ⚠️ Le bouton `enabled` du SERVICE reste le MAÎTRE : service désactivé =
+   * rien n'est appelé, quelles que soient les étapes. Les deux niveaux se
+   * cumulent logiquement.
+   *
+   * RÉTRO-COMPATIBILITÉ : un `catalog.json` antérieur n'a pas ce champ ; à la
+   * lecture il vaut `true` (`normalizeStep`) — une étape sans le champ est donc
+   * ACTIVÉE, jamais éteinte par surprise.
+   */
+  enabled: boolean;
 }
 
 export interface ProviderRecord {
@@ -150,6 +168,15 @@ function normalizeProvider(value: Record<string, unknown>): ProviderRecord {
   return provider;
 }
 
+/**
+ * Normalise une étape lue du DISQUE : `enabled` absent (catalogue antérieur)
+ * vaut ACTIVÉE. Seul un `false` EXPLICITE désactive une étape — aucune
+ * réécriture du fichier n'est nécessaire (migration douce à la lecture).
+ */
+function normalizeStep(step: ServiceStep): ServiceStep {
+  return { ...step, enabled: step.enabled !== false };
+}
+
 function normalizeService(value: Record<string, unknown>): ServiceRecord {
   // `reservations` (ancien champ de service) est explicitement écarté : sa
   // sémantique a migré vers `ProviderRecord.maxConcurrency`.
@@ -157,6 +184,11 @@ function normalizeService(value: Record<string, unknown>): ServiceRecord {
   const service = { ...rest } as unknown as ServiceRecord;
   service.prioritaire = service.prioritaire === true; // défaut `false` si absent
   service.rolling = service.rolling === true; // défaut `false` si absent (rétro-compatible)
+  // Étapes : `enabled` absent = activée (voir `normalizeStep`).
+  if (service.principal) service.principal = normalizeStep(service.principal);
+  if (Array.isArray(service.fallbacks)) {
+    service.fallbacks = service.fallbacks.filter((step) => !!step).map((step) => normalizeStep(step));
+  }
   return service;
 }
 
@@ -354,8 +386,14 @@ function validateStep(
   }
   const model = requireString(obj.model, `${field}.model`, errors, 200);
   const reasoning = requireEnum(obj.reasoning ?? "off", `${field}.reasoning`, errors, REASONING_LEVELS);
-  if (providerId === null || model === null || reasoning === null) return null;
-  return { providerId, model, reasoning };
+  // `enabled` est OPTIONNEL et vaut `true` par défaut — à la création comme à la
+  // mise à jour : le corps d'un `PUT` envoyé par un client antérieur (sans le
+  // champ) ne peut donc jamais éteindre une étape par accident. Une valeur NON
+  // booléenne est refusée (booléen strict : `"false"` ≠ `false`).
+  const enabledRaw = obj.enabled;
+  const enabled = enabledRaw === undefined ? true : requireBoolean(enabledRaw, `${field}.enabled`, errors);
+  if (providerId === null || model === null || reasoning === null || enabled === null) return null;
+  return { providerId, model, reasoning, enabled };
 }
 
 /**

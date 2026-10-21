@@ -80,6 +80,44 @@ function hasModel(step) {
 }
 
 /**
+ * Une étape est-elle ACTIVÉE ? Règle UNIQUE du niveau étape, partagée par la
+ * carte, la fenêtre « Modifier » et les tests : seul un `enabled: false`
+ * EXPLICITE éteint l'étape. Un champ absent (catalogue antérieur) vaut ACTIVÉE —
+ * une étape n'est jamais éteinte par surprise.
+ *
+ * ⚠️ Ce n'est PAS le `enabled` du SERVICE (bouton maître de la carte) : service
+ * désactivé = rien n'est appelé, quelles que soient les étapes.
+ */
+export function isStepEnabled(step) {
+  if (!step || typeof step !== "object") return false;
+  return step.enabled !== false;
+}
+
+/**
+ * Étapes RÉELLEMENT appelables d'une liste ordonnée (les autres sont conservées
+ * dans la liste, mais sautées à l'exécution). Sert à compter/annoncer ce qui
+ * reste actif — jamais à réordonner : la position d'une étape désactivée ne
+ * bouge pas et son libellé suit l'ORDRE, pas l'état.
+ */
+export function enabledSteps(steps) {
+  return asStepList(steps).filter(isStepEnabled);
+}
+
+/**
+ * Nouvelle liste où l'étape `index` prend l'état `enabled` (booléen strict).
+ * Les AUTRES étapes sont renvoyées telles quelles (même identité d'objet) ; les
+ * index invalides renvoient une simple copie — jamais d'exception, jamais de
+ * mutation de l'entrée (la carte en a besoin pour revenir en arrière si
+ * l'enregistrement échoue).
+ */
+export function withStepEnabled(steps, index, enabled) {
+  const list = asStepList(steps);
+  if (!Number.isInteger(index) || index < 0 || index >= list.length) return list;
+  const next = enabled === true;
+  return list.map((step, i) => (i === index ? { ...step, enabled: next } : step));
+}
+
+/**
  * Liste ordonnée → liste RÉELLEMENT envoyable à l'API : les replis restés sans
  * modèle sont écartés (le serveur les refuserait : `fallbacks[i].model: required`).
  *

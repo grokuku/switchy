@@ -34,11 +34,14 @@
  */
 import {
   dropToIndex,
+  enabledSteps,
+  isStepEnabled,
   moveStep,
   nonEmptySteps,
   serviceToSteps,
   stepRoleLabel,
   stepsToServiceShape,
+  withStepEnabled,
 } from "./service-steps.js";
 (() => {
   "use strict";
@@ -1188,6 +1191,94 @@ import {
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  // Activation d'UNE ÉTAPE (bouton ON/OFF par modèle, depuis la carte)
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Bouton ON/OFF d'une LIGNE d'étape (principal ou repli) : bascule
+   * `step.enabled` et enregistre TOUT DE SUITE — même mécanique que les boutons
+   * du service (affichage optimiste, recalage sur la réponse du serveur, retour
+   * arrière + message honnête si l'enregistrement échoue).
+   *
+   * Une étape désactivée est CONSERVÉE (position, libellé `principal`/`repli n`,
+   * fournisseur, modèle, réflexion) : la chaîne la saute simplement, avec un
+   * motif distinct d'une saturation. Le bouton du SERVICE reste le MAÎTRE :
+   * service éteint = rien n'est appelé, même si des étapes sont actives.
+   */
+  function stepEnabledButton(service, step, index) {
+    const on = isStepEnabled(step);
+    const role = stepRoleLabel(index);
+    const model = step.model || "modèle vide";
+    return h("button", {
+      class: `btn btn--toggle btn--small btn--step-toggle ${on ? "is-on" : "is-off"}`,
+      text: on ? "on" : "off",
+      attrs: {
+        type: "button",
+        "aria-pressed": on ? "true" : "false",
+        title: on
+          ? `Désactiver le ${role} (${model}) — il sera sauté, sans être supprimé`
+          : `Activer le ${role} (${model})`,
+      },
+      on: {
+        click: (event) => {
+          // Clic CLOS : ne démarre ni glisser-déposer ni test d'étape.
+          event.preventDefault();
+          event.stopPropagation();
+          void toggleStepEnabled(service, index);
+        },
+      },
+    });
+  }
+
+  async function toggleStepEnabled(service, index) {
+    const previous = serviceToSteps(service);
+    if (!previous[index]) return;
+    const wasOn = isStepEnabled(previous[index]);
+    const role = stepRoleLabel(index);
+    const next = withStepEnabled(previous, index, !wasOn);
+
+    clearStepTests(service.name); // le verdict portait sur l'état précédent de l'étape
+    applyStepsToService(service, next); // affichage optimiste (ligne atténuée)
+    renderServices();
+
+    try {
+      const data = await saveServiceSteps(service, next);
+      // Le SERVEUR fait foi : on recale l'affichage sur SA réponse.
+      const saved = data && data.service;
+      if (saved) applyStepsToService(service, serviceToSteps(saved));
+      renderServices();
+
+      const steps = serviceToSteps(service);
+      const nowOn = steps[index] ? isStepEnabled(steps[index]) : !wasOn;
+      if (nowOn !== !wasOn) {
+        notify(
+          `« ${service.name} » : le serveur a enregistré le ${role} ${nowOn ? "activé" : "désactivé"}.`,
+          "warning",
+        );
+      } else if (!nowOn && enabledSteps(steps).length === 0) {
+        // Honnête : le service refuse désormais les appels, on le dit AVANT qu'il échoue.
+        notify(
+          `« ${service.name} » : plus aucune étape activée — les appels seront refusés tant qu'une étape n'est pas réactivée.`,
+          "warning",
+        );
+      } else {
+        notify(
+          `« ${service.name} » : ${role} ${nowOn ? "activé — de nouveau dans la chaîne." : "désactivé — sauté, mais conservé dans la liste."}`,
+          nowOn ? "success" : "info",
+        );
+      }
+    } catch (err) {
+      applyStepsToService(service, previous); // retour à l'état réellement enregistré
+      renderServices();
+      const reason = (err && err.message) || "réseau indisponible";
+      notify(
+        `Changement non enregistré (${reason}) — le ${role} de « ${service.name} » reste ${wasOn ? "activé" : "désactivé"}.`,
+        "error",
+      );
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
   // Test d'une ÉTAPE (bouton « Tester » + zone « Tester les modèles »)
   // ════════════════════════════════════════════════════════════════════════
 
@@ -1228,6 +1319,7 @@ import {
     upstream_error: "requête refusée",
     provider_disabled: "fournisseur désactivé",
     provider_missing: "fournisseur inconnu",
+    step_disabled: "étape désactivée",
     timeout: "délai dépassé",
     busy: "file d'attente saturée",
     password_default: "mot de passe par défaut",
@@ -1368,7 +1460,8 @@ import {
     }
     stepSelect.disabled = false;
     serviceToSteps(service).forEach((step, index) => {
-      const label = `${stepRoleLabel(index)} — ${step.model || "(modèle vide)"}`;
+      const off = !isStepEnabled(step) ? " (désactivé)" : "";
+      const label = `${stepRoleLabel(index)} — ${step.model || "(modèle vide)"}${off}`;
       stepSelect.append(h("option", { text: label, attrs: { value: String(index) } }));
     });
     if (current !== "" && Number(current) < stepSelect.options.length) stepSelect.value = current;
@@ -1483,6 +1576,9 @@ import {
     if (s.prioritaire) badges.append(badge("prioritaire", "env"));
     if (s.vision) badges.append(badge("vision", "ok"));
     badges.append(badge(`${s.fallbacks ? s.fallbacks.length : 0} repli(s)`));
+    // Étapes éteintes : annoncées sur la carte (une ligne grisée passe inaperçue).
+    const offSteps = serviceToSteps(s).length - enabledSteps(serviceToSteps(s)).length;
+    if (offSteps > 0) badges.append(badge(`${offSteps} étape(s) désactivée(s)`, "warn"));
     head.append(badges);
 
     const actions = h("div", { class: "item-actions" });
@@ -1528,16 +1624,28 @@ import {
   }
 
   /**
-   * Une étape de la CARTE : poignée de glisser + boutons ↑/↓ + bouton « Tester ».
+   * Une étape de la CARTE : bouton ON/OFF de la ligne + poignée de glisser +
+   * boutons ↑/↓ + bouton « Tester ».
    * La persistance de l'ordre est IMMÉDIATE (aucun bouton « Enregistrer ») :
    * `onMove` remonte des index de liste, traités par `reorderServiceSteps`.
    *
+   * Une étape DÉSACTIVÉE garde sa place (on peut la réordonner, la modifier,
+   * la supprimer) et reste lisible : seule la ligne est atténuée.
+   *
    * « Tester » teste CETTE étape (fournisseur + modèle + réflexion) SANS passer
-   * par la chaîne de replis : le verdict s'affiche juste à côté.
+   * par la chaîne de replis : le verdict s'affiche juste à côté. Une étape
+   * éteinte n'est pas testable (le serveur refuse aussi) : le bouton est
+   * désactivé avec la raison en infobulle.
    */
   function cardStepItem(service, step, index, total, onMove) {
-    const li = h("li", { class: "step step--sortable", attrs: { "data-step-index": String(index) } });
+    const on = isStepEnabled(step);
+    const li = h("li", {
+      class: `step step--sortable${on ? "" : " is-step-disabled"}`,
+      attrs: { "data-step-index": String(index) },
+    });
     const role = stepRoleLabel(index);
+    // Bouton ON/OFF de la ligne : à part de la poignée, donc jamais un glisser.
+    li.append(stepEnabledButton(service, step, index));
     const grip = stepGrip(role);
     li.append(grip);
     // Bloc central : libellé + modèle + fournisseur + réflexion (une seule
@@ -1555,9 +1663,15 @@ import {
     const testBtn = h("button", {
       class: "btn btn--ghost btn--small",
       text: "Tester",
-      attrs: { type: "button", title: `Tester ${role} : ${step.model || "(modèle vide)"}` },
+      attrs: {
+        type: "button",
+        title: on
+          ? `Tester ${role} : ${step.model || "(modèle vide)"}`
+          : `étape désactivée — réactivez-la (bouton « on ») pour la tester`,
+      },
       on: { click: () => void runStepTest(service, index, testBtn, resultEl) },
     });
+    if (!on) testBtn.disabled = true;
     const key = stepTestKey(service.name, index);
     if (stepTestsRunning.has(key)) {
       testBtn.disabled = true;
@@ -1771,11 +1885,11 @@ import {
     service.fallbacks = shape.fallbacks;
   }
 
-  /** PUT partiel (le serveur n'exige que les champs fournis). */
+  /** PUT partiel (le serveur n'exige que les champs fournis) — renvoie `{ service }`. */
   async function saveServiceSteps(service, steps) {
     const shape = stepsToServiceShape(steps);
     if (!shape.principal) throw new Error("un service garde toujours au moins une étape");
-    await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, {
+    return apiRequest(`/api/services/${encodeURIComponent(service.name)}`, {
       method: "PUT",
       body: { principal: shape.principal, fallbacks: shape.fallbacks },
     });
@@ -1811,17 +1925,20 @@ import {
     let steps =
       Array.isArray(initialSteps) && initialSteps.length > 0
         ? initialSteps.slice()
-        : [{ providerId: firstProvider, model: "", reasoning: "off" }];
+        : [{ providerId: firstProvider, model: "", reasoning: "off", enabled: true }];
 
     /** Relit une ligne du DOM : une saisie en cours n'est jamais perdue. */
     function readRow(li) {
       const providerSel = li.querySelector("select.step-provider-select");
       const modelInput = li.querySelector("input.step-model-input");
       const reasoningSel = li.querySelector("select.step-reasoning-select");
+      const enabledBox = li.querySelector("input.step-enabled-input");
       return {
         providerId: providerSel ? providerSel.value : "",
         model: modelInput ? modelInput.value.trim() : "",
         reasoning: reasoningSel ? reasoningSel.value : "off",
+        // Absent = ACTIVÉE (rétro-compatible) ; la case est la seule vérité ici.
+        enabled: enabledBox ? enabledBox.checked : true,
       };
     }
 
@@ -1849,11 +1966,26 @@ import {
     }
 
     function makeRow(step, index) {
-      const li = h("li", { class: "step-editor-row", attrs: { "data-step-index": String(index) } });
+      const on = isStepEnabled(step);
+      const li = h("li", {
+        class: `step-editor-row${on ? "" : " is-step-disabled"}`,
+        attrs: { "data-step-index": String(index) },
+      });
       const role = stepRoleLabel(index);
 
       li.append(stepGrip(role));
       li.append(h("span", { class: "step-role", text: role }));
+
+      // Case ON/OFF de l'étape — même champ `enabled` que le bouton de la carte.
+      const enabledBox = h("input", {
+        class: "step-enabled-input",
+        attrs: { type: "checkbox", "aria-label": `Étape ${role} activée`, title: `Étape ${role} activée` },
+      });
+      enabledBox.checked = on;
+      enabledBox.addEventListener("change", () => {
+        li.classList.toggle("is-step-disabled", !enabledBox.checked);
+      });
+      li.append(enabledBox);
 
       const providerSel = buildSelect(
         state.providers.map((p) => ({ value: p.id, label: p.label || p.id })),
@@ -1952,6 +2084,7 @@ import {
               providerId: (last && last.providerId) || firstProvider,
               model: "",
               reasoning: "off",
+              enabled: true,
             },
           ]);
           draw();

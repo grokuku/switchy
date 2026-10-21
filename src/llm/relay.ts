@@ -549,14 +549,28 @@ interface ChainRun {
 }
 
 /**
+ * Une étape est-elle ACTIVÉE ?
+ *
+ * Règle UNIQUE du niveau étape : seul un `false` EXPLICITE désactive. Un champ
+ * absent (catalogue antérieur, étape construite à la main dans un test) vaut
+ * ACTIVÉE — une étape n'est jamais éteinte par surprise.
+ */
+export function isStepEnabled(step: ServiceStep | null | undefined): boolean {
+  return !step || step.enabled !== false;
+}
+
+/**
  * Étape sur laquelle ATTENDRE quand toutes les étapes d'un service en rolling
  * sont saturées : le fournisseur MÉMORISÉ pour la clé (cache déjà chaud, index
  * d'affinité) s'il est une étape UTILISABLE de CE service, sinon le principal
  * (`0`), sinon la première étape utilisable. `null` = aucune étape utilisable.
  * ⚠️ On ne sort JAMAIS du service : l'attente porte forcément sur une de ses étapes.
+ * ⚠️ Une étape DÉSACTIVÉE n'est jamais retenue : elle ne consomme pas de place
+ * et ne doit pas servir de cible d'attente.
  */
 function pickWaitStep(steps: ServiceStep[], affinityIndex: number): number | null {
   const usable = (index: number): boolean => {
+    if (!isStepEnabled(steps[index])) return false;
     const provider = getProvider(steps[index].providerId);
     return provider !== null && provider.enabled;
   };
@@ -579,8 +593,22 @@ function pickWaitStep(steps: ServiceStep[], affinityIndex: number): number | nul
  *      le principal, puis, en cas d'échec, sur les étapes restantes.
  * Hors rolling, une seule passe EN ATTENTE — comportement historique inchangé.
  *
+ * ÉTAPES DÉSACTIVÉES (`step.enabled === false`, bouton on/off d'une ligne) :
+ * elles sont SAUTÉES sans aucun appel réseau, avec le motif PROPRE
+ * `reason: "step_disabled"` (journalisé une seule fois, jamais silencieux).
+ * Elles gardent leur position dans le catalogue (le libellé `principal` /
+ * `repli n` suit l'ORDRE, pas l'état). Conséquences :
+ *   - si le PRINCIPAL est désactivé, la chaîne démarre simplement sur la
+ *     première étape activée (repli 1…) — jamais d'erreur de validation ;
+ *   - si AUCUNE étape n'est activée, refus franc `503 / NO_ENABLED_STEP`
+ *     AVANT tout appel fournisseur (pas de 500 opaque) ;
+ *   - en rolling, une étape désactivée ne consomme aucune place et n'est
+ *     jamais choisie comme cible d'attente ;
+ *   - l'AFFINITÉ ignore une étape désactivée : si le fournisseur mémorisé pour
+ *     la clé est éteint, on retombe sur le principal actif.
+ *
  * AFFINITÉ (rolling uniquement) : le dernier fournisseur qui a répondu pour
- * cette clé passe en tête s'il est une étape de CE service. La place est
+ * cette clé passe en tête s'il est une étape ACTIVE de CE service. La place est
  * toujours vérifiée : l'affinité ne fait JAMAIS dépasser la concurrence.
  *
  * ⚠️ SOURCE DE VÉRITÉ UNIQUE : le relais de production (`relayServiceChat`) et
@@ -596,12 +624,52 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
   const callId = newCallId();
   const rolling = service.rolling === true;
 
+  // Ordre de tentative = étapes ACTIVÉES, dans l'ordre du catalogue. Les étapes
+  // désactivées sont journalisées ICI, une seule fois (le second passage du
+  // rolling ne les revoit donc pas) : aucun appel réseau, motif `step_disabled`.
+  const catalogueOrder: number[] = [];
+  for (let index = 0; index < steps.length; index++) {
+    if (isStepEnabled(steps[index])) {
+      catalogueOrder.push(index);
+      continue;
+    }
+    const step = steps[index];
+    logCall({
+      callId,
+      keyName: input.keyName,
+      service: service.name,
+      attempt: index,
+      provider: step.providerId,
+      model: step.model,
+      result: "skipped",
+      reason: "step_disabled",
+      durationMs: 0,
+      prioritaire,
+      endpoint: input.endpoint,
+    });
+  }
+  if (catalogueOrder.length === 0) {
+    // AUCUNE étape activée : erreur CLAIRE et HONNÊTE, avant tout appel
+    // fournisseur (ni 500 opaque, ni quota consommé).
+    return {
+      output: null,
+      failure: new UpstreamFailure(
+        503,
+        {},
+        jsonErrorBody(`service "${service.name}": toutes les étapes sont désactivées`, "NO_ENABLED_STEP"),
+      ),
+      answeredIndex: -1,
+    };
+  }
+
   // Ordre des étapes : celui du catalogue par défaut ; en rolling, le
   // fournisseur mémorisé pour la clé (affinité) passe devant s'il est une étape
-  // de CE service. L'affinité expire au bout de 5 min (voir `key-affinity.ts`).
-  const catalogueOrder = steps.map((_, index) => index);
+  // ACTIVE de CE service. L'affinité expire au bout de 5 min (`key-affinity.ts`)
+  // et ne ressuscite JAMAIS une étape désactivée.
   const affinityId = rolling ? preferredProvider(input.keyName) : null;
-  const affinityIndex = affinityId === null ? -1 : steps.findIndex((s) => s.providerId === affinityId);
+  const affinityCandidate =
+    affinityId === null ? undefined : catalogueOrder.find((index) => steps[index].providerId === affinityId);
+  const affinityIndex = affinityCandidate === undefined ? -1 : affinityCandidate;
   const affinityApplied = affinityIndex > 0; // le principal n'a rien à gagner à passer devant lui-même
   let order = affinityApplied
     ? [affinityIndex, ...catalogueOrder.filter((index) => index !== affinityIndex)]
@@ -868,6 +936,15 @@ function upstreamErrorMessage(status: number, reason: string): string {
  *   - `stepIndex` absent → CHAÎNE COMPLÈTE (comportement de production, replis
  *     compris) — `fellBack` dit alors si un repli a répondu.
  *
+ * ÉTAPE DÉSACTIVÉE (`step.enabled === false`) : DÉCISION — on REFUSE de la
+ * tester (résultat structuré `ok: false`, `error.code = "step_disabled"`,
+ * `status: 0`). Aucun appel fournisseur, aucun quota consommé, et le message
+ * dit comment procéder (« réactivez-la pour la tester »). Un « test forcé » a
+ * été écarté : il afficherait un ✅ sur une étape qui ne sert aucun appel réel.
+ * En revanche, le test de la CHAÎNE COMPLÈTE (index absent) SAUTE les étapes
+ * éteintes — c'est exactement ce que fait la production, donc ce qu'on veut
+ * vérifier.
+ *
  * L'appel est journalisé normalement (il compte dans les statistiques).
  * Un service DÉSACTIVÉ reste testable : c'est un diagnostic de configuration,
  * pas une mise en service.
@@ -976,6 +1053,17 @@ async function runTest(
   // ── Étape CIBLÉE : un seul fournisseur, AUCUN repli ──
   const step = steps[index];
   const result = base(step, index);
+  if (!isStepEnabled(step)) {
+    // Refus EXPLICITE : on ne teste pas une étape éteinte (voir la doc de
+    // `testServiceStep`). Aucun appel réseau, donc aucun quota consommé.
+    result.latencyMs = elapsed();
+    result.error = {
+      code: "step_disabled",
+      reason: "step_disabled",
+      message: `étape ${index === 0 ? "principale" : `de repli ${index}`} désactivée : aucun appel n'a été tenté — réactivez-la pour la tester`,
+    };
+    return result;
+  }
   const provider = getProvider(step.providerId);
   if (!provider || !provider.enabled) {
     result.latencyMs = elapsed();

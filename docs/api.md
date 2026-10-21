@@ -69,13 +69,24 @@ Sémantique du champ `apiKey` :
 | `PUT` | `/api/services/:name` | Mise à jour |
 | `DELETE` | `/api/services/:name` | Suppression |
 
-**Service** : `name`, `description`, `principal` `{providerId, model, reasoning}`,
+**Service** : `name`, `description`, `principal` `{providerId, model, reasoning, enabled}`,
 `fallbacks[]` (mêmes champs, ordonnés), `contextWindow`, `maxOutputTokens`,
 `vision`, **`prioritaire`** (booléen : ses appels passent avant les autres quand
-une place se libère chez le fournisseur), `enabled`.
+une place se libère chez le fournisseur), **`rolling`** (ne pas patienter : une
+étape pleine est sautée) et `enabled`.
+
+**`enabled` d'une ÉTAPE** (principal comme repli) : défaut `true`, booléen
+**strict** (`"false"` → `400`). Une étape à `false` est **conservée** (position,
+libellé `principal`/`repli n`, réglages) mais **sautée** à l'exécution, avec le
+motif de journal `step_disabled` — distinct de `saturated` (charge) et des
+erreurs fournisseur. Le `enabled` du SERVICE reste **maître** : service éteint =
+rien n'est appelé. Le principal peut être éteint sans casser le service (la
+chaîne démarre sur le premier repli actif) ; **toutes** les étapes éteintes →
+`503` `NO_ENABLED_STEP`, sans aucun appel fournisseur.
 
 > Migration douce : un ancien `catalog.json` contenant `reservations` reste
-> lisible — le champ est **ignoré**, `prioritaire` vaut `false` par défaut.
+> lisible — le champ est **ignoré**, `prioritaire` vaut `false` par défaut ; une
+> étape **sans** `enabled` vaut `true` (activée).
 
 **Validation** (réponses `400` `VALIDATION_ERROR` avec `errors[]`) : nom unique
 (`409` `CONFLICT` si dupliqué), `providerId` existant, bornes numériques
