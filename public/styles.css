@@ -1375,3 +1375,149 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 .disclosure[open] > summary {
   margin-bottom: 12px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Activation d'un service (bouton ON/OFF de la carte)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.btn--toggle {
+  padding: 4px 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+/* État ACTIVÉ : couleur de succès, jamais un simple gris ambigu. */
+.btn--toggle.is-on {
+  color: var(--switchy-ok);
+  border-color: color-mix(in srgb, var(--switchy-ok) 45%, var(--switchy-border));
+  background: color-mix(in srgb, var(--switchy-ok) 14%, transparent);
+}
+
+/* État DÉSACTIVÉ : bordure en pointillés — lisible sans couleur. */
+.btn--toggle.is-off {
+  color: var(--switchy-text-muted);
+  border-style: dashed;
+}
+
+/* Un service désactivé reste VISIBLE mais ATTÉNUÉ : il ne sert plus d'appels. */
+.item-card.is-disabled {
+  opacity: 0.62;
+}
+.item-card.is-disabled:hover,
+.item-card.is-disabled:focus-within {
+  opacity: 0.9;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   Test d'une étape (bouton « Tester » de la carte)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.btn--small {
+  padding: 3px 9px;
+  font-size: 12.5px;
+}
+
+/* Le verdict du test occupe SA PROPRE ligne, sous l'étape : la carte ne se
+   comprime jamais pour lui faire de place. */
+.step-test-result {
+  grid-column: 1 / -1;
+  font-size: 12.5px;
+  color: var(--switchy-text-muted);
+  overflow-wrap: anywhere;
+}
+/* Rien à dire ? Aucune ligne vide ne s'affiche. */
+.step-test-result:empty {
+  display: none;
+}
+.step-test-result.is-ok {
+  color: var(--switchy-ok);
+  font-weight: 600;
+}
+.step-test-result.is-error {
+  color: var(--switchy-danger);
+}
+.step-test-result.is-pending {
+  color: var(--switchy-warn);
+}
+
+/* Les flèches masquées (une seule étape) ne laissent pas de trou. */
+.step-tools .btn[hidden] {
+  display: none;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   Zone « Tester les modèles » (sous les cartes)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.testzone {
+  margin-top: calc(var(--switchy-gap) * 1.5);
+  padding: 16px;
+  border: 1px solid var(--switchy-border);
+  border-radius: var(--switchy-radius);
+  background: var(--switchy-bg-raised);
+  /* Pleine largeur : la zone occupe toute la page, comme les autres panneaux. */
+  width: 100%;
+}
+
+.testzone-head h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.testzone-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.testzone-form .field {
+  min-width: 150px;
+}
+
+.testzone-form .field--grow {
+  flex: 1 1 260px;
+}
+
+.testzone-result {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--switchy-border);
+  border-radius: calc(var(--switchy-radius) - 4px);
+  background: var(--switchy-bg);
+}
+
+.testzone-result.is-ok {
+  border-color: color-mix(in srgb, var(--switchy-ok) 45%, var(--switchy-border));
+}
+
+.testzone-result.is-error {
+  border-color: color-mix(in srgb, var(--switchy-danger) 45%, var(--switchy-border));
+}
+
+.testzone-verdict {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+.testzone-verdict.is-ok {
+  color: var(--switchy-ok);
+}
+.testzone-verdict.is-error {
+  color: var(--switchy-danger);
+}
+
+/* Réponse du modèle telle quelle (espaces et retours à la ligne préservés). */
+.testzone-text {
+  margin: 8px 0 0;
+  padding: 10px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--switchy-border);
+  border-radius: 6px;
+  background: var(--switchy-bg-raised);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

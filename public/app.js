@@ -416,7 +416,9 @@ import {
       method,
       headers: {},
       credentials: "same-origin",
-      timeout: 20000,
+      // Délai de la requête HTTP : 20 s par défaut ; un test d'étape (appel
+      // fournisseur) demande plus large et le passe explicitement.
+      timeout: Number.isFinite(options.timeout) && options.timeout > 0 ? Math.round(options.timeout) : 20000,
     };
     if (state.csrfToken && method !== "GET" && method !== "HEAD") {
       init.headers["X-CSRF-Token"] = state.csrfToken;
@@ -1035,6 +1037,9 @@ import {
     const status = $("services-status");
     if (!list || !empty) return;
 
+    // La zone de test suit la même source de vérité que les cartes.
+    renderTestServiceSelect();
+
     const visible = servicesView();
     list.replaceChildren();
     if (state.services.length === 0) {
@@ -1055,13 +1060,356 @@ import {
     for (const s of visible) list.append(renderServiceCard(s));
   }
 
+  // ════════════════════════════════════════════════════════════════════════
+  // Activation d'un service (bascule ON/OFF depuis la carte)
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Bouton ON/OFF d'une carte : bascule `enabled` et enregistre TOUT DE SUITE
+   * (`PUT /api/services/:name`) — aucun passage par « Modifier ».
+   *
+   * L'écran bascule immédiatement, puis le serveur confirme. Si l'enregistrement
+   * ÉCHOUE, l'état PRÉCÉDENT est remis à l'écran et l'erreur est annoncée : jamais
+   * un affichage qui ne correspond pas à ce qui est enregistré.
+   */
+  function serviceToggleButton(service) {
+    const on = service.enabled === true;
+    return h("button", {
+      class: `btn btn--toggle ${on ? "is-on" : "is-off"}`,
+      text: on ? "activé" : "désactivé",
+      attrs: {
+        type: "button",
+        "aria-pressed": on ? "true" : "false",
+        title: on ? `Désactiver « ${service.name} »` : `Activer « ${service.name} »`,
+      },
+      on: { click: () => void toggleServiceEnabled(service) },
+    });
+  }
+
+  async function toggleServiceEnabled(service) {
+    const previous = service.enabled === true;
+    const next = !previous;
+    service.enabled = next; // affichage optimiste (badge ET bouton)
+    renderServices();
+
+    try {
+      const data = await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, {
+        method: "PUT",
+        body: { enabled: next },
+      });
+      // Le SERVEUR fait foi : on recale l'affichage sur SA réponse.
+      const saved = data && data.service;
+      if (saved && typeof saved.enabled === "boolean") service.enabled = saved.enabled;
+      renderServices();
+      if (service.enabled === next) {
+        notify(
+          next
+            ? `« ${service.name} » activé — de nouveau proposé dans /v1/models.`
+            : `« ${service.name} » désactivé — retiré de /v1/models (les cartes restent visibles).`,
+          next ? "success" : "info",
+        );
+      } else {
+        notify(`« ${service.name} » : le serveur a enregistré « ${service.enabled ? "activé" : "désactivé"} ».`, "warning");
+      }
+    } catch (err) {
+      service.enabled = previous; // retour à l'état réellement enregistré
+      renderServices();
+      const reason = (err && err.message) || "réseau indisponible";
+      notify(`Changement non enregistré (${reason}) — « ${service.name} » reste ${previous ? "activé" : "désactivé"}.`, "error");
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Test d'une ÉTAPE (bouton « Tester » + zone « Tester les modèles »)
+  // ════════════════════════════════════════════════════════════════════════
+
+  /** Prompt par défaut : court, sans ambiguïté, facile à vérifier à l'œil. */
+  const DEFAULT_TEST_PROMPT = "Réponds uniquement : ok";
+
+  /** `max_tokens` de l'interface (le serveur plafonne de toute façon à 256). */
+  const DEFAULT_TEST_MAX_TOKENS = 64;
+
+  /** Résultats des tests d'étape, clé `service:index` — survivent à un re-rendu. */
+  const stepTestResults = new Map();
+
+  /** Tests en cours (clé `service:index`) : pas de double clic. */
+  const stepTestsRunning = new Set();
+
+  function stepTestKey(name, index) {
+    return `${name}:${index}`;
+  }
+
+  /**
+   * Oublie les verdicts d'un service : après un déplacement d'étape, une
+   * modification ou une suppression, un ancien ✅ ne désigne plus la même ligne.
+   */
+  function clearStepTests(serviceName) {
+    const prefix = `${serviceName}:`;
+    for (const key of [...stepTestResults.keys()]) {
+      if (key.startsWith(prefix)) stepTestResults.delete(key);
+    }
+  }
+
+  /** Libellés COURTS des motifs d'échec (codes du serveur → français lisible). */
+  const TEST_REASON_LABELS = {
+    auth_error: "clé du fournisseur refusée",
+    quota: "quota épuisé",
+    rate_limit: "débit dépassé",
+    overloaded: "fournisseur indisponible",
+    network_error: "réseau injoignable",
+    upstream_error: "requête refusée",
+    provider_disabled: "fournisseur désactivé",
+    provider_missing: "fournisseur inconnu",
+    timeout: "délai dépassé",
+    busy: "file d'attente saturée",
+    password_default: "mot de passe par défaut",
+    unauthorized: "session expirée",
+    request_failed: "requête refusée",
+    internal_error: "échec du relais",
+  };
+
+  /** Tokens lisibles ; « — » quand le fournisseur ne les expose pas. */
+  function formatTestTokens(tokens) {
+    const t = tokens || {};
+    const show = (v) => (typeof v === "number" && Number.isFinite(v) ? formatNumber(v) : "—");
+    return `entrée ${show(t.prompt)} · sortie ${show(t.completion)} · réflexion ${show(t.reasoning)}`;
+  }
+
+  /** Motif d'échec HUMAIN : code HTTP + motif catégorisé, jamais un JSON brut. */
+  function describeTestError(result) {
+    const err = (result && result.error) || {};
+    const label = TEST_REASON_LABELS[err.reason] || "échec du fournisseur";
+    const status = Number(result && result.status) || 0;
+    return status > 0 ? `HTTP ${status} — ${label}` : label;
+  }
+
+  /**
+   * Motif d'une requête de test REFUSÉE par Switchy (avant tout appel
+   * fournisseur) : session expirée, mot de passe par défaut, validation. Le
+   * message est celui du serveur — jamais un « échec » générique.
+   */
+  function testRequestError(err) {
+    const code = err && err.data && err.data.code;
+    if (code === "PASSWORD_NOT_CHANGED") {
+      showDefaultPasswordBanner(true);
+      return {
+        code,
+        reason: "password_default",
+        message: "Changez le mot de passe administrateur par défaut (onglet Réglages) avant de tester un modèle.",
+      };
+    }
+    if ((err && err.status) === 401) {
+      return { code: "unauthorized", reason: "unauthorized", message: "Session expirée — reconnectez-vous." };
+    }
+    return {
+      code: "request_failed",
+      reason: "request_failed",
+      message: (err && err.message) || "réseau indisponible",
+    };
+  }
+
+  /** Peint (ou efface) le verdict d'un test d'étape sur la carte. */
+  function paintStepTestResult(serviceName, index, resultEl) {
+    if (!resultEl) return;
+    const result = stepTestResults.get(stepTestKey(serviceName, index));
+    if (!result) {
+      resultEl.className = "step-test-result";
+      resultEl.textContent = "";
+      resultEl.removeAttribute("title");
+      return;
+    }
+    if (result.ok) {
+      resultEl.className = "step-test-result is-ok";
+      resultEl.textContent = `✅ OK · ${formatDuration(result.latencyMs)}`;
+      resultEl.title = `réponse : ${(result.text || "(vide)").slice(0, 200)}`;
+    } else {
+      resultEl.className = "step-test-result is-error";
+      resultEl.textContent = `❌ ${describeTestError(result)}`;
+      resultEl.title = (result.error && result.error.message) || "";
+    }
+  }
+
+  /**
+   * Teste UNE étape (fournisseur + modèle + réflexion) SANS passer par la chaîne
+   * de replis, et affiche le verdict à côté de l'étape.
+   *
+   * Requête MINIMALE (prompt court, 64 tokens, 30 s côté serveur) : c'est du quota
+   * utilisateur. Le bouton passe en état « en cours » et refuse le double clic.
+   */
+  async function runStepTest(service, index, button, resultEl) {
+    const key = stepTestKey(service.name, index);
+    if (stepTestsRunning.has(key)) return;
+    stepTestsRunning.add(key);
+    button.disabled = true;
+    button.textContent = "Test…";
+    if (resultEl) {
+      resultEl.className = "step-test-result is-pending";
+      resultEl.textContent = "en cours…";
+    }
+
+    let result;
+    try {
+      result = await apiRequest(`/api/services/${encodeURIComponent(service.name)}/test`, {
+        method: "POST",
+        body: { stepIndex: index, prompt: DEFAULT_TEST_PROMPT, maxTokens: DEFAULT_TEST_MAX_TOKENS },
+        timeout: 40000,
+      });
+    } catch (err) {
+      // Échec de la REQUÊTE (session, mot de passe par défaut, réseau) : honnête
+      // et distinct d'un échec du fournisseur.
+      result = {
+        ok: false,
+        status: (err && err.status) || 0,
+        latencyMs: 0,
+        error: testRequestError(err),
+      };
+    } finally {
+      stepTestsRunning.delete(key);
+      button.disabled = false;
+      button.textContent = "Tester";
+    }
+
+    stepTestResults.set(key, result);
+    paintStepTestResult(service.name, index, resultEl);
+  }
+
+  /** Remplit le sélecteur de SERVICE de la zone de test (sans perdre le choix courant). */
+  function renderTestServiceSelect() {
+    const select = $("test-service");
+    if (!select) return;
+    const current = select.value;
+    select.replaceChildren();
+    for (const s of state.services) {
+      select.append(h("option", { text: s.enabled ? s.name : `${s.name} (désactivé)`, attrs: { value: s.name } }));
+    }
+    if (current && state.services.some((s) => s.name === current)) select.value = current;
+    renderTestStepSelect();
+  }
+
+  /** Remplit le sélecteur d'ÉTAPE du service choisi (principal, repli 1…). */
+  function renderTestStepSelect() {
+    const serviceSelect = $("test-service");
+    const stepSelect = $("test-step");
+    if (!serviceSelect || !stepSelect) return;
+    const current = stepSelect.value;
+    const service = state.services.find((s) => s.name === serviceSelect.value);
+    stepSelect.replaceChildren();
+    if (!service) {
+      stepSelect.disabled = true;
+      return;
+    }
+    stepSelect.disabled = false;
+    serviceToSteps(service).forEach((step, index) => {
+      const label = `${stepRoleLabel(index)} — ${step.model || "(modèle vide)"}`;
+      stepSelect.append(h("option", { text: label, attrs: { value: String(index) } }));
+    });
+    if (current !== "" && Number(current) < stepSelect.options.length) stepSelect.value = current;
+  }
+
+  /**
+   * Zone « Tester les modèles » : envoie un appel COURT à l'étape choisie et
+   * affiche texte, durée, tokens, fournisseur/modèle réellement utilisés et le
+   * recours éventuel à un repli. Aucune clé, aucun JSON brut, aucune URL.
+   */
+  async function runZoneTest() {
+    const button = $("test-run");
+    const out = $("test-result");
+    const serviceSelect = $("test-service");
+    const stepSelect = $("test-step");
+    const promptInput = $("test-prompt");
+    const maxTokensInput = $("test-max-tokens");
+    if (!button || !out || !serviceSelect || !stepSelect) return;
+
+    const serviceName = serviceSelect.value;
+    const service = state.services.find((s) => s.name === serviceName);
+    if (!service) {
+      notify("Choisissez un service à tester.", "warning");
+      return;
+    }
+    const stepIndex = Number(stepSelect.value);
+    if (!Number.isInteger(stepIndex) || stepIndex < 0) {
+      notify("Choisissez une étape à tester.", "warning");
+      return;
+    }
+    const prompt = String((promptInput && promptInput.value) || "").trim() || DEFAULT_TEST_PROMPT;
+    const rawMax = Number((maxTokensInput && maxTokensInput.value) || DEFAULT_TEST_MAX_TOKENS);
+    const maxTokens = Number.isFinite(rawMax) && rawMax >= 1 ? Math.min(256, Math.round(rawMax)) : DEFAULT_TEST_MAX_TOKENS;
+
+    button.disabled = true;
+    button.textContent = "Test…";
+    out.hidden = false;
+    out.className = "testzone-result is-pending";
+    out.replaceChildren(h("p", { class: "muted", text: "Appel en cours…" }));
+
+    let result = null;
+    let failure = null;
+    try {
+      result = await apiRequest(`/api/services/${encodeURIComponent(serviceName)}/test`, {
+        method: "POST",
+        body: { stepIndex, prompt, maxTokens },
+        timeout: 40000,
+      });
+    } catch (err) {
+      failure = err;
+    } finally {
+      button.disabled = false;
+      button.textContent = "Tester";
+    }
+
+    if (failure) {
+      const info = testRequestError(failure);
+      out.className = "testzone-result is-error";
+      out.replaceChildren(
+        h("p", { class: "testzone-verdict is-error", text: `❌ requête refusée par Switchy` }),
+        h("p", { class: "muted", text: info.message }),
+      );
+      return;
+    }
+
+    renderTestOutcome(result || {}, out);
+    // Le verdict de la CARTE suit celui de la zone : une seule vérité.
+    stepTestResults.set(stepTestKey(serviceName, stepIndex), result);
+    renderServices();
+  }
+
+  /** Affiche le résultat complet d'un test de zone (lecture immédiate, sans jargon). */
+  function renderTestOutcome(data, out) {
+    const ok = data && data.ok === true;
+    out.className = `testzone-result ${ok ? "is-ok" : "is-error"}`;
+    const verdict = ok ? "✅ Réponse reçue" : `❌ ${describeTestError(data)}`;
+    const nodes = [h("p", { class: "testzone-verdict " + (ok ? "is-ok" : "is-error"), text: verdict })];
+    if (!ok && data && data.error && data.error.message) {
+      nodes.push(h("p", { class: "muted", text: data.error.message }));
+    }
+
+    const dl = h("dl", { class: "kv" });
+    const row = (term, value) => dl.append(h("div", null, h("dt", { text: term }), h("dd", { text: value })));
+    const stepIndex = data && Number.isInteger(data.stepIndex) ? data.stepIndex : 0;
+    row("étape", `${stepRoleLabel(stepIndex)}${data && data.fellBack ? " (repli sollicité)" : " (aucun repli)"}`);
+    row("fournisseur", data && data.providerId ? providerLabel(data.providerId) : "—");
+    row("modèle", (data && data.model) || "—");
+    row("réflexion", (data && data.reasoning) || "off");
+    row("durée", formatDuration(data && data.latencyMs));
+    row("tokens", formatTestTokens(data && data.tokens));
+    nodes.push(dl);
+
+    if (ok) {
+      const text = String((data && data.text) || "").trim();
+      nodes.push(h("pre", { class: "testzone-text", text: text === "" ? "(réponse vide)" : text }));
+    }
+    out.replaceChildren(...nodes);
+  }
+
   function renderServiceCard(s) {
-    const card = h("article", { class: "card item-card" });
+    // Un service désactivé reste VISIBLE (on doit pouvoir le réactiver) mais
+    // atténué : l'écran ne laisse jamais croire qu'il sert des appels.
+    const card = h("article", { class: "card item-card" + (s.enabled ? "" : " is-disabled") });
 
     const head = h("header", { class: "item-head" });
     // Titre tronqué à une ligne (CSS) : l'infobulle garde le nom complet.
     head.append(h("h3", { class: "item-title", text: s.name, attrs: { title: s.name } }));
     const badges = h("div", { class: "badges" });
+    // Badge ET bouton ON/OFF lisent le MÊME champ `enabled` : jamais deux vérités.
     badges.append(s.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
     if (s.prioritaire) badges.append(badge("prioritaire", "env"));
     if (s.vision) badges.append(badge("vision", "ok"));
@@ -1069,6 +1417,7 @@ import {
     head.append(badges);
 
     const actions = h("div", { class: "item-actions" });
+    actions.append(serviceToggleButton(s));
     actions.append(iconButton("pencil", "Modifier", { on: { click: () => openServiceForm(s) } }));
     actions.append(
       iconButton("trash", "Supprimer", {
@@ -1086,7 +1435,7 @@ import {
     const drawSteps = () => {
       stepsEl.replaceChildren();
       currentSteps.forEach((step, index) => {
-        stepsEl.append(cardStepItem(step, index, currentSteps.length, (from, to) => void reorderServiceSteps(s, from, to)));
+        stepsEl.append(cardStepItem(s, step, index, currentSteps.length, (from, to) => void reorderServiceSteps(s, from, to)));
       });
     };
     drawSteps();
@@ -1104,11 +1453,14 @@ import {
   }
 
   /**
-   * Une étape de la CARTE : poignée de glisser + boutons ↑/↓.
-   * La persistance est IMMÉDIATE (aucun bouton « Enregistrer ») : `onMove`
-   * remonte des index de liste, traités par `reorderServiceSteps`.
+   * Une étape de la CARTE : poignée de glisser + boutons ↑/↓ + bouton « Tester ».
+   * La persistance de l'ordre est IMMÉDIATE (aucun bouton « Enregistrer ») :
+   * `onMove` remonte des index de liste, traités par `reorderServiceSteps`.
+   *
+   * « Tester » teste CETTE étape (fournisseur + modèle + réflexion) SANS passer
+   * par la chaîne de replis : le verdict s'affiche juste à côté.
    */
-  function cardStepItem(step, index, total, onMove) {
+  function cardStepItem(service, step, index, total, onMove) {
     const li = h("li", { class: "step step--sortable", attrs: { "data-step-index": String(index) } });
     const role = stepRoleLabel(index);
     const grip = stepGrip(role);
@@ -1121,12 +1473,35 @@ import {
     main.append(h("span", { class: "step-provider muted", text: providerLabel(step.providerId) }));
     main.append(h("span", { class: "step-reason muted", text: `réflexion: ${step.reasoning || "off"}` }));
     li.append(main);
+
+    // Test de l'étape : le bouton rejoint les outils (à droite), le verdict
+    // s'affiche sur SA PROPRE ligne — la carte ne se comprime jamais.
+    const resultEl = h("span", { class: "step-test-result", attrs: { role: "status", "aria-live": "polite" } });
+    const testBtn = h("button", {
+      class: "btn btn--ghost btn--small",
+      text: "Tester",
+      attrs: { type: "button", title: `Tester ${role} : ${step.model || "(modèle vide)"}` },
+      on: { click: () => void runStepTest(service, index, testBtn, resultEl) },
+    });
+    const key = stepTestKey(service.name, index);
+    if (stepTestsRunning.has(key)) {
+      testBtn.disabled = true;
+      testBtn.textContent = "Test…";
+      resultEl.className = "step-test-result is-pending";
+      resultEl.textContent = "en cours…";
+    } else {
+      paintStepTestResult(service.name, index, resultEl);
+    }
+
     const tools = stepMoveTools(index, total, role, onMove);
+    tools.wrap.append(testBtn);
     li.append(tools.wrap);
-    // Une seule étape : ni poignée ni flèches (rien à déplacer).
+    li.append(resultEl);
+    // Une seule étape : ni poignée ni flèches (rien à déplacer) — le test reste.
     if (total < 2) {
       grip.hidden = true;
-      tools.wrap.hidden = true;
+      tools.up.hidden = true;
+      tools.down.hidden = true;
     }
     return li;
   }
@@ -1277,6 +1652,7 @@ import {
     if (next.length === 0) return; // jamais de liste vide
     if (sameSteps(previous, next)) return;
 
+    clearStepTests(service.name); // les verdicts portaient sur l'ordre précédent
     applyStepsToService(service, next); // affichage optimiste
     renderServices();
 
@@ -1660,6 +2036,8 @@ import {
         };
         if (editing) {
           await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, { method: "PUT", body });
+          // Les modèles ont peut-être changé : les anciens verdicts ne valent plus.
+          clearStepTests(service.name);
           notify(`Service « ${service.name} » mis à jour.`);
         } else {
           body.name = nameInput.value.trim();
@@ -1682,6 +2060,7 @@ import {
     if (!ok) return;
     try {
       await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, { method: "DELETE" });
+      clearStepTests(service.name);
       notify(`Service « ${service.name} » supprimé.`);
       await loadServices();
     } catch (err) {
@@ -2506,6 +2885,21 @@ import {
       keyForm.addEventListener("submit", (event) => {
         event.preventDefault();
         createKey();
+      });
+    }
+
+    // Zone « Tester les modèles » : service → étapes, puis test de l'étape.
+    const testService = $("test-service");
+    if (testService) testService.addEventListener("change", renderTestStepSelect);
+    const testRun = $("test-run");
+    if (testRun) testRun.addEventListener("click", () => void runZoneTest());
+    const testPrompt = $("test-prompt");
+    if (testPrompt) {
+      testPrompt.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void runZoneTest();
+        }
       });
     }
   }

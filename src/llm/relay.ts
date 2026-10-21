@@ -504,23 +504,27 @@ function jsonErrorBody(message: string, code: string): Buffer {
   return Buffer.from(JSON.stringify({ error: message, code }));
 }
 
-/**
- * Relaie un appel « chat completions » pour un service nommé :
- * principal → replis, avec comptage PAR FOURNISSEUR et journalisation de CHAQUE
- * tentative. Jette `ApiError` (service inconnu/désactivé), `QueueFullError` /
- * `QueueTimeoutError` (429 côté route) ou `UpstreamFailure` (dernier échec à
- * relayer tel quel).
- */
-export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> {
-  const service = getService(input.serviceName);
-  if (!service) throw ApiError.notFound(`service "${input.serviceName}" not found`);
-  if (!service.enabled) {
-    throw new ApiError(503, "SERVICE_DISABLED", `service "${service.name}" is disabled`);
-  }
-  if (input.signal?.aborted) {
-    throw new UpstreamFailure(499, {}, null, { aborted: true, message: "Client disconnected" });
-  }
+/** Résultat d'une traversée de chaîne : réponse, dernier échec, étape qui a servi. */
+interface ChainRun {
+  /** Réponse de l'étape qui a abouti (`null` si la chaîne a échoué). */
+  output: RelayOutput | null;
+  /** Dernier échec rencontré (`null` en cas de succès). */
+  failure: UpstreamFailure | null;
+  /** Index de l'étape qui a RÉPONDU (`0` = principal) ; `-1` si aucune. */
+  answeredIndex: number;
+}
 
+/**
+ * Traverse la CHAÎNE d'un service : principal (rang 0) puis replis, dans l'ordre
+ * du catalogue, en journalisant CHAQUE tentative. Ne jette pas : renvoie la
+ * réponse de l'étape qui a abouti, ou le dernier échec.
+ *
+ * ⚠️ SOURCE DE VÉRITÉ UNIQUE : le relais de production (`relayServiceChat`) et
+ * le test d'étape de l'interface (`testServiceStep`) passent tous les deux par
+ * ICI — la logique fournisseur (corps, en-têtes, slots, journal) n'est jamais
+ * dupliquée.
+ */
+async function runServiceChain(service: ServiceRecord, input: RelayInput): Promise<ChainRun> {
   const prioritaire = service.prioritaire === true;
   const steps: ServiceStep[] = [service.principal, ...service.fallbacks];
   // Identifiant commun à TOUTES les tentatives de cet appel : un repli se
@@ -565,23 +569,378 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
       endpoint: input.endpoint,
       keyName: input.keyName,
     });
-    if (outcome.ok) return outcome.output;
+    if (outcome.ok) return { output: outcome.output, failure: null, answeredIndex: attempt };
     lastFailure = outcome.failure;
-    if (outcome.failure.aborted) throw outcome.failure;
+    if (outcome.failure.aborted) return { output: null, failure: outcome.failure, answeredIndex: -1 };
     if (!outcome.fallbackable) break;
   }
 
-  if (lastFailure) throw lastFailure;
-  throw new UpstreamFailure(
-    503,
-    {},
-    jsonErrorBody(
-      anyAttempted
-        ? `service "${service.name}": all steps failed`
-        : `service "${service.name}": no enabled provider available`,
-      "NO_PROVIDER",
+  if (lastFailure) return { output: null, failure: lastFailure, answeredIndex: -1 };
+  return {
+    output: null,
+    failure: new UpstreamFailure(
+      503,
+      {},
+      jsonErrorBody(
+        anyAttempted
+          ? `service "${service.name}": all steps failed`
+          : `service "${service.name}": no enabled provider available`,
+        "NO_PROVIDER",
+      ),
     ),
+    answeredIndex: -1,
+  };
+}
+
+/**
+ * Relaie un appel « chat completions » pour un service nommé :
+ * principal → replis, avec comptage PAR FOURNISSEUR et journalisation de CHAQUE
+ * tentative. Jette `ApiError` (service inconnu/désactivé), `QueueFullError` /
+ * `QueueTimeoutError` (429 côté route) ou `UpstreamFailure` (dernier échec à
+ * relayer tel quel).
+ */
+export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> {
+  const service = getService(input.serviceName);
+  if (!service) throw ApiError.notFound(`service "${input.serviceName}" not found`);
+  if (!service.enabled) {
+    throw new ApiError(503, "SERVICE_DISABLED", `service "${service.name}" is disabled`);
+  }
+  if (input.signal?.aborted) {
+    throw new UpstreamFailure(499, {}, null, { aborted: true, message: "Client disconnected" });
+  }
+
+  const run = await runServiceChain(service, input);
+  if (run.output) return run.output;
+  throw run.failure ?? new UpstreamFailure(503, {}, jsonErrorBody("relay failed", "NO_PROVIDER"));
+}
+
+// ── Test d'UNE étape (interface « Tester », diagnostic de configuration) ──
+
+/**
+ * Délai maximal d'un test manuel d'étape. Court à dessein : c'est du QUOTA
+ * utilisateur, pas une requête de production — mieux vaut un « délai dépassé »
+ * franc qu'un bouton qui tourne indéfiniment.
+ */
+export const TEST_TIMEOUT_MS = 30_000;
+
+/** Délai minimal accepté (protège d'un `timeoutMs: 1` qui ne testerait rien). */
+export const TEST_MIN_TIMEOUT_MS = 1_000;
+
+/** Plafond du texte renvoyé à l'interface (le reste est tronqué, pas perdu). */
+const MAX_TEST_TEXT_CHARS = 4_000;
+
+/** Jetons d'un test (champs `null` = le fournisseur ne les expose pas). */
+export interface StepTestTokens {
+  prompt: number | null;
+  completion: number | null;
+  reasoning: number | null;
+}
+
+/** Échec STRUCTURÉ d'un test : jamais un 500 opaque, jamais un corps amont brut. */
+export interface StepTestError {
+  /** Code stable et catégorisé (voir `StepTestResult.error`). */
+  code: string;
+  /** Motif court (`CallReason`, `provider_disabled`, `provider_missing`, `timeout`, `busy`…). */
+  reason: string;
+  /** Message lisible en FRANÇAIS, sans secret, sans URL de fournisseur, sans JSON brut. */
+  message: string;
+}
+
+/** Réponse du test d'étape — forme STABLE consommée par l'interface. */
+export interface StepTestResult {
+  ok: boolean;
+  /** Code HTTP amont (`0` quand aucun appel n'a eu lieu). */
+  status: number;
+  /** Index de l'étape réellement testée / utilisée (`0` = principal). */
+  stepIndex: number;
+  providerId: string;
+  model: string;
+  reasoning: string | null;
+  latencyMs: number;
+  tokens: StepTestTokens;
+  text?: string;
+  error?: StepTestError;
+  /** Vrai si un repli a répondu (chaîne complète uniquement, jamais en test ciblé). */
+  fellBack: boolean;
+}
+
+export interface StepTestInput {
+  serviceName: string;
+  /** Corps « chat completions » minimal déjà construit par l'appelant. */
+  body: Record<string, unknown>;
+  /** `undefined` = chaîne complète (replis compris) ; sinon index ABSOLU d'étape. */
+  stepIndex?: number;
+  headers?: IncomingHttpHeaders;
+  timeoutMs?: number;
+  keyName?: string;
+  endpoint?: string;
+}
+
+const EMPTY_TOKENS: StepTestTokens = { prompt: null, completion: null, reasoning: null };
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+/** Texte d'une réponse OpenAI-compatible (ou native Ollama) ; `undefined` si absent. */
+function extractResponseText(payload: Record<string, unknown>): string | undefined {
+  const choices = payload.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const message = asObject(asObject(choices[0])?.message);
+    const content = message?.content;
+    if (typeof content === "string" && content !== "") return content;
+    if (Array.isArray(content)) {
+      const parts = content
+        .map((part) => {
+          const obj = asObject(part);
+          return obj && typeof obj.text === "string" ? obj.text : "";
+        })
+        .join("");
+      if (parts !== "") return parts;
+    }
+  }
+  // API NATIVE Ollama : `/api/chat` renvoie `{ message: { content } }`.
+  const ollamaMessage = asObject(payload.message);
+  if (ollamaMessage && typeof ollamaMessage.content === "string" && ollamaMessage.content !== "") {
+    return ollamaMessage.content;
+  }
+  if (typeof payload.response === "string" && payload.response !== "") return payload.response;
+  return undefined;
+}
+
+/** Découpe une réponse complète en `{ text, tokens }` (jamais d'exception). */
+function readTestPayload(payload: Buffer | null): { text: string | undefined; tokens: StepTestTokens } {
+  if (!payload) return { text: undefined, tokens: EMPTY_TOKENS };
+  try {
+    const obj = asObject(JSON.parse(payload.toString("utf-8")));
+    if (!obj) return { text: undefined, tokens: EMPTY_TOKENS };
+    const usage = normalizeUsage(obj.usage);
+    const text = extractResponseText(obj);
+    return {
+      text: text === undefined ? undefined : text.length > MAX_TEST_TEXT_CHARS ? `${text.slice(0, MAX_TEST_TEXT_CHARS)}…` : text,
+      tokens: {
+        prompt: usage?.promptTokens ?? null,
+        completion: usage?.completionTokens ?? null,
+        reasoning: usage?.reasoningTokens ?? null,
+      },
+    };
+  } catch {
+    return { text: undefined, tokens: EMPTY_TOKENS };
+  }
+}
+
+/** Message FRANÇAIS d'un échec fournisseur — code HTTP + motif, jamais un corps brut. */
+function upstreamErrorMessage(status: number, reason: string): string {
+  const motifs: Record<string, string> = {
+    auth_error: "clé du fournisseur refusée",
+    quota: "quota épuisé chez le fournisseur",
+    rate_limit: "débit dépassé (trop de requêtes)",
+    overloaded: "fournisseur momentanément indisponible",
+    network_error: "fournisseur injoignable (réseau)",
+    upstream_error: "le fournisseur a refusé la requête",
+  };
+  const motif = motifs[reason] ?? motifs.upstream_error;
+  return status > 0 ? `HTTP ${status} — ${motif}` : motif;
+}
+
+/**
+ * Teste UNE étape (ou la chaîne complète) d'un service et renvoie un résultat
+ * STRUCTURÉ — jamais d'exception pour un échec fournisseur, jamais de secret ni
+ * de corps amont brut dans la réponse.
+ *
+ *   - `stepIndex: 0` → principal SEUL (aucun repli : on teste ce qu'on croit) ;
+ *   - `stepIndex: n` → repli n-1 SEUL ;
+ *   - `stepIndex` absent → CHAÎNE COMPLÈTE (comportement de production, replis
+ *     compris) — `fellBack` dit alors si un repli a répondu.
+ *
+ * L'appel est journalisé normalement (il compte dans les statistiques).
+ * Un service DÉSACTIVÉ reste testable : c'est un diagnostic de configuration,
+ * pas une mise en service.
+ */
+export async function testServiceStep(input: StepTestInput): Promise<StepTestResult> {
+  const service = getService(input.serviceName);
+  if (!service) throw ApiError.notFound(`service "${input.serviceName}" not found`);
+
+  const steps: ServiceStep[] = [service.principal, ...service.fallbacks];
+  const index = input.stepIndex;
+  if (index !== undefined && (!Number.isInteger(index) || index < 0 || index >= steps.length)) {
+    throw ApiError.validation([`stepIndex: doit être un entier entre 0 et ${steps.length - 1}`]);
+  }
+
+  const timeoutMs = Math.max(
+    TEST_MIN_TIMEOUT_MS,
+    Math.min(60_000, Number.isFinite(input.timeoutMs) ? Math.floor(input.timeoutMs as number) : TEST_TIMEOUT_MS),
   );
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException("Switchy step test timeout", "TimeoutError"));
+  }, timeoutMs);
+  (timer as { unref?: () => void })?.unref?.();
+
+  // Corps minimal : jamais de streaming (on veut un corps complet à lire).
+  const body: Record<string, unknown> = { ...input.body, stream: false };
+  const startedAt = Date.now();
+  const base = (step: ServiceStep, stepIndex: number): StepTestResult => ({
+    ok: false,
+    status: 0,
+    stepIndex,
+    providerId: step.providerId,
+    model: step.model,
+    reasoning: step.reasoning ?? null,
+    latencyMs: 0,
+    tokens: EMPTY_TOKENS,
+    fellBack: false,
+  });
+
+  try {
+    return await runTest(service, steps, index, body, base, {
+      input,
+      signal: controller.signal,
+      startedAt,
+      timeoutMs,
+    });
+  } catch (err) {
+    // File pleine / attente expirée : un diagnostic honnête, pas un 500.
+    const busy = err instanceof QueueFullError || err instanceof QueueTimeoutError;
+    const step = steps[index ?? 0];
+    const result = base(step, index ?? 0);
+    result.latencyMs = Date.now() - startedAt;
+    result.error = {
+      code: busy ? "busy" : "internal_error",
+      reason: busy ? "busy" : "upstream_error",
+      message: busy
+        ? "le fournisseur est saturé (file d'attente pleine) — réessayez"
+        : `échec inattendu du relais : ${err instanceof Error ? err.message : String(err)}`,
+    };
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Cœur de `testServiceStep` (étape ciblée ou chaîne complète). */
+async function runTest(
+  service: ServiceRecord,
+  steps: ServiceStep[],
+  index: number | undefined,
+  body: Record<string, unknown>,
+  base: (step: ServiceStep, stepIndex: number) => StepTestResult,
+  ctx: { input: StepTestInput; signal: AbortSignal; startedAt: number; timeoutMs: number },
+): Promise<StepTestResult> {
+  const { input, signal, startedAt, timeoutMs } = ctx;
+  const elapsed = (): number => Date.now() - startedAt;
+
+  // ── Chaîne COMPLÈTE (comportement de production, replis compris) ──
+  if (index === undefined) {
+    const run = await runServiceChain(service, {
+      serviceName: service.name,
+      body,
+      headers: input.headers ?? {},
+      signal,
+      keyName: input.keyName,
+      endpoint: input.endpoint ?? "test",
+    });
+    const answered = run.output ? steps[run.answeredIndex] : undefined;
+    const usedStep = answered ?? steps[0];
+    const result = base(usedStep, run.output ? run.answeredIndex : 0);
+    result.latencyMs = elapsed();
+    result.fellBack = run.output !== null && run.answeredIndex > 0;
+    if (run.output) {
+      const payload = Buffer.isBuffer(run.output.payload) ? run.output.payload : null;
+      const parsed = readTestPayload(payload);
+      result.ok = true;
+      result.status = run.output.status;
+      result.tokens = parsed.tokens;
+      if (parsed.text !== undefined) result.text = parsed.text;
+      return result;
+    }
+    Object.assign(result, failureToTestError(run.failure, signal, timeoutMs, elapsed()));
+    return result;
+  }
+
+  // ── Étape CIBLÉE : un seul fournisseur, AUCUN repli ──
+  const step = steps[index];
+  const result = base(step, index);
+  const provider = getProvider(step.providerId);
+  if (!provider || !provider.enabled) {
+    result.latencyMs = elapsed();
+    result.error = {
+      code: provider ? "provider_disabled" : "provider_missing",
+      reason: provider ? "provider_disabled" : "provider_missing",
+      message: provider
+        ? `fournisseur « ${step.providerId} » désactivé : aucun appel n'a été tenté`
+        : `fournisseur « ${step.providerId} » absent du catalogue : aucun appel n'a été tenté`,
+    };
+    return result;
+  }
+
+  const outcome = await attemptStep({
+    service,
+    step,
+    attempt: index,
+    callId: newCallId(),
+    provider,
+    body,
+    headers: input.headers ?? {},
+    prioritaire: service.prioritaire === true,
+    signal,
+    endpoint: input.endpoint ?? "test",
+    keyName: input.keyName,
+  });
+  result.latencyMs = elapsed();
+  if (!outcome.ok) {
+    Object.assign(result, failureToTestError(outcome.failure, signal, timeoutMs, result.latencyMs));
+    return result;
+  }
+  const payload = Buffer.isBuffer(outcome.output.payload) ? outcome.output.payload : null;
+  const parsed = readTestPayload(payload);
+  result.ok = true;
+  result.status = outcome.output.status;
+  result.tokens = parsed.tokens;
+  if (parsed.text !== undefined) result.text = parsed.text;
+  return result;
+}
+
+/** Traduit un `UpstreamFailure` en échec STRUCTURÉ (délai dépassé distingué du reste). */
+function failureToTestError(
+  failure: UpstreamFailure | null,
+  signal: AbortSignal,
+  timeoutMs: number,
+  latencyMs: number,
+): Partial<StepTestResult> {
+  if (signal.aborted) {
+    return {
+      ok: false,
+      status: 0,
+      latencyMs,
+      error: {
+        code: "timeout",
+        reason: "timeout",
+        message: `délai de ${Math.round(timeoutMs / 1000)} s dépassé — le fournisseur n'a pas répondu à temps`,
+      },
+    };
+  }
+  if (!failure) {
+    return {
+      ok: false,
+      status: 0,
+      latencyMs,
+      error: { code: "upstream_error", reason: "upstream_error", message: "aucune réponse du fournisseur" },
+    };
+  }
+  const status = failure.status;
+  const bodyText = failure.body ? failure.body.toString("utf-8") : "";
+  const reason = classifyReason(status === 0 ? undefined : status, bodyText);
+  return {
+    ok: false,
+    status,
+    latencyMs,
+    error: {
+      code: "upstream_error",
+      reason,
+      message: upstreamErrorMessage(status, reason),
+    },
+  };
 }
 
 /** Erreurs attendues du relais, à convertir en réponse HTTP par la route. */
