@@ -1,14 +1,25 @@
 # ─── Switchy — image de service ───
 #
-# Même miroir public Amazon ECR que Pi-Web et Libry : contourne le rate-limit
-# Docker Hub (HTTP 429 « toomanyrequests ») sans toucher au daemon. Contenu
-# identique à docker.io/library/node:22-slim, seule la provenance change.
+# Image de base tirée du MIROIR PUBLIC GOOGLE (mirror.gcr.io) : contenu
+# identique à docker.io/library/node:22-slim, seule la provenance change — et
+# ce miroir n'applique pas de quota de pulls anonymes.
+#
+# Pourquoi PAS public.ecr.aws (utilisé avant) : ECR Public limite les pulls
+# ANONYMES par adresse IP ; les runners GitHub partagent leurs IP, d'où l'échec
+# « 429 Too Many Requests · toomanyrequests: Data limit exceeded » observé en CI.
+# Pourquoi PAS docker.io en direct : Docker Hub rate-limite aussi les anonymes.
+#
+# Empreintes MESURÉES le 2026-10-21 sur mirror.gcr.io (figées ici en
+# commentaire, le tag reste utilisé : un digest épinglé casse le build si le
+# miroir resynchronise le tag) :
+#   index multi-arch  : sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
+#   linux/amd64       : sha256:ea11b74b986d520137cdef9a5346e447a00f275ecc4abc0055b7151226231e09
 #
 # Build en DEUX étapes : la compilation TypeScript a besoin des devDependencies
 # (typescript, @types/*), l'exécution NON.
 
 # ─── Étape 1 : compilation TypeScript ───
-FROM public.ecr.aws/docker/library/node:22-slim AS build
+FROM mirror.gcr.io/library/node:22-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -17,7 +28,7 @@ COPY src ./src
 RUN npm run build
 
 # ─── Étape 2 : exécution ───
-FROM public.ecr.aws/docker/library/node:22-slim
+FROM mirror.gcr.io/library/node:22-slim
 ENV NODE_ENV=production
 ENV SWITCHY_DATA_DIR=/app/data
 ENV SWITCHY_HOST=0.0.0.0

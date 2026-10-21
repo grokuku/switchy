@@ -110,6 +110,42 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Registres publics : les pulls ANONYMES sont quota-tés PAR IP et les
+      # runners GitHub partagent leurs IP — d'où le « 429 toomanyrequests »
+      # observé sur public.ecr.aws. Secours : on tire l'image de base AVANT le
+      # build, avec 3 tentatives et des pauses croissantes ; buildx la
+      # réutilise ensuite depuis le cache local. L'image est LUE dans le
+      # Dockerfile (source de vérité unique), donc rien à maintenir ici.
+      # Aucun identifiant : les deux registres visés sont publics.
+      - name: Prétélécharger l'image de base (3 tentatives)
+        run: |
+          set -euo pipefail
+          # Tous les FROM distincts du Dockerfile (build + runtime), en
+          # ignorant une éventuelle option `--platform=...` avant l'image.
+          mapfile -t BASES < <(awk '/^FROM[[:space:]]/ { img = ($2 ~ /^--/) ? $3 : $2; print img }' Dockerfile | sort -u)
+          if [ "${#BASES[@]}" -eq 0 ]; then
+            echo "::error::aucun FROM trouvé dans le Dockerfile."
+            exit 1
+          fi
+          for BASE in "${BASES[@]}"; do
+            echo "Image de base : ${BASE}"
+            pulled=""
+            for i in 1 2 3; do
+              if docker pull "${BASE}"; then
+                pulled="oui"
+                break
+              fi
+              if [ "${i}" -lt 3 ]; then
+                echo "::warning::tentative ${i}/3 échouée pour ${BASE}, nouvelle tentative dans $((i*10))s…"
+                sleep $((i*10))
+              fi
+            done
+            if [ -z "${pulled}" ]; then
+              echo "::error::impossible de tirer ${BASE} après 3 tentatives."
+              exit 1
+            fi
+          done
+
       # Construction locale (`load: true`) avec le cache de build GitHub.
       - name: Build image
         uses: docker/build-push-action@v5

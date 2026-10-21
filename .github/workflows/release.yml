@@ -149,6 +149,38 @@ jobs:
           echo "Tags    :"
           while IFS= read -r tag; do printf '  - %s\n' "${tag}"; done <<< "${TAGS}"
 
+      # Même secours que dans `ci.yml` (voir le commentaire détaillé là-bas) :
+      # les pulls anonymes sont quota-tés par IP sur les registres publics.
+      # L'image est LUE dans le Dockerfile — aucune référence en dur.
+      - name: Prétélécharger l'image de base (3 tentatives)
+        run: |
+          set -euo pipefail
+          # Tous les FROM distincts du Dockerfile (build + runtime), en
+          # ignorant une éventuelle option `--platform=...` avant l'image.
+          mapfile -t BASES < <(awk '/^FROM[[:space:]]/ { img = ($2 ~ /^--/) ? $3 : $2; print img }' Dockerfile | sort -u)
+          if [ "${#BASES[@]}" -eq 0 ]; then
+            echo "::error::aucun FROM trouvé dans le Dockerfile."
+            exit 1
+          fi
+          for BASE in "${BASES[@]}"; do
+            echo "Image de base : ${BASE}"
+            pulled=""
+            for i in 1 2 3; do
+              if docker pull "${BASE}"; then
+                pulled="oui"
+                break
+              fi
+              if [ "${i}" -lt 3 ]; then
+                echo "::warning::tentative ${i}/3 échouée pour ${BASE}, nouvelle tentative dans $((i*10))s…"
+                sleep $((i*10))
+              fi
+            done
+            if [ -z "${pulled}" ]; then
+              echo "::error::impossible de tirer ${BASE} après 3 tentatives."
+              exit 1
+            fi
+          done
+
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
