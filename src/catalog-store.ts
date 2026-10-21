@@ -104,6 +104,14 @@ export interface ServiceRecord {
    * défini une fois dans le catalogue, le client n'a AUCUN en-tête à envoyer.
    */
   prioritaire: boolean;
+  /**
+   * Mode « ROLLING » : quand une étape n'a pas de place libre, on NE PATIENTE
+   * PAS — on passe à l'étape suivante (répartition de la charge). Si TOUTES les
+   * étapes sont saturées, l'appel attend sur le fournisseur mémorisé pour la
+   * clé d'API (affinité de cache, `src/llm/key-affinity.ts`), sinon sur le
+   * principal. `false` (défaut) = file d'attente normale, comportement historique.
+   */
+  rolling: boolean;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -148,6 +156,7 @@ function normalizeService(value: Record<string, unknown>): ServiceRecord {
   const { reservations: _legacyReservations, ...rest } = value;
   const service = { ...rest } as unknown as ServiceRecord;
   service.prioritaire = service.prioritaire === true; // défaut `false` si absent
+  service.rolling = service.rolling === true; // défaut `false` si absent (rétro-compatible)
   return service;
 }
 
@@ -554,6 +563,7 @@ function validateServiceBody(
   maxOutputTokens?: number;
   vision?: boolean;
   prioritaire?: boolean;
+  rolling?: boolean;
   enabled?: boolean;
 } {
   const out: ReturnType<typeof validateServiceBody> = {};
@@ -614,6 +624,10 @@ function validateServiceBody(
     const prioritaire = requireBoolean(body.prioritaire ?? false, "prioritaire", errors);
     if (prioritaire !== null) out.prioritaire = prioritaire;
   }
+  if (body.rolling !== undefined || mustExist) {
+    const rolling = requireBoolean(body.rolling ?? false, "rolling", errors);
+    if (rolling !== null) out.rolling = rolling;
+  }
   if (body.enabled !== undefined || mustExist) {
     const enabled = requireBoolean(body.enabled ?? true, "enabled", errors);
     if (enabled !== null) out.enabled = enabled;
@@ -647,6 +661,7 @@ export function createService(input: unknown): ServiceRecord {
     maxOutputTokens: parsed.maxOutputTokens as number,
     vision: parsed.vision ?? false,
     prioritaire: parsed.prioritaire ?? false,
+    rolling: parsed.rolling ?? false,
     enabled: parsed.enabled ?? true,
     createdAt: now,
     updatedAt: now,
@@ -685,6 +700,7 @@ export function updateService(name: string, input: unknown): ServiceRecord {
   if (parsed.maxOutputTokens !== undefined) next.maxOutputTokens = parsed.maxOutputTokens;
   if (parsed.vision !== undefined) next.vision = parsed.vision;
   if (parsed.prioritaire !== undefined) next.prioritaire = parsed.prioritaire;
+  if (parsed.rolling !== undefined) next.rolling = parsed.rolling;
   if (parsed.enabled !== undefined) next.enabled = parsed.enabled;
 
   next.updatedAt = new Date().toISOString();

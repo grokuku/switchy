@@ -53,9 +53,20 @@ export type CallResult = "ok" | "error" | "aborted" | "skipped";
  *   - `overloaded`    : 503 (service momentanément indisponible) ;
  *   - `auth_error`    : 401/403 (clé invalide/expirée ou droits insuffisants) ;
  *   - `network_error` : échec réseau (aucune réponse HTTP) ;
- *   - `upstream_error`: tout autre code / erreur amont.
+ *   - `upstream_error`: tout autre code / erreur amont ;
+ *   - `saturated`     : AUCUNE place libre chez le fournisseur. Ce n'est PAS une
+ *                       erreur du fournisseur mais une bascule pour CHARGE
+ *                       (mode rolling) : jamais comptée comme échec fournisseur.
  */
-export const CALL_REASONS = ["quota", "rate_limit", "overloaded", "auth_error", "network_error", "upstream_error"] as const;
+export const CALL_REASONS = [
+  "quota",
+  "rate_limit",
+  "overloaded",
+  "auth_error",
+  "network_error",
+  "upstream_error",
+  "saturated",
+] as const;
 export type CallReason = (typeof CALL_REASONS)[number];
 
 /**
@@ -118,6 +129,18 @@ export interface CallLogEntry {
   durationMs: number;
   /** Consommation rapportée par le fournisseur, si disponible. */
   tokens?: CallLogTokens;
+  /**
+   * BASCULE POUR CHARGE : au moins une étape avait été écartée faute de place
+   * (mode rolling) avant cette tentative. Permet de distinguer une bascule pour
+   * charge d'une bascule pour ERREUR (`reason`). Additif — absent des entrées
+   * antérieures.
+   */
+  charge?: boolean;
+  /**
+   * AFFINITÉ APPLIQUÉE : cette tentative est celle du fournisseur repris parce
+   * qu'il est le dernier à avoir répondu pour cette clé (cache chaud). Additif.
+   */
+  affinity?: boolean;
   // ── Mode « full » uniquement ──
   /** Le service appelé était-il prioritaire ? (priorité intrinsèque, sans en-tête) */
   prioritaire?: boolean;
@@ -145,6 +168,8 @@ const ESSENTIAL: (keyof CallLogEntry)[] = [
   "durationMs",
   "tokens",
   "stream",
+  "charge",
+  "affinity",
 ];
 
 /** Longueur maximale d'un message d'erreur réseau journalisé. */
@@ -397,6 +422,13 @@ export interface ActivitySummary {
   fallbackAttempts: number;
   /** `fallbacks / calls`, ou `null` si aucun appel. */
   fallbackRate: number | null;
+  /**
+   * Tentatives ÉCARTÉES faute de place (bascule pour CHARGE, mode rolling).
+   * Distinctes des replis pour ERREUR : jamais des échecs fournisseur.
+   */
+  loadFallbacks: number;
+  /** Tentatives servies par AFFINITÉ de cache (fournisseur repris pour cette clé). */
+  affinityHits: number;
   latency: LatencyStats;
 }
 
@@ -447,6 +479,8 @@ export function summarizeActivity(
   const groups = new Map<string, CallGroup>();
   let attempts = 0;
   let fallbackAttempts = 0;
+  let loadFallbacks = 0;
+  let affinityHits = 0;
   let latencySum = 0;
   let latencyMax: number | null = null;
   let latencySamples = 0;
@@ -454,6 +488,8 @@ export function summarizeActivity(
   entries.forEach((entry, index) => {
     if (!withinWindow(entry.ts, cutoff)) return;
     attempts += 1;
+    if (entry.reason === "saturated") loadFallbacks += 1;
+    if (entry.affinity === true) affinityHits += 1;
     const attempt = typeof entry.attempt === "number" ? entry.attempt : 0;
     const isFallback = entry.isFallback === true || attempt > 0;
     if (isFallback) fallbackAttempts += 1;
@@ -495,6 +531,8 @@ export function summarizeActivity(
     fallbacks,
     fallbackAttempts,
     fallbackRate: calls > 0 ? fallbacks / calls : null,
+    loadFallbacks,
+    affinityHits,
     latency: {
       avgMs: latencySamples > 0 ? Math.round(latencySum / latencySamples) : null,
       maxMs: latencyMax,

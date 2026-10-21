@@ -12,6 +12,7 @@ import { resetLlmSlots } from "../src/llm/slot-queue.js";
 import { resetCallsLogState } from "../src/llm/calls-log.js";
 import { resetModelCatalogCache } from "../src/llm/model-catalog.js";
 import { resetInFlightCounters } from "../src/llm/inflight-by-key.js";
+import { resetKeyAffinity } from "../src/llm/key-affinity.js";
 
 export interface TestEnv {
   app: Express;
@@ -63,6 +64,7 @@ export function makeTestEnv(overrides: Record<string, string> = {}): TestEnv {
   resetCallsLogState();
   resetModelCatalogCache();
   resetInFlightCounters();
+  resetKeyAffinity();
   // Compteur anti-force brute du login : store module, réinitialisé par test.
   void resetLoginRateLimitForTests();
 

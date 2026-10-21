@@ -1120,6 +1120,74 @@ import {
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  // Mode ROLLING d'un service (bascule ON/OFF depuis la carte)
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Bouton ROLLING d'une carte : bascule `rolling` et enregistre TOUT DE SUITE
+   * (`PUT /api/services/:name`) — même mécanique que le bouton `enabled` :
+   * affichage optimiste, puis recalage sur la réponse du serveur.
+   *
+   * Rolling actif = un fournisseur PLEIN est sauté sans attendre (on passe à
+   * l'étape suivante) ; si TOUTES les étapes sont pleines, l'appel attend sur le
+   * fournisseur déjà utilisé par cette clé d'API (cache chaud), sinon le principal.
+   */
+  function serviceRollingButton(service) {
+    const on = service.rolling === true;
+    return h("button", {
+      class: `btn btn--toggle btn--toggle--rolling ${on ? "is-on" : "is-off"}`,
+      text: on ? "rolling" : "file d'attente",
+      attrs: {
+        type: "button",
+        "aria-pressed": on ? "true" : "false",
+        title: on
+          ? `Désactiver le mode rolling de « ${service.name} » (retour à la file d'attente)`
+          : `Activer le mode rolling de « ${service.name} » (ne pas patienter : passer à l'étape suivante)`,
+      },
+      on: { click: () => void toggleServiceRolling(service) },
+    });
+  }
+
+  async function toggleServiceRolling(service) {
+    const previous = service.rolling === true;
+    const next = !previous;
+    service.rolling = next; // affichage optimiste (badge ET bouton)
+    renderServices();
+
+    try {
+      const data = await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, {
+        method: "PUT",
+        body: { rolling: next },
+      });
+      // Le SERVEUR fait foi : on recale l'affichage sur SA réponse.
+      const saved = data && data.service;
+      if (saved && typeof saved.rolling === "boolean") service.rolling = saved.rolling;
+      renderServices();
+      if (service.rolling === next) {
+        notify(
+          next
+            ? `« ${service.name} » en mode rolling — une étape pleine est sautée, sans attente.`
+            : `« ${service.name} » revient à la file d'attente (aucune étape sautée pour cause de charge).`,
+          next ? "success" : "info",
+        );
+      } else {
+        notify(
+          `« ${service.name} » : le serveur a enregistré « ${service.rolling ? "rolling" : "file d'attente"} ».`,
+          "warning",
+        );
+      }
+    } catch (err) {
+      service.rolling = previous; // retour à l'état réellement enregistré
+      renderServices();
+      const reason = (err && err.message) || "réseau indisponible";
+      notify(
+        `Changement non enregistré (${reason}) — « ${service.name} » reste en ${previous ? "rolling" : "file d'attente"}.`,
+        "error",
+      );
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
   // Test d'une ÉTAPE (bouton « Tester » + zone « Tester les modèles »)
   // ════════════════════════════════════════════════════════════════════════
 
@@ -1411,6 +1479,7 @@ import {
     const badges = h("div", { class: "badges" });
     // Badge ET bouton ON/OFF lisent le MÊME champ `enabled` : jamais deux vérités.
     badges.append(s.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
+    if (s.rolling) badges.append(badge("rolling", "env"));
     if (s.prioritaire) badges.append(badge("prioritaire", "env"));
     if (s.vision) badges.append(badge("vision", "ok"));
     badges.append(badge(`${s.fallbacks ? s.fallbacks.length : 0} repli(s)`));
@@ -1418,6 +1487,7 @@ import {
 
     const actions = h("div", { class: "item-actions" });
     actions.append(serviceToggleButton(s));
+    actions.append(serviceRollingButton(s));
     actions.append(iconButton("pencil", "Modifier", { on: { click: () => openServiceForm(s) } }));
     actions.append(
       iconButton("trash", "Supprimer", {
@@ -1448,6 +1518,11 @@ import {
     if (s.prioritaire) {
       dl.append(h("div", null, h("dt", { text: "priorité" }), h("dd", { text: "passe en premier" })));
     }
+    dl.append(
+      h("div", null, h("dt", { text: "charge" }), h("dd", {
+        text: s.rolling ? "rolling — étape pleine sautée" : "file d'attente",
+      })),
+    );
     card.append(dl);
     return card;
   }
@@ -2004,6 +2079,17 @@ import {
       }),
     );
 
+    // Mode « rolling » : répartition de la charge entre les étapes.
+    form.append(formSection("Charge"));
+    const rollingBox = checkbox(editing ? service.rolling === true : false, "Rolling");
+    form.append(rollingBox.wrap);
+    form.append(
+      h("p", {
+        class: "field-hint muted",
+        text: "Si une étape n'a plus de place libre, on ne patiente pas : on passe à l'étape suivante. Si toutes sont pleines, l'appel attend sur le fournisseur déjà utilisé par la clé d'API (cache chaud), sinon sur le principal.",
+      }),
+    );
+
     openForm({
       modalId: "service-form",
       title: editing ? `Service — ${service.name}` : "Nouveau service",
@@ -2032,6 +2118,7 @@ import {
           maxOutputTokens: Number(maxOutInput.value),
           vision: visionBox.input.checked,
           prioritaire: prioritaireBox.input.checked,
+          rolling: rollingBox.input.checked,
           enabled: enabledBox.input.checked,
         };
         if (editing) {
@@ -2450,6 +2537,17 @@ import {
       dashboardStat("replis", formatCompact(activity.fallbacks), {
         alert: Number(activity.fallbacks) > 0,
         hint: `${formatPercent(activity.fallbackRate)} des appels`,
+      }),
+    );
+    // Motifs DISTINCTS : une bascule pour CHARGE (rolling) n'est pas une erreur.
+    stats.append(
+      dashboardStat("sautés (charge)", formatCompact(activity.loadFallbacks), {
+        hint: "rolling : étape pleine, sans attente",
+      }),
+    );
+    stats.append(
+      dashboardStat("affinité", formatCompact(activity.affinityHits), {
+        hint: "fournisseur repris (cache chaud)",
       }),
     );
     const latency = activity.latency || {};

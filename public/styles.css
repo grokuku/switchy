@@ -1399,6 +1399,14 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   border-style: dashed;
 }
 
+/* Mode ROLLING actif : couleur d'accent (≠ succès et ≠ désactivé), pour que
+   « ce service saute les étapes pleines » se lise d'un coup d'œil. */
+.btn--toggle--rolling.is-on {
+  color: var(--switchy-accent);
+  border-color: color-mix(in srgb, var(--switchy-accent) 50%, var(--switchy-border));
+  background: color-mix(in srgb, var(--switchy-accent) 16%, transparent);
+}
+
 /* Un service désactivé reste VISIBLE mais ATTÉNUÉ : il ne sert plus d'appels. */
 .item-card.is-disabled {
   opacity: 0.62;

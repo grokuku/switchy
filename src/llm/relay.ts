@@ -35,6 +35,7 @@ import { getProvider, getService, type ProviderRecord, type ServiceRecord, type 
 import { getConcurrency } from "../config.js";
 import { ApiError } from "../utils/api-error.js";
 import { classifyReason, logCall, newCallId, type CallLogTokens } from "./calls-log.js";
+import { preferredProvider, rememberProvider } from "./key-affinity.js";
 import { isReasoningLevel, normalizeMessagesForProvider, reasoningWireValue } from "./reasoning.js";
 import { llmSlots, QueueFullError, QueueTimeoutError } from "./slot-queue.js";
 
@@ -348,11 +349,21 @@ interface StepParams {
   endpoint: string | undefined;
   /** Nom de la clé appelante (voir `RelayInput.keyName`). */
   keyName: string | undefined;
+  /**
+   * Mode d'acquisition de la place : `wait` (file d'attente, historique) ou
+   * `try` (mode rolling : on ne PATIENTE pas — pas de place ⇒ étape écartée).
+   */
+  acquireMode?: "wait" | "try";
+  /** Vrai si au moins une étape a été écartée pour CHARGE avant cette tentative. */
+  charge?: boolean;
+  /** Vrai si cette tentative est celle du fournisseur repris par AFFINITÉ de cache. */
+  affinity?: boolean;
 }
 
 type StepOutcome =
   | { ok: true; output: RelayOutput }
-  | { ok: false; failure: UpstreamFailure; fallbackable: boolean };
+  | { ok: false; failure: UpstreamFailure; fallbackable: boolean }
+  | { ok: false; saturated: true };
 
 /**
  * Corps RÉELLEMENT envoyé au fournisseur : copie du corps client, `model`
@@ -384,6 +395,7 @@ export function buildUpstreamBody(
 
 async function attemptStep(params: StepParams): Promise<StepOutcome> {
   const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint, keyName } = params;
+  const acquireMode = params.acquireMode ?? "wait";
   const startedAt = Date.now();
 
   // Slot du seau DU FOURNISSEUR : sa `maxConcurrency` (ou le défaut global)
@@ -408,17 +420,39 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     prioritaire,
     endpoint,
     providerType: provider.type,
+    ...(params.charge ? { charge: true } : {}),
+    ...(params.affinity ? { affinity: true } : {}),
   };
 
   try {
-    slotKey = await llmSlots.acquire({
+    const request = {
       service: service.name,
       provider: provider.id,
       limit: provider.maxConcurrency ?? getConcurrency(),
       prioritaire,
       signal: attemptSignal,
       onExpire: () => watchdog.abort(new DOMException("LLM slot watchdog expired", "AbortError")),
-    });
+    };
+    if (acquireMode === "try") {
+      // Mode ROLLING : aucune attente. Pas de place ⇒ l'étape est ÉCARTÉE pour
+      // CHARGE (motif distinct d'une erreur fournisseur : `reason: "saturated"`),
+      // et la chaîne passe à l'étape suivante.
+      const immediate = llmSlots.tryAcquire(request);
+      if (!immediate) {
+        logCall({
+          ...common,
+          result: "skipped",
+          reason: "saturated",
+          charge: true,
+          durationMs: 0,
+          stream: wantsStream(body),
+        });
+        return { ok: false, saturated: true };
+      }
+      slotKey = immediate;
+    } else {
+      slotKey = await llmSlots.acquire(request);
+    }
     attemptSignal.throwIfAborted();
     const upstream = await fetch(joinUrl(provider.baseUrl, "chat/completions"), {
       method: "POST",
@@ -515,9 +549,39 @@ interface ChainRun {
 }
 
 /**
+ * Étape sur laquelle ATTENDRE quand toutes les étapes d'un service en rolling
+ * sont saturées : le fournisseur MÉMORISÉ pour la clé (cache déjà chaud, index
+ * d'affinité) s'il est une étape UTILISABLE de CE service, sinon le principal
+ * (`0`), sinon la première étape utilisable. `null` = aucune étape utilisable.
+ * ⚠️ On ne sort JAMAIS du service : l'attente porte forcément sur une de ses étapes.
+ */
+function pickWaitStep(steps: ServiceStep[], affinityIndex: number): number | null {
+  const usable = (index: number): boolean => {
+    const provider = getProvider(steps[index].providerId);
+    return provider !== null && provider.enabled;
+  };
+  if (affinityIndex >= 0 && usable(affinityIndex)) return affinityIndex;
+  for (let index = 0; index < steps.length; index++) if (usable(index)) return index;
+  return null;
+}
+
+/**
  * Traverse la CHAÎNE d'un service : principal (rang 0) puis replis, dans l'ordre
  * du catalogue, en journalisant CHAQUE tentative. Ne jette pas : renvoie la
  * réponse de l'étape qui a abouti, ou le dernier échec.
+ *
+ * MODE ROLLING (`service.rolling === true`) — deux passes :
+ *   1. PASSE SANS ATTENTE : chaque étape est tentée avec `tryAcquire`. Si son
+ *      fournisseur est plein, l'étape est ÉCARTÉE (`reason: "saturated"`) sans
+ *      patienter et la chaîne passe à la suivante (répartition de la charge) ;
+ *   2. si TOUTES les étapes utilisables sont saturées, PASSE EN ATTENTE sur le
+ *      fournisseur mémorisé pour cette clé d'API (affinité de cache), sinon sur
+ *      le principal, puis, en cas d'échec, sur les étapes restantes.
+ * Hors rolling, une seule passe EN ATTENTE — comportement historique inchangé.
+ *
+ * AFFINITÉ (rolling uniquement) : le dernier fournisseur qui a répondu pour
+ * cette clé passe en tête s'il est une étape de CE service. La place est
+ * toujours vérifiée : l'affinité ne fait JAMAIS dépasser la concurrence.
  *
  * ⚠️ SOURCE DE VÉRITÉ UNIQUE : le relais de production (`relayServiceChat`) et
  * le test d'étape de l'interface (`testServiceStep`) passent tous les deux par
@@ -530,49 +594,100 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
   // Identifiant commun à TOUTES les tentatives de cet appel : un repli se
   // constate en lisant le journal (mêmes `callId`) sans corrélation manuelle.
   const callId = newCallId();
+  const rolling = service.rolling === true;
+
+  // Ordre des étapes : celui du catalogue par défaut ; en rolling, le
+  // fournisseur mémorisé pour la clé (affinité) passe devant s'il est une étape
+  // de CE service. L'affinité expire au bout de 5 min (voir `key-affinity.ts`).
+  const catalogueOrder = steps.map((_, index) => index);
+  const affinityId = rolling ? preferredProvider(input.keyName) : null;
+  const affinityIndex = affinityId === null ? -1 : steps.findIndex((s) => s.providerId === affinityId);
+  const affinityApplied = affinityIndex > 0; // le principal n'a rien à gagner à passer devant lui-même
+  let order = affinityApplied
+    ? [affinityIndex, ...catalogueOrder.filter((index) => index !== affinityIndex)]
+    : catalogueOrder;
 
   let lastFailure: UpstreamFailure | null = null;
   let anyAttempted = false;
+  let acquireMode: "wait" | "try" = rolling ? "try" : "wait";
+  // Nombre d'étapes écartées pour CHARGE : sert à distinguer « bascule pour
+  // charge » de « bascule pour erreur » dans le journal (tentatives suivantes).
+  let loadSkips = 0;
 
-  for (let attempt = 0; attempt < steps.length; attempt++) {
-    const step = steps[attempt];
-    const provider = getProvider(step.providerId);
-    if (!provider || !provider.enabled) {
-      // Étape impossible : journalisée (jamais silencieuse), aucun appel réseau.
-      logCall({
+  for (;;) {
+    let usableSteps = 0;
+    let saturatedSteps = 0;
+    let stopped = false;
+
+    for (const index of order) {
+      const step = steps[index];
+      const provider = getProvider(step.providerId);
+      if (!provider || !provider.enabled) {
+        // Étape impossible : journalisée (jamais silencieuse), aucun appel réseau.
+        logCall({
+          callId,
+          keyName: input.keyName,
+          service: service.name,
+          attempt: index,
+          provider: step.providerId,
+          model: step.model,
+          result: "skipped",
+          error: provider ? "provider_disabled" : "provider_missing",
+          durationMs: 0,
+          prioritaire,
+          endpoint: input.endpoint,
+        });
+        continue;
+      }
+
+      anyAttempted = true;
+      usableSteps += 1;
+      const outcome = await attemptStep({
+        service,
+        step,
+        attempt: index,
         callId,
-        keyName: input.keyName,
-        service: service.name,
-        attempt,
-        provider: step.providerId,
-        model: step.model,
-        result: "skipped",
-        error: provider ? "provider_disabled" : "provider_missing",
-        durationMs: 0,
+        provider,
+        body: input.body,
+        headers: input.headers,
         prioritaire,
+        signal: input.signal,
         endpoint: input.endpoint,
+        keyName: input.keyName,
+        acquireMode,
+        charge: loadSkips > 0,
+        affinity: affinityApplied && index === affinityIndex,
       });
-      continue;
+
+      if (outcome.ok) {
+        // AFFINITÉ : on ne mémorise QUE ce qui a RÉPONDU (jamais un échec).
+        rememberProvider(input.keyName, provider.id);
+        return { output: outcome.output, failure: null, answeredIndex: index };
+      }
+      if ("saturated" in outcome) {
+        saturatedSteps += 1;
+        loadSkips += 1;
+        continue;
+      }
+      lastFailure = outcome.failure;
+      if (outcome.failure.aborted) return { output: null, failure: outcome.failure, answeredIndex: -1 };
+      if (!outcome.fallbackable) {
+        stopped = true;
+        break;
+      }
     }
 
-    anyAttempted = true;
-    const outcome = await attemptStep({
-      service,
-      step,
-      attempt,
-      callId,
-      provider,
-      body: input.body,
-      headers: input.headers,
-      prioritaire,
-      signal: input.signal,
-      endpoint: input.endpoint,
-      keyName: input.keyName,
-    });
-    if (outcome.ok) return { output: outcome.output, failure: null, answeredIndex: attempt };
-    lastFailure = outcome.failure;
-    if (outcome.failure.aborted) return { output: null, failure: outcome.failure, answeredIndex: -1 };
-    if (!outcome.fallbackable) break;
+    if (stopped) break;
+
+    // TOUTES les étapes utilisables étaient saturées : on ATTEND maintenant,
+    // sur le fournisseur mémorisé pour la clé (cache chaud), sinon le principal.
+    const allSaturated = acquireMode === "try" && usableSteps > 0 && saturatedSteps === usableSteps;
+    if (!allSaturated) break;
+    const waitIndex = pickWaitStep(steps, affinityIndex);
+    if (waitIndex === null) break; // aucune étape utilisable : 503 plus bas
+    order = [waitIndex, ...catalogueOrder.filter((index) => index !== waitIndex)];
+    acquireMode = "wait";
+    lastFailure = null; // la passe d'attente repart d'un bilan vierge
   }
 
   if (lastFailure) return { output: null, failure: lastFailure, answeredIndex: -1 };
@@ -889,7 +1004,10 @@ async function runTest(
   });
   result.latencyMs = elapsed();
   if (!outcome.ok) {
-    Object.assign(result, failureToTestError(outcome.failure, signal, timeoutMs, result.latencyMs));
+    // Le test ciblé emploie `acquireMode: "wait"` : « saturated » y est
+    // inatteignable, mais le type l'autorise — on ne fabrique jamais un échec nul.
+    const failure = "saturated" in outcome ? null : outcome.failure;
+    Object.assign(result, failureToTestError(failure, signal, timeoutMs, result.latencyMs));
     return result;
   }
   const payload = Buffer.isBuffer(outcome.output.payload) ? outcome.output.payload : null;

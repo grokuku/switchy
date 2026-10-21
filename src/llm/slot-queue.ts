@@ -177,6 +177,26 @@ export class ProviderSlotQueue {
     });
   }
 
+  /**
+   * Tentative d'acquisition IMMÉDIATE — mode « rolling » : on ne PATIENTE pas.
+   * Renvoie l'identifiant du slot, ou `null` si le seau de CE fournisseur est
+   * plein. L'appel n'est JAMAIS mis en file et ne consomme jamais le quota
+   * `SWITCHY_QUEUE_MAX`.
+   *
+   * Le slot rendu suit EXACTEMENT les mêmes règles qu'`acquire` : plafond relu
+   * à chaud (`currentLimit`), watchdog (via `onExpire`), et libération
+   * idempotente par `release` — l'appelant doit le libérer une seule fois,
+   * comme pour `acquire`.
+   *
+   * Un signal déjà annulé renvoie `null` (aucune place acquise : rien à
+   * libérer) ; c'est à l'appelant de conclure à l'annulation.
+   */
+  tryAcquire(request: SlotRequest): string | null {
+    if (request.signal?.aborted) return null;
+    if (!this.canRun(request)) return null;
+    return this.take(request);
+  }
+
   /** Libère un slot (no-op idempotent si déjà libéré, ex. par le watchdog). */
   release(slotKey: string): void {
     const slot = this.active.get(slotKey);
