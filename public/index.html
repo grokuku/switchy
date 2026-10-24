@@ -105,13 +105,14 @@
     </div>
 
     <nav class="tabs" role="tablist" aria-label="Sections de l'interface">
-      <button type="button" class="tab is-active" role="tab" id="tab-services"
-              data-tab="services" aria-selected="true" aria-controls="panel-services">
-        Services
-      </button>
-      <button type="button" class="tab" role="tab" id="tab-activity"
-              data-tab="activity" aria-selected="false" aria-controls="panel-activity">
+      <!-- Activité = PAGE D'ENTRÉE (état initial, pas un clic simulé). -->
+      <button type="button" class="tab is-active" role="tab" id="tab-activity"
+              data-tab="activity" aria-selected="true" aria-controls="panel-activity">
         Activité
+      </button>
+      <button type="button" class="tab" role="tab" id="tab-services"
+              data-tab="services" aria-selected="false" aria-controls="panel-services">
+        Services
       </button>
       <button type="button" class="tab" role="tab" id="tab-providers"
               data-tab="providers" aria-selected="false" aria-controls="panel-providers">
@@ -126,7 +127,7 @@
 
   <main class="content">
     <!-- ── Services ─────────────────────────────────────────────────────── -->
-    <section class="panel" id="panel-services" role="tabpanel" aria-labelledby="tab-services">
+    <section class="panel" id="panel-services" role="tabpanel" aria-labelledby="tab-services" hidden>
       <header class="panel-head">
         <h2>Services LLM</h2>
         <p class="panel-hint">Services nommés exposés aux autres projets : fournisseur
@@ -180,21 +181,22 @@
       </section>
     </section>
 
-    <!-- ── Activité (tableau de bord, auto-rafraîchi) ───────────────────── -->
-    <section class="panel" id="panel-activity" role="tabpanel" aria-labelledby="tab-activity" hidden>
+    <!-- ── Activité (tableau de bord, temps réel) ───────────────────────── -->
+    <section class="panel" id="panel-activity" role="tabpanel" aria-labelledby="tab-activity">
       <header class="panel-head">
         <h2>Activité</h2>
-        <p class="panel-hint">État de la concurrence en direct, chiffres des 24 dernières
-          heures, consommation de tokens par service et par fournisseur, et derniers appels.
-          Rafraîchissement automatique tant que cet onglet est visible.</p>
+        <p class="panel-hint">État de la concurrence <strong>en direct</strong> (places
+          occupées, appels en cours, nouvelles lignes d'appel), chiffres des 24 dernières
+          heures et consommation de tokens. Le direct est poussé par le serveur ; les
+          chiffres 24 h se rafraîchissent toutes les 30 s et à chaque retour sur cet onglet.</p>
       </header>
 
       <div class="toolbar">
+        <span class="live-conn" id="live-conn" data-state="off">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span class="live-conn-label">en pause</span>
+        </span>
         <span class="toolbar-status" id="activity-status" role="status" aria-live="polite"></span>
-        <label class="checkbox">
-          <input type="checkbox" id="activity-auto" checked />
-          Rafraîchissement auto (5 s)
-        </label>
         <button type="button" class="btn" id="activity-reload">Rafraîchir</button>
       </div>
 

@@ -29,6 +29,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { randomUUID } from "node:crypto";
 import path from "path";
 import { getCallsLogFile, getCallsLogMaxEntries, getCallsLogMode, getCallsLogRetentionDays } from "../config.js";
+import { notifyCallLogged } from "../live/events.js";
 
 export interface CallLogTokens {
   promptTokens?: number;
@@ -259,6 +260,11 @@ export function logCall(input: CallLogInput): void {
 
     const max = getCallsLogMaxEntries();
     if (max > 0 && lineCount > max) compactCallsLog();
+
+    // DIRECT : la tentative vient d'être journalisée → une ligne en tête de
+    // « Derniers appels ». Le filtrage des champs (ni identité d'appelant, ni
+    // message d'erreur libre, ni prompt) appartient à `live/hub.ts`.
+    notifyCallLogged(entry);
   } catch (err) {
     console.error("[calls-log] Failed to append entry:", err);
   }

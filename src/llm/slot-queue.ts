@@ -30,6 +30,7 @@
  */
 import { randomUUID } from "crypto";
 import { getConcurrency, getQueueMax, getQueueTimeoutMs, getSlotWatchdogMs } from "../config.js";
+import { notifyLiveChange } from "../live/events.js";
 import { getProvider } from "../catalog-store.js";
 
 export interface SlotRequest {
@@ -162,6 +163,8 @@ export class ProviderSlotQueue {
         bucket.splice(idx, 1);
         waiter.cleanup();
         reject(error);
+        // File raccourcie (annulation ou expiration) : état direct modifié.
+        notifyLiveChange();
       };
       const abort = (): void => remove(new DOMException("Request aborted", "AbortError"));
       const timeoutMs = getQueueTimeoutMs();
@@ -174,6 +177,8 @@ export class ProviderSlotQueue {
       }
       bucket.push(waiter);
       request.signal?.addEventListener("abort", abort, { once: true });
+      // La file vient de s'allonger : le direct doit le voir tout de suite.
+      notifyLiveChange();
     });
   }
 
@@ -203,6 +208,9 @@ export class ProviderSlotQueue {
     if (!slot) return;
     this.active.delete(slotKey);
     this.drain(slot.provider);
+    // ⚠️ Émettre APRÈS la mise à jour (et après le drain : une place libérée
+    // peut être immédiatement reprise par un appel en attente).
+    notifyLiveChange();
   }
 
   /**
@@ -228,6 +236,7 @@ export class ProviderSlotQueue {
       }
     }
     for (const provider of freedProviders) this.drain(provider);
+    if (stale.length > 0) notifyLiveChange();
     return stale.map((slot) => slot.slotKey);
   }
 
@@ -319,6 +328,7 @@ export class ProviderSlotQueue {
       acquiredAt: Date.now(),
       onExpire: request.onExpire,
     });
+    notifyLiveChange();
     return slotKey;
   }
 

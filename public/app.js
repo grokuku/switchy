@@ -63,8 +63,13 @@ import {
     settings: document.getElementById("panel-settings"),
   };
 
-  /** Onglet affiché (sert à ne PAS rafraîchir un onglet inactif). */
-  let activeTab = "services";
+  /**
+   * Onglet affiché. ⚠️ « Activité » est la PAGE D'ENTRÉE (état initial) : c'est
+   * le tableau de bord temps réel. Les autres onglets restent à un clic.
+   * (Décision : Activité par défaut, SAUF ancre explicite `#services`,
+   * `#providers` ou `#settings` — voir `tabFromHash`.)
+   */
+  let activeTab = "activity";
 
   /** Affiche l'onglet demandé et masque les autres. */
   function activate(name) {
@@ -80,11 +85,13 @@ import {
     if (name === "providers") loadProviders();
     else if (name === "settings") loadSettings();
     else if (name === "activity") {
+      // Agrégats par requête + DIRECT par WebSocket : deux cadences distinctes.
       loadDashboard();
-      startDashboardAutoRefresh();
+      startLive();
     } else loadServices();
-    // L'auto-rafraîchissement ne tourne QUE sur l'onglet Activité.
-    if (name !== "activity") stopDashboardAutoRefresh();
+    // Le direct n'est ouvert QUE sur l'onglet Activité (comme l'ancien
+    // rafraîchissement, qui ne tournait que sur l'onglet visible).
+    if (name !== "activity") stopLive();
   }
 
   // ── Thème (brique tokens) ────────────────────────────────────────────────
@@ -2549,19 +2556,52 @@ import {
   }
 
   // ════════════════════════════════════════════════════════════════════════
-  // Tableau de bord « Activité » (auto-rafraîchi, PLEINE LARGEUR)
+  // Tableau de bord « Activité » — TEMPS RÉEL (PLEINE LARGEUR)
   //
-  // Une SEULE requête (`GET /api/dashboard`) porte tout l'onglet. Le minuteur
-  // ne rafraîchit QUE lorsque l'onglet Activité est affiché ET la page visible
-  // (aucun appel inutile en arrière-plan). Le re-rendu est complet mais garde
-  // la même structure : pas de saut visuel.
+  // ⚠️ Deux natures de données, deux canaux, deux cadences :
+  //
+  //   DIRECT (WebSocket `/ws/activity`)          | AGRÉGATS (GET /api/dashboard)
+  //   ------------------------------------------+-------------------------------
+  //   places occupées / en attente / plafond   | 24 h : appels, réussite, replis,
+  //   par fournisseur                          | latence, sauts pour charge, affinité
+  //   appels en vol par clé                    | tokens par service / fournisseur
+  //   chaque tentative terminée (ligne)        | « Par clé » (volumétrie, tokens)
+  //
+  // Le direct arrive en poussée serveur (frames `snapshot` / `live` / `call`) ;
+  // les agrégats, eux, ne sont JAMAIS recalculés à chaque événement : une
+  // requête toutes les ~30 s (et au retour sur l'onglet). Recalculer 24 h de
+  // journal à chaque token serait absurde.
+  //
+  // Le re-rendu est local : seuls les blocs DIRECT (« En ce moment », la colonne
+  // « en cours » de « Par clé », « Derniers appels ») sont repeints — les blocs
+  // 24 h et Tokens gardent leur DOM jusqu'à la requête suivante.
   // ════════════════════════════════════════════════════════════════════════
 
-  /** Période d'auto-rafraîchissement (ms) — onglet actif uniquement. */
-  const DASHBOARD_REFRESH_MS = 5000;
+  /** Cadence des AGRÉGATS (ms) — le DIRECT, lui, est poussé par le serveur. */
+  const AGGREGATES_REFRESH_MS = 30000;
+
+  /** Nombre de lignes « Derniers appels » affichées (identique au serveur). */
+  const RECENT_LIMIT = 10;
 
   let dashboardTimer = null;
   let dashboardLoading = false;
+
+  /** Dernière réponse `/api/dashboard` (source des agrégats affichés). */
+  let lastDashboard = null;
+  /** Dernier état direct reçu (providers / keys / totals) — `null` avant. */
+  let liveState = null;
+  /** Lignes « Derniers appels » : reprise serveur + frames `call`. */
+  let recentEntries = [];
+  /** Blocs repeints en place (jamais tout le tableau). */
+  let dashHosts = null;
+
+  // ── Connexion directe (WebSocket) ──
+  let liveSocket = null;
+  /** Tentatives de reconnexion consécutives (index du backoff). */
+  let liveRetry = 0;
+  let liveRetryTimer = null;
+  /** Backoff progressif : on ne martèle pas un serveur qui redémarre. */
+  const LIVE_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000];
 
   /** Grand nombre lisible : 1234567 → « 1,2 M », 340000 → « 340 k ». */
   function formatCompact(value) {
@@ -2810,6 +2850,18 @@ import {
     return badge(labels[result] || result, variant);
   }
 
+  /** Une ligne « Derniers appels » (badge REPLI visible). */
+  function recentRow(entry) {
+    const li = h("li", { class: "recent-row" });
+    li.append(h("span", { class: "recent-time", text: formatClock(entry.ts) }));
+    li.append(h("span", { class: "recent-service", text: entry.service || "?", attrs: { title: entry.service || "?" } }));
+    li.append(h("span", { class: "recent-provider muted", text: providerLabel(entry.provider) }));
+    li.append(resultBadge(entry));
+    li.append(h("span", { class: "recent-duration muted", text: formatDuration(entry.durationMs) }));
+    if (entry.isFallback) li.append(h("span", { class: "badge badge--danger repli-badge", text: "REPLI" }));
+    return li;
+  }
+
   /** Bloc ④ — « Derniers appels » (badge REPLI visible). */
   function renderRecentBlock(recent) {
     const block = h("section", { class: "dash-block" });
@@ -2820,21 +2872,115 @@ import {
       return block;
     }
     const list = h("ol", { class: "recent-list" });
-    for (const entry of rows) {
-      const li = h("li", { class: "recent-row" });
-      li.append(h("span", { class: "recent-time", text: formatClock(entry.ts) }));
-      li.append(h("span", { class: "recent-service", text: entry.service || "?", attrs: { title: entry.service || "?" } }));
-      li.append(h("span", { class: "recent-provider muted", text: providerLabel(entry.provider) }));
-      li.append(resultBadge(entry));
-      li.append(h("span", { class: "recent-duration muted", text: formatDuration(entry.durationMs) }));
-      if (entry.isFallback) li.append(h("span", { class: "badge badge--danger repli-badge", text: "REPLI" }));
-      list.append(li);
-    }
+    for (const entry of rows) list.append(recentRow(entry));
     block.append(list);
     return block;
   }
 
-  /** Peint le tableau de bord à partir de la réponse `/api/dashboard`. */
+  // ── Direct : mise à jour EN PLACE des blocs concernés ──────────────────
+
+  /**
+   * Forme d'affichage du direct : le payload WebSocket est compact
+   * (`{id, active, queued, max}`) ; les libellés et le plafond effectif sont
+   * repris du dernier `/api/dashboard` pour éviter tout doublon de calcul.
+   */
+  function liveView() {
+    if (!liveState) return lastDashboard ? lastDashboard.live : null;
+    const known = new Map(
+      (((lastDashboard && lastDashboard.live && lastDashboard.live.providers) || [])).map((p) => [p.id, p]),
+    );
+    const totals = liveState.totals || { active: 0, queued: 0 };
+    return {
+      active: Number(totals.active) || 0,
+      queued: Number(totals.queued) || 0,
+      providers: (liveState.providers || []).map((p) => {
+        const ref = known.get(p.id) || null;
+        const limit = Number(p.max) || Number(ref && ref.limit) || 0;
+        const active = Number(p.active) || 0;
+        return {
+          id: p.id,
+          label: (ref && ref.label) || p.id,
+          limit,
+          active,
+          queued: Number(p.queued) || 0,
+          state: active <= 0 ? "free" : limit > 0 && active >= limit ? "saturated" : "busy",
+        };
+      }),
+    };
+  }
+
+  /**
+   * Lignes « Par clé » : les AGRÉGATS (volumétrie, tokens) viennent de la
+   * dernière requête ; SEULE la colonne « en cours » est remplacée par le
+   * direct. Sans direct (onglet hors ligne), on garde la valeur du serveur.
+   */
+  function keysWithLive(byKey) {
+    const rows = Array.isArray(byKey) ? byKey : [];
+    if (!liveState) return rows;
+    const inFlight = new Map((liveState.keys || []).map((k) => [k.key, Number(k.inFlight) || 0]));
+    const out = rows.map((row) => ({ ...row, inFlight: inFlight.has(row.key) ? inFlight.get(row.key) : 0 }));
+    // Une clé peut avoir un appel en vol sans agrégat encore calculé.
+    for (const [key, count] of inFlight) {
+      if (count <= 0 || out.some((row) => row.key === key)) continue;
+      out.push({
+        key,
+        inFlight: count,
+        calls: 0,
+        attempts: 0,
+        successRate: null,
+        fallbacks: 0,
+        latency: { avgMs: null, maxMs: null, samples: 0 },
+        tokens: { calls: 0, prompt: null, completion: null, reasoning: null },
+      });
+    }
+    return out;
+  }
+
+  /** Repeint « En ce moment » (places par fournisseur + totaux). */
+  function paintLiveBlock() {
+    if (!dashHosts || !dashHosts.live) return;
+    const view = liveView();
+    if (!view) return;
+    dashHosts.live.replaceChildren(...Array.from(renderLiveBlock(view).childNodes));
+  }
+
+  /** Repeint « Par clé » (colonne « en cours » seulement, depuis le direct). */
+  function paintKeyBlock() {
+    if (!dashHosts || !dashHosts.key || !lastDashboard) return;
+    dashHosts.key.replaceChildren(...Array.from(renderKeyBlock(keysWithLive(lastDashboard.byKey)).childNodes));
+  }
+
+  /** Repeint « Derniers appels » (les nouvelles lignes arrivent en tête). */
+  function paintRecent() {
+    if (!dashHosts || !dashHosts.recent) return;
+    dashHosts.recent.replaceChildren(...Array.from(renderRecentBlock(recentEntries).childNodes));
+  }
+
+  /** Applique une frame du direct (`snapshot`, `live` ou `call`). */
+  function applyLiveFrame(frame) {
+    if (!frame || typeof frame !== "object") return;
+    if (frame.type === "call") {
+      const entry = frame.call;
+      if (!entry || typeof entry !== "object") return;
+      recentEntries.unshift(entry);
+      if (recentEntries.length > RECENT_LIMIT) recentEntries.length = RECENT_LIMIT;
+      paintRecent();
+      return;
+    }
+    if (frame.type !== "snapshot" && frame.type !== "live") return;
+    liveState = {
+      providers: Array.isArray(frame.providers) ? frame.providers : [],
+      keys: Array.isArray(frame.keys) ? frame.keys : [],
+      totals: frame.totals || { active: 0, queued: 0 },
+    };
+    paintLiveBlock();
+    paintKeyBlock();
+  }
+
+  /**
+   * Peint le tableau de bord à partir de la réponse `/api/dashboard` (AGRÉGATS),
+   * en réappliquant le dernier état DIRECT connu : le direct ne recule jamais.
+   */
   function renderDashboard(data) {
     const host = $("dashboard");
     const empty = $("activity-empty");
@@ -2845,29 +2991,34 @@ import {
         empty.textContent = "Aucune donnée d'activité pour l'instant.";
       }
       host.replaceChildren();
+      dashHosts = null;
+      lastDashboard = null;
       return;
     }
     if (empty) empty.hidden = true;
+    lastDashboard = data;
+    recentEntries = Array.isArray(data.recent) ? data.recent.slice(0, RECENT_LIMIT) : [];
+
+    const view = liveState ? liveView() : data.live;
     const row = h("div", { class: "dash-row" });
-    row.append(renderLiveBlock(data.live));
+    const liveHost = renderLiveBlock(view);
+    const keyHost = renderKeyBlock(keysWithLive(data.byKey));
+    const recentHost = renderRecentBlock(recentEntries);
+    row.append(liveHost);
     row.append(renderSummaryBlock(data.activity));
-    host.replaceChildren(
-      row,
-      renderKeyBlock(data.byKey),
-      renderTokensBlock(data.tokens),
-      renderRecentBlock(data.recent),
-    );
+    host.replaceChildren(row, keyHost, renderTokensBlock(data.tokens), recentHost);
+    // Références des blocs DIRECT (seuls repeints par le WebSocket).
+    dashHosts = { live: liveHost, key: keyHost, recent: recentHost };
   }
 
-  /** Charge (et peint) le tableau de bord — garde anti-réentrance. */
+  /** Charge (et peint) les AGRÉGATS — garde anti-réentrance. */
   async function loadDashboard() {
     if (dashboardLoading) return;
     dashboardLoading = true;
     try {
       const data = await apiRequest("/api/dashboard");
       renderDashboard(data);
-      const status = $("activity-status");
-      if (status) status.textContent = `Mis à jour à ${new Date().toLocaleTimeString("fr-FR", { hour12: false })}`;
+      setActivityStatus(`Agrégats à ${new Date().toLocaleTimeString("fr-FR", { hour12: false })}`);
     } catch (err) {
       handleApiError(err, "Impossible de charger l'activité.");
     } finally {
@@ -2875,21 +3026,157 @@ import {
     }
   }
 
-  /** Démarre l'auto-rafraîchissement (onglet actif visible uniquement). */
-  function startDashboardAutoRefresh() {
-    stopDashboardAutoRefresh();
-    const auto = $("activity-auto");
-    if (auto && !auto.checked) return;
-    dashboardTimer = setInterval(() => {
-      if (activeTab === "activity" && !document.hidden) loadDashboard();
-    }, DASHBOARD_REFRESH_MS);
+  /** Horodatage des AGRÉGATS (le direct, lui, n'a pas d'horodatage manuel). */
+  function setActivityStatus(text) {
+    const status = $("activity-status");
+    if (status) status.textContent = text;
   }
 
-  function stopDashboardAutoRefresh() {
+  /** Démarre la cadence LENTE des agrégats (onglet actif visible uniquement). */
+  function startAggregatesRefresh() {
+    stopAggregatesRefresh();
+    dashboardTimer = setInterval(() => {
+      if (activeTab === "activity" && !document.hidden) loadDashboard();
+    }, AGGREGATES_REFRESH_MS);
+  }
+
+  function stopAggregatesRefresh() {
     if (dashboardTimer !== null) {
       clearInterval(dashboardTimer);
       dashboardTimer = null;
     }
+  }
+
+  // ── WebSocket du direct : ouverture, reprise, indicateur ───────────────
+
+  /** URL du direct (ws:// ou wss:// selon la page). */
+  function liveSocketUrl() {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/ws/activity`;
+  }
+
+  /**
+   * Indicateur visuel HONNÊTE : « direct » seulement quand la socket est
+   * ouverte. En reconnexion, l'interface dit que les chiffres peuvent être
+   * périmés (règle du projet : pas de faux affichage).
+   */
+  function setLiveStatus(status) {
+    const el = $("live-conn");
+    const labels = { live: "direct", connecting: "connexion…", reconnecting: "reconnexion…", off: "en pause" };
+    const titles = {
+      live: "Flux direct connecté : places et appels en cours poussés par le serveur.",
+      connecting: "Connexion au flux direct en cours…",
+      reconnecting: "Connexion perdue : reprise automatique — les chiffres directs peuvent être périmés.",
+      off: "Le flux direct n'est ouvert que sur l'onglet Activité visible.",
+    };
+    if (!el) return;
+    el.dataset.state = status;
+    const label = el.querySelector(".live-conn-label");
+    if (label) label.textContent = labels[status] || status;
+    el.setAttribute("title", titles[status] || "");
+  }
+
+  /** Ouvre le direct (uniquement si l'onglet Activité est visible et connecté). */
+  function startLive() {
+    if (liveSocket || liveRetryTimer !== null) return;
+    if (!state.authenticated || activeTab !== "activity" || document.hidden) return;
+    if (typeof window.WebSocket !== "function") {
+      setLiveStatus("off");
+      setActivityStatus("Direct indisponible dans ce navigateur.");
+      return;
+    }
+    setLiveStatus(liveRetry > 0 ? "reconnecting" : "connecting");
+    let socket;
+    try {
+      socket = new window.WebSocket(liveSocketUrl());
+    } catch {
+      scheduleLiveReconnect();
+      return;
+    }
+    liveSocket = socket;
+
+    socket.addEventListener("open", () => {
+      if (liveSocket !== socket) return;
+      liveRetry = 0;
+      setLiveStatus("live");
+      // Reprise : le serveur a déjà poussé le `snapshot` ; on relit les
+      // agrégats et « Derniers appels » (aucune ligne perdue pendant la coupure).
+      loadDashboard();
+      startAggregatesRefresh();
+    });
+
+    socket.addEventListener("message", (event) => {
+      if (liveSocket !== socket) return;
+      let frame = null;
+      try {
+        frame = JSON.parse(String(event.data));
+      } catch {
+        return; // frame illisible : ignorée, jamais d'exception qui casse l'UI
+      }
+      applyLiveFrame(frame);
+    });
+
+    socket.addEventListener("close", () => {
+      if (liveSocket !== socket) return;
+      liveSocket = null;
+      stopAggregatesRefresh();
+      if (activeTab === "activity" && !document.hidden) {
+        setLiveStatus("reconnecting");
+        setActivityStatus("Direct interrompu — reprise automatique.");
+        scheduleLiveReconnect();
+      } else {
+        setLiveStatus("off");
+      }
+    });
+
+    socket.addEventListener("error", () => {
+      // `close` suit toujours : la reprise est gérée là-bas (pas de doublon).
+      try {
+        socket.close();
+      } catch {
+        /* déjà fermée */
+      }
+    });
+  }
+
+  /** Reprise automatique avec backoff progressif (plafonné, sans martèlement). */
+  function scheduleLiveReconnect() {
+    if (liveRetryTimer !== null) return;
+    const delay = LIVE_BACKOFF_MS[Math.min(liveRetry, LIVE_BACKOFF_MS.length - 1)];
+    liveRetry += 1;
+    liveRetryTimer = setTimeout(() => {
+      liveRetryTimer = null;
+      startLive();
+    }, delay);
+  }
+
+  /** Ferme le direct (départ d'onglet, page masquée, déconnexion). */
+  function stopLive() {
+    if (liveRetryTimer !== null) {
+      clearTimeout(liveRetryTimer);
+      liveRetryTimer = null;
+    }
+    const socket = liveSocket;
+    liveSocket = null;
+    if (socket) {
+      try {
+        socket.close(1000, "leave");
+      } catch {
+        /* déjà fermée */
+      }
+    }
+    stopAggregatesRefresh();
+    setLiveStatus("off");
+  }
+
+  /** Reprise totale après reconnexion de compte (login) : on repart à zéro. */
+  function resetLive() {
+    stopLive();
+    liveRetry = 0;
+    liveState = null;
+    lastDashboard = null;
+    recentEntries = [];
+    dashHosts = null;
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -2905,6 +3192,9 @@ import {
 
   /** Affiche l'écran de connexion SEUL (aucun contenu applicatif derrière). */
   function showLogin() {
+    // Plus de session : on coupe le direct et on oublie l'état affiché
+    // (aucun chiffre périmé ne doit survivre à une déconnexion).
+    resetLive();
     state.authenticated = false;
     state.passwordIsDefault = false;
     state.csrfToken = null;
@@ -3101,13 +3391,12 @@ import {
     const settingsSave = $("settings-save");
     if (settingsSave) settingsSave.addEventListener("click", () => saveSettings());
 
+    // « Rafraîchir » = relire les AGRÉGATS et rouvrir le direct s'il est tombé.
     const activityReload = $("activity-reload");
-    if (activityReload) activityReload.addEventListener("click", () => loadDashboard());
-    const activityAuto = $("activity-auto");
-    if (activityAuto) {
-      activityAuto.addEventListener("change", () => {
-        if (activityAuto.checked && activeTab === "activity") startDashboardAutoRefresh();
-        else stopDashboardAutoRefresh();
+    if (activityReload) {
+      activityReload.addEventListener("click", () => {
+        loadDashboard();
+        startLive();
       });
     }
 
@@ -3135,16 +3424,26 @@ import {
     }
   }
 
-  /** Onglet porté par l'ancre d'URL (`#settings`), défaut « services ». */
+  /**
+   * Onglet porté par l'ancre d'URL (`#services`, `#providers`, `#settings`) ;
+   * DÉFAUT « activity ». Décision : Activité est la page d'entrée, sauf
+   * préférence explicite exprimée par l'ancre (aucun localStorage d'onglet :
+   * il n'y a donc rien qui puisse forcer un autre onglet silencieusement).
+   */
   function tabFromHash() {
     const hash = (window.location.hash || "").replace(/^#/, "");
-    return hash === "settings" || hash === "providers" || hash === "activity" ? hash : "services";
+    return hash === "services" || hash === "providers" || hash === "settings" ? hash : "activity";
   }
 
-  // Revient sur l'onglet Activité après un passage en arrière-plan : on relit
-  // l'état tout de suite plutôt que d'attendre le prochain tic.
+  // Passage en arrière-plan : on FERME le direct (aucune connexion inutile) ;
+  // au retour, on rouvre et on relit les agrégats immédiatement.
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && activeTab === "activity") loadDashboard();
+    if (document.hidden) {
+      stopLive();
+    } else if (activeTab === "activity") {
+      loadDashboard();
+      startLive();
+    }
   });
 
   wireSession();

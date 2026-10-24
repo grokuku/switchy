@@ -96,13 +96,18 @@ function liveState(active: number, limit: number): LiveState {
   return active >= limit ? "saturated" : "busy";
 }
 
-/** Construit le tableau de bord complet (une seule lecture du journal). */
-export function buildDashboard(now: number = Date.now()): Dashboard {
-  const entries = readAllCallsLog();
+/**
+ * Occupation de CHAQUE fournisseur configuré à l'instant présent (les
+ * fournisseurs sans activité sont présents à zéro).
+ *
+ * SOURCE UNIQUE du bloc « En ce moment » : le tableau de bord complet
+ * (`buildDashboard`) ET le direct WebSocket (`live/hub.ts`) l'appellent, pour
+ * que les deux vues ne puissent jamais diverger.
+ */
+export function collectLiveProviders(): LiveProvider[] {
   const providers = listProviders();
   const states = llmSlots.providerStates(providers.map((provider) => provider.id));
-
-  const liveProviders: LiveProvider[] = providers.map((provider) => {
+  return providers.map((provider) => {
     const state = states[provider.id] ?? { limit: null, active: 0, queued: 0 };
     const limit = provider.maxConcurrency ?? getConcurrency();
     return {
@@ -115,11 +120,21 @@ export function buildDashboard(now: number = Date.now()): Dashboard {
       state: liveState(state.active, limit),
     };
   });
+}
 
-  const live = liveProviders.reduce(
+/** Totaux d'occupation (places actives / en attente, tous fournisseurs). */
+export function collectLiveTotals(providers: LiveProvider[]): { active: number; queued: number } {
+  return providers.reduce(
     (acc, provider) => ({ active: acc.active + provider.active, queued: acc.queued + provider.queued }),
     { active: 0, queued: 0 },
   );
+}
+
+/** Construit le tableau de bord complet (une seule lecture du journal). */
+export function buildDashboard(now: number = Date.now()): Dashboard {
+  const entries = readAllCallsLog();
+  const liveProviders = collectLiveProviders();
+  const live = collectLiveTotals(liveProviders);
 
   // ── Statistiques par clé d'API (nom lisible uniquement) ──
   const knownKeys = listKeys()

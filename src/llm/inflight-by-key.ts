@@ -18,6 +18,7 @@
  * `middleware/api-auth.ts`) : jamais un secret, jamais un hash.
  */
 import { KEY_NAME_UNKNOWN } from "../middleware/api-auth.js";
+import { notifyLiveChange } from "../live/events.js";
 
 const counters = new Map<string, number>();
 
@@ -31,6 +32,8 @@ function normalize(keyName: unknown): string {
 export function beginCall(keyName: string): void {
   const name = normalize(keyName);
   counters.set(name, (counters.get(name) ?? 0) + 1);
+  // Émis APRÈS la mise à jour : le direct relit `inFlightByKey()`.
+  notifyLiveChange();
 }
 
 /** Un appel se termine pour cette clé (à appeler dans un `finally`). */
@@ -39,6 +42,7 @@ export function endCall(keyName: string): void {
   const current = counters.get(name) ?? 0;
   if (current <= 1) counters.delete(name);
   else counters.set(name, current - 1);
+  notifyLiveChange();
 }
 
 /** Appels en vol pour UNE clé (0 si aucun). */

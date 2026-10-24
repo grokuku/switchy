@@ -301,6 +301,70 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-size: 12.5px;
 }
 
+/* ── Indicateur de connexion du DIRECT (WebSocket) ────────────────────── */
+/* ⚠️ Pas de faux affichage : vert UNIQUEMENT quand la socket est ouverte ;
+   en reconnexion, l'indicateur l'annonce explicitement. */
+.live-conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 10px;
+  border: 1px solid var(--switchy-border);
+  border-radius: 999px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--switchy-text-muted);
+  background: var(--switchy-bg-raised);
+  user-select: none;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--switchy-text-muted);
+  flex: 0 0 auto;
+}
+
+.live-conn[data-state="live"] {
+  color: var(--switchy-ok);
+  border-color: color-mix(in srgb, var(--switchy-ok) 45%, var(--switchy-border));
+}
+
+.live-conn[data-state="live"] .live-dot {
+  background: var(--switchy-ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--switchy-ok) 22%, transparent);
+}
+
+.live-conn[data-state="connecting"] {
+  color: var(--switchy-warn);
+  border-color: color-mix(in srgb, var(--switchy-warn) 45%, var(--switchy-border));
+}
+
+.live-conn[data-state="connecting"] .live-dot {
+  background: var(--switchy-warn);
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+
+.live-conn[data-state="reconnecting"] {
+  color: var(--switchy-danger);
+  border-color: color-mix(in srgb, var(--switchy-danger) 50%, var(--switchy-border));
+}
+
+.live-conn[data-state="reconnecting"] .live-dot {
+  background: var(--switchy-danger);
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-conn .live-dot { animation: none; }
+}
+
 /* ── Tableau de bord « Activité » ─────────────────────────────────────── */
 
 .dash {

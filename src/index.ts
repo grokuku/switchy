@@ -29,6 +29,7 @@ import { llmRouter, openaiRouter } from "./routes/llm.js";
 import nativeRouter from "./routes/native.js";
 import callsRouter from "./routes/calls.js";
 import dashboardRouter from "./routes/dashboard.js";
+import { attachActivityWs } from "./live/ws.js";
 
 /** Version du package, lue à côté du point d'entrée (src/ comme dist/). */
 export const version: string = (() => {
@@ -141,7 +142,11 @@ if (isDirectRun) {
     );
   }
   console.log(`[switchy] admin password: ${describeAdminPasswordState()}`);
-  app.listen(port, host, () => {
+  const server = app.listen(port, host, () => {
     console.log(`[switchy] listening on http://${host}:${port} (version ${version})`);
   });
+  // Direct de l'onglet « Activité » : WebSocket `/ws/activity`, même auth que
+  // l'API (session OU clé). Branché sur le serveur HTTP réel — le `upgrade`
+  // n'existe pas dans Express. Les agrégats restent servis par `/api/dashboard`.
+  attachActivityWs(server);
 }
