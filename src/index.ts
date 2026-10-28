@@ -26,6 +26,7 @@ import servicesRouter from "./routes/services.js";
 import settingsRouter from "./routes/settings.js";
 import keysRouter from "./routes/keys.js";
 import { llmRouter, openaiRouter } from "./routes/llm.js";
+import { systemOneRouter, systemOneRootRouter } from "./routes/system-one.js";
 import nativeRouter from "./routes/native.js";
 import callsRouter from "./routes/calls.js";
 import dashboardRouter from "./routes/dashboard.js";
@@ -91,6 +92,11 @@ export function createApp(): express.Express {
   // relais de l'API NATIVE des fournisseurs (découverte des modèles), et
   // consultation du journal d'appels.
   app.use("/api/llm", requireApiAuth, llmRouter);
+  // Second TYPE D'API, géré NATIVEMENT (aucune conversion vers le chat) :
+  // `POST /api/system/:service` et `POST /v1/systemone` (`model` = nom du
+  // service). Même auth, même journal, mêmes replis que le relais chat.
+  app.use("/api/system", requireApiAuth, systemOneRouter);
+  app.use("/v1/systemone", requireApiAuth, systemOneRootRouter);
   // `/v1` = surface compatible OpenAI : POST /chat/completions (relais) ET
   // GET /models + GET /models/:id (liste des services activés). Un SEUL routeur
   // monté : aucun ordre de handler à surveiller entre les deux familles.

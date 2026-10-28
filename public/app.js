@@ -879,6 +879,7 @@ import {
     const dl = h("dl", { class: "kv" });
     dl.append(h("div", null, h("dt", { text: "/v1" }), h("dd", { text: p.baseUrl })));
     if (p.nativeUrl) dl.append(h("div", null, h("dt", { text: "native" }), h("dd", { text: p.nativeUrl })));
+    if (p.systemOneUrl) dl.append(h("div", null, h("dt", { text: "system one" }), h("dd", { text: p.systemOneUrl })));
     dl.append(
       h(
         "div",
@@ -930,6 +931,18 @@ import {
     nativeInput.setAttribute("placeholder", "https://ollama.com/api");
     form.append(field("URL native (optionnelle)", nativeInput, "Découverte des modèles (ex. Ollama /api/tags)"));
 
+    // API System One : chemin DÉDIÉ (facultatif). Vide = dérivé de l'URL /v1
+    // ci-dessus (`…/v1` → `…/v1/systemone`), ce qui couvre ollama.com.
+    const systemOneInput = inputText(editing ? provider.systemOneUrl || "" : "");
+    systemOneInput.setAttribute("placeholder", "dérivée (…/v1/systemone)");
+    form.append(
+      field(
+        "URL System One (optionnelle)",
+        systemOneInput,
+        "Décisions typées (state + questions). Laisser vide = déduite de l'URL /v1.",
+      ),
+    );
+
     // Limite de concurrence DU COMPTE (la limite appartient au fournisseur).
     const concurrencyInput = inputNumber(
       editing && provider.maxConcurrency !== undefined && provider.maxConcurrency !== null ? provider.maxConcurrency : "",
@@ -975,6 +988,7 @@ import {
           type: typeSelect.value,
           baseUrl: baseInput.value.trim(),
           nativeUrl: nativeInput.value.trim(),
+          systemOneUrl: systemOneInput.value.trim(),
           enabled: enabledBox.input.checked,
         };
         const mcRaw = concurrencyInput.value.trim();

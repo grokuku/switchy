@@ -43,7 +43,9 @@ Liveness, aligné sur les autres services de l'écosystème. Public, sans clé.
 
 **Fournisseur** : `id`, `label`, `type` (`openai-compatible` \| `ollama-native` \|
 `anthropic` \| `google`), `baseUrl` (URL `/v1`), `nativeUrl?` (URL native, ex.
-Ollama `/api/tags`), **`maxConcurrency?`** (appels simultanés du **compte** ;
+Ollama `/api/tags`), `systemOneUrl?` (URL **complète** de l'endpoint System One ;
+absente = dérivée de `baseUrl` : `…/v1` → `…/v1/systemone`),
+**`maxConcurrency?`** (appels simultanés du **compte** ;
 absent = défaut global `SWITCHY_CONCURRENCY`, min 1 — `0` refusé),
 `apiKey` (**secret**), `enabled`.
 
@@ -163,6 +165,49 @@ d'authentification** (`401`, `403`) : une clé invalide/expirée ne sera pas val
 chez le fournisseur suivant, et basculer vers un repli payant masquerait un
 simple problème de configuration. L'échec est alors relayé tel quel et
 journalisé avec `reason: "auth_error"`.
+
+## API « System One » — `/api/system/:service` et `/v1/systemone`
+
+Second **type d'API**, géré **nativement** : ce n'est pas du chat. Le client
+envoie un `state` (texte ou JSON) et un **schéma de questions typées** ; le
+modèle de décision (ex. `clef`, Ollama Cloud) rend une décision par question en
+une passe, sans générer de texte.
+
+| Méthode | Chemin | Effet |
+| --- | --- | --- |
+| `POST` | `/api/system/:service` | Relais pour le service nommé (canonique) |
+| `POST` | `/v1/systemone` | Même chemin que le fournisseur, `model` = nom du service |
+
+**Corps relayé TEL QUEL** (contrat Ollama `POST /v1/systemone`) :
+
+```json
+{
+  "model": "triage",
+  "state": { "ticket": "…" },
+  "questions": {
+    "team":    { "type": "choice", "instructions": "…", "criteria": { "billing": "…", "technical": "…" } },
+    "refund":  { "type": "noul", "instructions": "…" },
+    "urgency": { "type": "score", "instructions": "…", "criteria": ["Routine", "Soon", "Urgent"] }
+  }
+}
+```
+
+- **seul `model` est remplacé** (par le modèle réel de l'étape du service) ;
+- `state`, `questions`, `images?`, `keep_alive?` passent inchangés ; aucune
+  conversion vers/du format chat ;
+- **aucun contrôle de génération** n'est ajouté (`reasoning_effort` compris) :
+  le fournisseur les refuse (`400`) ;
+- **pas de streaming** (la doc Ollama ne le prévoit pas) : la réponse est un
+  unique corps JSON `{ model, answers, usage }`, relayé sans transformation ;
+- l'auth, les clés (jamais celle du client), la concurrence par fournisseur, les
+  replis, l'affinité, le mode rolling, `keyName`, le journal et le tableau de
+  bord sont **ceux du relais chat** ;
+- le **journal ne contient ni `state` ni `questions`** (contenu utilisateur),
+  seulement les métadonnées habituelles.
+
+Validation locale (`400 VALIDATION_ERROR`) : `state` non vide, `questions`
+(1 à 64) avec `type` ∈ `choice`/`noul`/`score` et `instructions` non vides,
+`score` à 2–10 niveaux, `choice` à au moins 2 options.
 
 ## Interface web
 

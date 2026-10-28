@@ -41,10 +41,28 @@ import { llmSlots, QueueFullError, QueueTimeoutError } from "./slot-queue.js";
 
 // ── Entrées / sorties ──
 
+/**
+ * TYPE D'API amont géré nativement par le relais.
+ *
+ *   - `chat`       : API « chat completions » OpenAI-compatible
+ *                    (`POST {baseUrl}/chat/completions`) — historique ;
+ *   - `systemone`  : API « System One » d'Ollama (`POST {baseUrl}/v1/systemone`,
+ *                    voir `systemOneEndpointUrl`). Corps `{ model, state,
+ *                    questions, images?, keep_alive? }` relayé TEL QUEL ; aucun
+ *                    `reasoning_effort`, aucune normalisation de messages, aucun
+ *                    streaming (la doc Ollama est explicite : « Returns one JSON
+ *                    response; streaming, video, tools, and generation controls
+ *                    are not supported »).
+ *
+ * Aucune conversion n'est faite d'un type vers l'autre : un appel System One
+ * n'est JAMAIS transformé en appel chat, et réciproquement.
+ */
+export type RelayApi = "chat" | "systemone";
+
 export interface RelayInput {
   /** Nom du service dans le catalogue. */
   serviceName: string;
-  /** Corps OpenAI-compatible du client (déjà parsé). Seul `model` sera remplacé. */
+  /** Corps du client (déjà parsé). Seul `model` sera remplacé. */
   body: Record<string, unknown>;
   /** En-têtes de la requête client (filtrés avant émission). */
   headers: IncomingHttpHeaders;
@@ -57,6 +75,8 @@ export interface RelayInput {
    * tel quel pour les statistiques par clé. ⚠️ Jamais un secret.
    */
   keyName?: string;
+  /** Type d'API amont (défaut `chat`). Voir `RelayApi`. */
+  api?: RelayApi;
 }
 
 export interface RelayOutput {
@@ -180,12 +200,16 @@ function positiveInt(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
 }
 
-/** Normalise un objet `usage` fournisseur (OpenAI `/v1` ou Ollama natif). */
+/** Normalise un objet `usage` fournisseur (OpenAI `/v1`, Ollama natif, System One). */
 export function normalizeUsage(raw: unknown): CallLogTokens | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const obj = raw as Record<string, unknown>;
-  const promptTokens = positiveInt(obj.prompt_tokens) ?? positiveInt(obj.prompt_eval_count);
-  const completionTokens = positiveInt(obj.completion_tokens) ?? positiveInt(obj.eval_count);
+  // System One (`{"input_tokens":332,"output_tokens":0}`) : noms snake_case
+  // distincts de ceux d'OpenAI — traités au même titre, jamais devinés.
+  const promptTokens =
+    positiveInt(obj.prompt_tokens) ?? positiveInt(obj.prompt_eval_count) ?? positiveInt(obj.input_tokens);
+  const completionTokens =
+    positiveInt(obj.completion_tokens) ?? positiveInt(obj.eval_count) ?? positiveInt(obj.output_tokens);
   const totalTokens = positiveInt(obj.total_tokens);
   // Tokens de RÉFLEXION : détaillés par certains fournisseurs (OpenAI/OpenRouter/
   // DeepSeek) sous `completion_tokens_details.reasoning_tokens`. Absent = le
@@ -331,8 +355,35 @@ function joinUrl(baseUrl: string, suffix: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${suffix}`;
 }
 
-function wantsStream(body: Record<string, unknown>): boolean {
-  return body.stream === true;
+/**
+ * URL de l'endpoint « System One » d'un fournisseur.
+ *
+ *   - `provider.systemOneUrl` renseigné → il FAIT FOI (chemin dédié) ;
+ *   - sinon DÉRIVÉ de `baseUrl` : `https://ollama.com/v1` →
+ *     `https://ollama.com/v1/systemone`, `http://localhost:11434` →
+ *     `http://localhost:11434/v1/systemone`.
+ *
+ * La dérivation ne touche à rien d'autre : un fournisseur qui n'utilise pas
+ * System One n'est jamais appelé par ce chemin (voir `RelayApi`).
+ */
+export function systemOneEndpointUrl(provider: ProviderRecord): string {
+  if (provider.systemOneUrl) return provider.systemOneUrl;
+  const base = provider.baseUrl.replace(/\/+$/, "");
+  return base.endsWith("/v1") ? `${base}/systemone` : `${base}/v1/systemone`;
+}
+
+/** URL réellement appelée pour le type d'API demandé. */
+export function upstreamUrl(provider: ProviderRecord, api: RelayApi = "chat"): string {
+  return api === "systemone" ? systemOneEndpointUrl(provider) : joinUrl(provider.baseUrl, "chat/completions");
+}
+
+/**
+ * Le client demande-t-il un flux SSE ?
+ * ⚠️ System One ne streame JAMAIS (doc Ollama) : la réponse est un unique corps
+ * JSON, même si le client a mis `stream: true`. Le relais ne trame donc pas.
+ */
+function wantsStream(body: Record<string, unknown>, api: RelayApi = "chat"): boolean {
+  return api === "chat" && body.stream === true;
 }
 
 interface StepParams {
@@ -347,6 +398,8 @@ interface StepParams {
   prioritaire: boolean;
   signal: AbortSignal | undefined;
   endpoint: string | undefined;
+  /** Type d'API amont (`chat` par défaut). */
+  api?: RelayApi;
   /** Nom de la clé appelante (voir `RelayInput.keyName`). */
   keyName: string | undefined;
   /**
@@ -366,24 +419,33 @@ type StepOutcome =
   | { ok: false; saturated: true };
 
 /**
- * Corps RÉELLEMENT envoyé au fournisseur : copie du corps client, `model`
- * remplacé par celui de l'étape courante, puis le niveau de réflexion du
- * service IMPOSÉ (`reasoning_effort`) — y compris quand il vaut `off`, qui doit
- * sortir en `"none"` (sinon Ollama réactive la réflexion : contrôle fantôme).
+ * Corps RÉELLEMENT envoyé au fournisseur. Deux régimes, JAMAIS mélangés :
  *
- * ⚠️ RÈGLE D'ARBITRAGE (décision utilisateur) : Switchy est le point de contrôle
- * central, il IMPOSE toujours son niveau et ÉCRASE la valeur du client. Le corps
- * n'est laissé intact que si le service ne définit AUCUN niveau (`step.reasoning`
- * absent) — c'est alors le mode pass-through.
+ *  - `api: "chat"` (défaut) : copie du corps client, `model` remplacé par celui
+ *    de l'étape courante, puis le niveau de réflexion du service IMPOSÉ
+ *    (`reasoning_effort`) — y compris quand il vaut `off`, qui doit sortir en
+ *    `"none"` (sinon Ollama réactive la réflexion : contrôle fantôme).
+ *    ⚠️ RÈGLE D'ARBITRAGE (décision utilisateur) : Switchy est le point de
+ *    contrôle central, il IMPOSE toujours son niveau et ÉCRASE la valeur du
+ *    client. Le corps n'est laissé intact que si le service ne définit AUCUN
+ *    niveau (`step.reasoning` absent) — c'est alors le mode pass-through.
+ *    Petit plus : le rôle `developer` est neutralisé pour un fournisseur Ollama
+ *    (sinon HTTP 400).
  *
- * Petit plus : le rôle `developer` est neutralisé pour un fournisseur Ollama
- * (sinon HTTP 400).
+ *  - `api: "systemone"` : PASSTHROUGH STRICT — copie du corps client au SEUL
+ *    champ `model` remplacé. `state`, `questions`, `images`, `keep_alive` sont
+ *    transmis tels quels (aucune conversion vers des messages de chat). Le
+ *    fournisseur refuse par 400 les contrôles de génération : on n'en ajoute
+ *    donc AUCUN (`reasoning_effort` compris), et `step.reasoning` est IGNORÉ
+ *    pour ce type d'API.
  */
 export function buildUpstreamBody(
   body: Record<string, unknown>,
   step: ServiceStep,
   provider: ProviderRecord,
+  api: RelayApi = "chat",
 ): Record<string, unknown> {
+  if (api === "systemone") return { ...body, model: step.model };
   const out: Record<string, unknown> = { ...body, model: step.model };
   if (isReasoningLevel(step.reasoning)) {
     out.reasoning_effort = reasoningWireValue(step.reasoning, provider);
@@ -396,6 +458,8 @@ export function buildUpstreamBody(
 async function attemptStep(params: StepParams): Promise<StepOutcome> {
   const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint, keyName } = params;
   const acquireMode = params.acquireMode ?? "wait";
+  const api: RelayApi = params.api ?? "chat";
+  const stream = wantsStream(body, api);
   const startedAt = Date.now();
 
   // Slot du seau DU FOURNISSEUR : sa `maxConcurrency` (ou le défaut global)
@@ -445,7 +509,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
           reason: "saturated",
           charge: true,
           durationMs: 0,
-          stream: wantsStream(body),
+          stream,
         });
         return { ok: false, saturated: true };
       }
@@ -454,10 +518,10 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
       slotKey = await llmSlots.acquire(request);
     }
     attemptSignal.throwIfAborted();
-    const upstream = await fetch(joinUrl(provider.baseUrl, "chat/completions"), {
+    const upstream = await fetch(upstreamUrl(provider, api), {
       method: "POST",
       headers: buildUpstreamHeaders(provider, headers),
-      body: JSON.stringify(buildUpstreamBody(body, step, provider)),
+      body: JSON.stringify(buildUpstreamBody(body, step, provider, api)),
       signal: attemptSignal,
     });
     const responseHeaders = filterResponseHeaders(upstream.headers);
@@ -473,7 +537,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
         reason,
         error: fallbackable ? "upstream_error" : reason === "auth_error" ? "upstream_auth_error" : "upstream_rejected_request",
         durationMs: Date.now() - startedAt,
-        stream: wantsStream(body),
+        stream,
       });
       release();
       return {
@@ -483,7 +547,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
       };
     }
 
-    const streaming = wantsStream(body) || (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+    const streaming = stream || (api === "chat" && (upstream.headers.get("content-type") ?? "").includes("text/event-stream"));
     if (streaming && upstream.body) {
       const payload = instrumentStream(upstream.body, () => attemptSignal.aborted, (report) => {
         logCall({
@@ -520,7 +584,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
       result: aborted ? "aborted" : "error",
       ...(aborted ? {} : { error: err instanceof Error ? err.message : String(err), reason: "network_error" as const }),
       durationMs: Date.now() - startedAt,
-      stream: wantsStream(body),
+      stream,
     });
     release();
     if (aborted) {
@@ -721,6 +785,7 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
         prioritaire,
         signal: input.signal,
         endpoint: input.endpoint,
+        api: input.api ?? "chat",
         keyName: input.keyName,
         acquireMode,
         charge: loadSkips > 0,
@@ -776,13 +841,15 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
 }
 
 /**
- * Relaie un appel « chat completions » pour un service nommé :
- * principal → replis, avec comptage PAR FOURNISSEUR et journalisation de CHAQUE
- * tentative. Jette `ApiError` (service inconnu/désactivé), `QueueFullError` /
+ * Relaie un appel vers un service nommé : principal → replis, avec comptage
+ * PAR FOURNISSEUR et journalisation de CHAQUE tentative. Le TYPE d'API est
+ * donné par `input.api` (`chat` par défaut) — voir `RelayApi`.
+ *
+ * Jette `ApiError` (service inconnu/désactivé), `QueueFullError` /
  * `QueueTimeoutError` (429 côté route) ou `UpstreamFailure` (dernier échec à
  * relayer tel quel).
  */
-export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> {
+export async function relayService(input: RelayInput): Promise<RelayOutput> {
   const service = getService(input.serviceName);
   if (!service) throw ApiError.notFound(`service "${input.serviceName}" not found`);
   if (!service.enabled) {
@@ -795,6 +862,14 @@ export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> 
   const run = await runServiceChain(service, input);
   if (run.output) return run.output;
   throw run.failure ?? new UpstreamFailure(503, {}, jsonErrorBody("relay failed", "NO_PROVIDER"));
+}
+
+/**
+ * Relaie un appel « chat completions » pour un service nommé (raccourci
+ * historique de `relayService` en `api: "chat"`).
+ */
+export async function relayServiceChat(input: RelayInput): Promise<RelayOutput> {
+  return relayService({ ...input, api: "chat" });
 }
 
 // ── Test d'UNE étape (interface « Tester », diagnostic de configuration) ──

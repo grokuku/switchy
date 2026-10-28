@@ -92,6 +92,17 @@ export interface ProviderRecord {
   /** URL de l'API NATIVE du fournisseur (ex. Ollama `/api/tags`) — optionnelle. */
   nativeUrl?: string;
   /**
+   * URL COMPLÈTE de l'endpoint « System One » du fournisseur — optionnelle.
+   *
+   * Motif : l'API System One (`POST /v1/systemone`, doc Ollama) n'est pas un
+   * chemin OpenAI-compatible : elle ne se déduit pas toujours de `baseUrl`.
+   * Quand ce champ est renseigné, il FAIT FOI (ex. `https://ollama.com/v1/systemone`).
+   * Sinon l'URL est DÉRIVÉE de `baseUrl` (`…/v1` → `…/v1/systemone`, sinon
+   * `…/v1/systemone` ajouté au chemin), voir `systemOneEndpointUrl`
+   * (`src/llm/relay.ts`). Les fournisseurs existants ne sont donc PAS impactés.
+   */
+  systemOneUrl?: string;
+  /**
    * Nombre d'appels SIMULTANÉS autorisés pour le COMPTE de ce fournisseur
    * (ex. 3 pour Ollama Cloud Pro, 500 pour un OpenRouter payant…). Absent =
    * valeur par défaut globale `SWITCHY_CONCURRENCY`. C'est LE bon endroit : la
@@ -368,6 +379,27 @@ function requireUrl(value: unknown, field: string, errors: string[]): string | n
   return str;
 }
 
+/**
+ * Valide une URL ABSOLUE optionnelle (`nativeUrl`, `systemOneUrl`).
+ * `undefined`/`null`/chaîne vide = non fourni → `undefined` ; une chaîne non
+ * vide doit être une URL absolue http(s), sinon une erreur est ajoutée.
+ */
+function validateOptionalUrl(value: unknown, field: string, errors: string[]): string | undefined {
+  const raw = optionalString(value, field, errors, 500);
+  if (!raw) return undefined;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      errors.push(`${field}: must use http or https`);
+      return undefined;
+    }
+    return raw;
+  } catch {
+    errors.push(`${field}: must be a valid absolute URL`);
+    return undefined;
+  }
+}
+
 /** Valide une étape (principal ou repli) : providerId existant + modèle + réflexion. */
 function validateStep(
   value: unknown,
@@ -465,6 +497,7 @@ export function createProvider(input: unknown): ProviderRecord {
       errors.push("nativeUrl: must be a valid absolute URL");
     }
   }
+  const systemOneUrl = validateOptionalUrl(body.systemOneUrl, "systemOneUrl", errors);
   const enabled = body.enabled === undefined ? true : requireBoolean(body.enabled, "enabled", errors);
   const maxConcurrency = optionalMaxConcurrency(body.maxConcurrency, "maxConcurrency", errors);
 
@@ -482,6 +515,7 @@ export function createProvider(input: unknown): ProviderRecord {
     type: type as ProviderType,
     baseUrl: baseUrl as string,
     ...(nativeUrl ? { nativeUrl } : {}),
+    ...(systemOneUrl ? { systemOneUrl } : {}),
     ...(typeof maxConcurrency === "number" ? { maxConcurrency } : {}),
     enabled: enabled as boolean,
     createdAt: now,
@@ -533,6 +567,14 @@ export function updateProvider(id: string, input: unknown): ProviderRecord {
       } catch {
         errors.push("nativeUrl: must be a valid absolute URL");
       }
+    }
+  }
+  if (body.systemOneUrl !== undefined) {
+    // Même sémantique que `nativeUrl` : null/"" efface, une valeur valide remplace.
+    if (body.systemOneUrl === null || body.systemOneUrl === "") delete next.systemOneUrl;
+    else {
+      const raw = validateOptionalUrl(body.systemOneUrl, "systemOneUrl", errors);
+      if (raw) next.systemOneUrl = raw;
     }
   }
   if (body.maxConcurrency !== undefined) {
