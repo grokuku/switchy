@@ -60,69 +60,119 @@
        affiché tant que la session n'est pas valide : `#app-shell` est masqué
        par défaut et app.js ne le révèle qu'après une session authentifiée. -->
   <div class="login-screen" id="login-screen">
+    <!-- Décor : deux halos dérivés de l'accent (aucune couleur en dur). -->
+    <div class="login-aurora" aria-hidden="true">
+      <span class="login-halo login-halo--a"></span>
+      <span class="login-halo login-halo--b"></span>
+    </div>
+
     <div class="login-card">
       <div class="login-brand">
-        <span class="brand-mark" aria-hidden="true">S</span>
+        <span class="brand-mark brand-mark--lg" aria-hidden="true">S</span>
         <div class="brand-text">
           <h1>Switchy</h1>
-          <p>Passerelle LLM — connexion</p>
+          <p>Passerelle LLM</p>
         </div>
       </div>
+
+      <h2 class="login-title">Connexion</h2>
+      <p class="login-sub">Un seul mot de passe protège la configuration : fournisseurs,
+        services nommés et clés d'API.</p>
+
       <form id="login-form" class="login-form" autocomplete="on">
         <div class="field field--grow">
           <label for="login-password">Mot de passe administrateur</label>
-          <input type="password" id="login-password" name="password"
-                 autocomplete="current-password" required autofocus />
+          <div class="reveal-wrap">
+            <input type="password" id="login-password" name="password"
+                   autocomplete="current-password" required autofocus
+                   placeholder="••••••••" />
+            <button type="button" class="reveal" id="login-reveal"
+                    aria-pressed="false" aria-label="Afficher le mot de passe"
+                    title="Afficher le mot de passe">
+              <svg class="reveal-icon reveal-icon--show" viewBox="0 0 24 24" aria-hidden="true"
+                   focusable="false" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z" />
+                <circle cx="12" cy="12" r="2.6" />
+              </svg>
+              <svg class="reveal-icon reveal-icon--hide" viewBox="0 0 24 24" aria-hidden="true"
+                   focusable="false" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 3l18 18" />
+                <path d="M10.6 5.7A10.9 10.9 0 0 1 12 5.5c6.4 0 10 6.5 10 6.5a17.9 17.9 0 0 1-3.4 4.3" />
+                <path d="M6.2 7.8A16.6 16.6 0 0 0 2 12s3.6 6.5 10 6.5a10.8 10.8 0 0 0 3.2-.5" />
+                <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+              </svg>
+            </button>
+          </div>
         </div>
-        <button type="submit" class="btn btn--accent" id="login-submit">Se connecter</button>
+        <button type="submit" class="btn btn--accent btn--block login-submit" id="login-submit">
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="login-submit-label">Se connecter</span>
+        </button>
       </form>
+
       <p class="login-error" id="login-error" role="alert" hidden></p>
+
       <p class="muted login-hint">Au tout premier démarrage, le mot de passe par défaut est
         <code>admin</code> — changez-le dès la connexion, dans l'onglet Réglages.
         Il n'est valable que tant qu'aucun mot de passe n'a été enregistré ; sinon,
         voir « Mot de passe administrateur » au README (réinitialisation).</p>
+
+      <p class="login-foot muted">Port 3008 · session locale signée</p>
     </div>
   </div>
 
   <div id="app-shell" hidden>
   <header class="topbar">
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true">S</span>
-      <div class="brand-text">
-        <h1>Switchy</h1>
-        <p>Passerelle LLM — services nommés, replis &amp; journal</p>
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <div class="brand-text">
+          <h1>Switchy</h1>
+          <p>Passerelle LLM — services nommés</p>
+        </div>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="Sections de l'interface">
+        <!-- Activité = PAGE D'ENTRÉE (état initial, pas un clic simulé). -->
+        <button type="button" class="tab is-active" role="tab" id="tab-activity"
+                data-tab="activity" aria-selected="true" aria-controls="panel-activity">
+          Activité
+        </button>
+        <button type="button" class="tab" role="tab" id="tab-services"
+                data-tab="services" aria-selected="false" aria-controls="panel-services">
+          Services
+        </button>
+        <button type="button" class="tab" role="tab" id="tab-providers"
+                data-tab="providers" aria-selected="false" aria-controls="panel-providers">
+          Fournisseurs
+        </button>
+        <button type="button" class="tab" role="tab" id="tab-settings"
+                data-tab="settings" aria-selected="false" aria-controls="panel-settings">
+          Réglages
+        </button>
+      </nav>
+
+      <div class="topbar-end">
+        <!-- Pilule « direct » : état réel de la socket /ws/activity (jamais un
+             faux vert — voir setLiveStatus dans app.js). -->
+        <span class="live-conn" id="live-conn" data-state="off">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span class="live-conn-label">en pause</span>
+        </span>
+
+        <!-- Sélecteur de thème (familles × mode) : rempli par app.js depuis
+             HolafTokens.listFamilies(). Masqué tant que la brique n'est pas là. -->
+        <div class="theme-control" id="theme-control" hidden>
+          <label class="sr-only" for="theme-family">Famille de thème</label>
+          <select id="theme-family" name="theme-family"></select>
+          <button type="button" id="theme-toggle" class="theme-toggle"
+                  aria-label="Basculer entre clair et sombre"
+                  title="Basculer entre clair et sombre"></button>
+        </div>
       </div>
     </div>
-
-    <!-- Sélecteur de thème (familles × mode) : rempli par app.js depuis
-         HolafTokens.listFamilies(). Masqué tant que la brique n'est pas là. -->
-    <div class="theme-control" id="theme-control" hidden>
-      <label class="sr-only" for="theme-family">Famille de thème</label>
-      <select id="theme-family" name="theme-family"></select>
-      <button type="button" id="theme-toggle" class="theme-toggle"
-              aria-label="Basculer entre clair et sombre"
-              title="Basculer entre clair et sombre"></button>
-    </div>
-
-    <nav class="tabs" role="tablist" aria-label="Sections de l'interface">
-      <!-- Activité = PAGE D'ENTRÉE (état initial, pas un clic simulé). -->
-      <button type="button" class="tab is-active" role="tab" id="tab-activity"
-              data-tab="activity" aria-selected="true" aria-controls="panel-activity">
-        Activité
-      </button>
-      <button type="button" class="tab" role="tab" id="tab-services"
-              data-tab="services" aria-selected="false" aria-controls="panel-services">
-        Services
-      </button>
-      <button type="button" class="tab" role="tab" id="tab-providers"
-              data-tab="providers" aria-selected="false" aria-controls="panel-providers">
-        Fournisseurs
-      </button>
-      <button type="button" class="tab" role="tab" id="tab-settings"
-              data-tab="settings" aria-selected="false" aria-controls="panel-settings">
-        Réglages
-      </button>
-    </nav>
   </header>
 
   <main class="content">
@@ -184,21 +234,18 @@
     <!-- ── Activité (tableau de bord, temps réel) ───────────────────────── -->
     <section class="panel" id="panel-activity" role="tabpanel" aria-labelledby="tab-activity">
       <header class="panel-head">
-        <h2>Activité</h2>
-        <p class="panel-hint">État de la concurrence <strong>en direct</strong> (places
-          occupées, appels en cours, nouvelles lignes d'appel), chiffres des 24 dernières
-          heures et consommation de tokens. Le direct est poussé par le serveur ; les
-          chiffres 24 h se rafraîchissent toutes les 30 s et à chaque retour sur cet onglet.</p>
+        <div class="panel-head-text">
+          <h2>Activité</h2>
+          <p class="panel-hint">État de la concurrence <strong>en direct</strong>, chiffres
+            des 24 dernières heures et consommation de tokens. Le direct est poussé par le
+            serveur ; les chiffres 24 h se rafraîchissent toutes les 30 s et à chaque retour
+            sur cet onglet.</p>
+        </div>
+        <div class="panel-head-actions">
+          <span class="toolbar-status" id="activity-status" role="status" aria-live="polite"></span>
+          <button type="button" class="btn" id="activity-reload">Rafraîchir</button>
+        </div>
       </header>
-
-      <div class="toolbar">
-        <span class="live-conn" id="live-conn" data-state="off">
-          <span class="live-dot" aria-hidden="true"></span>
-          <span class="live-conn-label">en pause</span>
-        </span>
-        <span class="toolbar-status" id="activity-status" role="status" aria-live="polite"></span>
-        <button type="button" class="btn" id="activity-reload">Rafraîchir</button>
-      </div>
 
       <p class="empty" id="activity-empty" hidden>Chargement…</p>
       <div class="dash" id="dashboard"></div>
@@ -240,65 +287,87 @@
 
       <!-- Bandeau rouge : visible tant que le mot de passe admin est le défaut. -->
       <div class="banner banner--danger" id="default-password-banner" role="alert" hidden>
-        <strong>Mot de passe administrateur par défaut.</strong>
-        <span>Les actions sensibles (gestion des clés, modification des fournisseurs,
-          des services et des réglages) sont bloquées tant que le mot de passe n'a pas
-          été changé. Utilisez « Changer le mot de passe » ci-dessous.</span>
+        <span class="banner-mark" aria-hidden="true">!</span>
+        <div class="banner-body">
+          <strong>Mot de passe administrateur par défaut.</strong>
+          <span>Les actions sensibles (gestion des clés, modification des fournisseurs,
+            des services et des réglages) sont bloquées tant que le mot de passe n'a pas
+            été changé. Utilisez « Changer le mot de passe » ci-dessous.</span>
+        </div>
       </div>
 
       <!-- Session administrateur (la connexion se fait sur l'écran d'entrée) -->
       <section class="card" id="session-card">
-        <h3 class="card-title">Session administrateur</h3>
-        <p class="session-line">
-          <span class="badge badge--ok">Connecté</span>
-          <button type="button" class="btn btn--ghost" id="logout-btn">Déconnexion</button>
-        </p>
-        <details class="disclosure" id="password-change">
-          <summary>Changer le mot de passe</summary>
-          <form id="password-form" class="form-col">
-            <div class="field">
-              <label for="pwd-current">Mot de passe actuel</label>
-              <input type="password" id="pwd-current" autocomplete="current-password" required />
-            </div>
-            <div class="field">
-              <label for="pwd-next">Nouveau mot de passe</label>
-              <input type="password" id="pwd-next" autocomplete="new-password" required minlength="4" />
-            </div>
-            <div class="field">
-              <label for="pwd-confirm">Confirmer le nouveau mot de passe</label>
-              <input type="password" id="pwd-confirm" autocomplete="new-password" required minlength="4" />
-            </div>
-            <button type="submit" class="btn btn--accent">Changer le mot de passe</button>
-          </form>
-        </details>
+        <header class="card-h">
+          <h3 class="card-title">Session administrateur</h3>
+        </header>
+        <div class="card-b">
+          <p class="session-line">
+            <span class="badge badge--ok">Connecté</span>
+            <span class="muted session-note">La session expire avec le navigateur.</span>
+            <button type="button" class="btn btn--ghost" id="logout-btn">Déconnexion</button>
+          </p>
+          <details class="disclosure" id="password-change">
+            <summary>Changer le mot de passe</summary>
+            <form id="password-form" class="form-col">
+              <div class="form-cols">
+                <div class="field">
+                  <label for="pwd-current">Mot de passe actuel</label>
+                  <input type="password" id="pwd-current" autocomplete="current-password" required />
+                </div>
+                <div class="field">
+                  <label for="pwd-next">Nouveau mot de passe</label>
+                  <input type="password" id="pwd-next" autocomplete="new-password" required minlength="4" />
+                </div>
+                <div class="field">
+                  <label for="pwd-confirm">Confirmer le nouveau mot de passe</label>
+                  <input type="password" id="pwd-confirm" autocomplete="new-password" required minlength="4" />
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="btn btn--accent">Changer le mot de passe</button>
+              </div>
+            </form>
+          </details>
+        </div>
       </section>
 
       <!-- Clés d'API serveur -->
       <section class="card" id="keys-card">
-        <h3 class="card-title">Clés d'API</h3>
-        <p class="muted">Clés nommées et révocables. Le secret complet n'est
-          affiché qu'une seule fois, à la création — conservez-le en lieu sûr.</p>
-        <form id="key-form" class="form-row">
-          <div class="field field--grow">
-            <label for="key-name">Nom de la nouvelle clé</label>
-            <input type="text" id="key-name" autocomplete="off" placeholder="ex. pi-web" />
-          </div>
-          <button type="submit" class="btn btn--accent">Créer la clé</button>
-        </form>
-        <p class="empty" id="keys-empty" hidden>Aucune clé pour l'instant.</p>
-        <ul class="list" id="keys-list"></ul>
+        <header class="card-h">
+          <h3 class="card-title">Clés d'API</h3>
+          <span class="card-h-meta">secret affiché une seule fois</span>
+        </header>
+        <div class="card-b">
+          <p class="muted">Clés nommées et révocables. Le secret complet n'est
+            affiché qu'une seule fois, à la création — conservez-le en lieu sûr.</p>
+          <form id="key-form" class="form-row">
+            <div class="field field--grow">
+              <label for="key-name">Nom de la nouvelle clé</label>
+              <input type="text" id="key-name" autocomplete="off" placeholder="ex. pi-web" />
+            </div>
+            <button type="submit" class="btn btn--accent">Créer la clé</button>
+          </form>
+          <p class="empty" id="keys-empty" hidden>Aucune clé pour l'instant.</p>
+          <ul class="list" id="keys-list"></ul>
+        </div>
       </section>
 
       <!-- Paramètres globaux -->
       <section class="card" id="settings-card">
-        <h3 class="card-title">Paramètres</h3>
-        <p class="muted">Valeurs résolues par <code>env&nbsp;→&nbsp;fichier&nbsp;→&nbsp;défaut</code>.
-          Un réglage fourni par l'environnement (badge <em>env</em>) est en lecture seule.
-          Les secrets ne sont jamais réaffichés.</p>
-        <div id="settings-form"></div>
-        <div class="form-actions">
-          <button type="button" class="btn btn--accent" id="settings-save">Enregistrer</button>
+        <header class="card-h">
+          <h3 class="card-title">Paramètres</h3>
+          <span class="card-h-meta">env → fichier → défaut</span>
+        </header>
+        <div class="card-b">
+          <p class="muted">Valeurs résolues par <code>env&nbsp;→&nbsp;fichier&nbsp;→&nbsp;défaut</code>.
+            Un réglage fourni par l'environnement (badge <em>env</em>) est en lecture seule.
+            Les secrets ne sont jamais réaffichés.</p>
+          <div id="settings-form"></div>
         </div>
+        <footer class="card-f">
+          <button type="button" class="btn btn--accent" id="settings-save">Enregistrer</button>
+        </footer>
       </section>
     </section>
   </main>

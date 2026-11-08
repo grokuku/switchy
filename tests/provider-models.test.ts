@@ -207,3 +207,25 @@ describe("capacités d'un modèle", () => {
     expect(sent.model).toBe("vendor/model-x");
   });
 });
+
+describe("compteur de modèles exposé", () => {
+  it("fournisseur avec 3 modèles → modelCount: 3 (aucun identifiant dans la réponse)", async () => {
+    await seedOpenAi();
+    mock = installMockFetch(() => jsonResponse({ data: [{ id: 'gpt-x' }, { id: 'gpt-y' }, { id: 'gpt-z' }] }));
+    await api(env.app).get("/api/providers/openai/models");
+    mock?.restore();
+    mock = null;
+
+    const res = await api(env.app).get("/api/providers");
+    expect(res.status).toBe(200);
+    expect(res.body.providers[0].modelCount).toBe(3);
+    expect(JSON.stringify(res.body)).not.toContain("gpt-x");
+  });
+
+  it("fournisseur sans modèle connu → modelCount: 0", async () => {
+    await seedOpenAi();
+    const res = await api(env.app).get("/api/providers");
+    expect(res.status).toBe(200);
+    expect(res.body.providers[0].modelCount).toBe(0);
+  });
+});

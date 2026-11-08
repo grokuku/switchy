@@ -60,7 +60,16 @@ export interface ProviderModelDetails {
   note?: string;
 }
 
-// ── En-têtes d'authentification du FOURNISSEUR (jamais le client) ──
+// Compteur de modèles par fournisseur, peuplé dès qu'une liste est
+// discovered (réseau mocké ou réel). Évite un appel réseau par fournisseur
+// au moment du rendu de la liste.
+const modelCounts = new Map<string, number>();
+
+/** Renvoie le nombre de modèles déjà connus pour un fournisseur, ou
+ * `undefined` s'il n'a jamais été découvert. */
+export function cachedModelCount(providerId: string): number | undefined {
+  return modelCounts.has(providerId) ? modelCounts.get(providerId) : undefined;
+}
 
 function authHeaders(provider: ProviderRecord): Record<string, string> {
   const headers: Record<string, string> = { accept: "application/json" };
@@ -119,6 +128,7 @@ function cacheKey(provider: ProviderRecord, extra = ""): string {
 export function resetModelCatalogCache(): void {
   modelsCache.clear();
   detailsCache.clear();
+  modelCounts.clear();
 }
 
 // ── Liste des modèles ──
@@ -135,7 +145,10 @@ export async function listProviderModels(providerId: string, opts: { refresh?: b
 
   const key = cacheKey(provider);
   const cached = modelsCache.get(key);
-  if (!opts.refresh && cached && cached.expiresAt > Date.now()) return cached.value;
+  if (!opts.refresh && cached && cached.expiresAt > Date.now()) {
+    modelCounts.set(provider.id, cached.value.length);
+    return cached.value;
+  }
 
   const source = modelSourceFor(provider);
   let models: ProviderModel[];
@@ -175,6 +188,7 @@ export async function listProviderModels(providerId: string, opts: { refresh?: b
   }
 
   modelsCache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, value: models });
+  modelCounts.set(provider.id, models.length);
   return models;
 }
 

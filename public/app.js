@@ -274,7 +274,12 @@ import {
     return "";
   }
 
-  /** Bouton avec icône (brique `icons`) + libellé texte. */
+  /**
+   * Bouton avec icône (brique `icons`) + libellé texte.
+   * `opts.iconOnly` : bouton-icône compact (actions de carte) — le libellé
+   * devient `aria-label` + infobulle, jamais un bouton muet pour l'écran
+   * (repli texte si la brique `icons` est absente).
+   */
   function iconButton(name, label, opts) {
     opts = opts || {};
     const btn = h("button", {
@@ -286,6 +291,13 @@ import {
     if (svg) {
       const span = h("span", { class: "icon", html: svg, attrs: { "aria-hidden": "true" } });
       btn.append(span);
+    }
+    if (opts.iconOnly) {
+      btn.setAttribute("aria-label", label);
+      btn.setAttribute("title", label);
+      // Sans la brique d'icônes, un bouton-icône serait VIDE : on garde le mot.
+      if (!svg) btn.append(document.createTextNode(label));
+      return btn;
     }
     btn.append(document.createTextNode(label));
     return btn;
@@ -853,56 +865,79 @@ import {
     const card = h("article", { class: "card item-card" });
 
     const head = h("header", { class: "item-head" });
+    const idBox = h("div", { class: "item-id" });
     // Titre tronqué à une ligne (CSS) : l'infobulle garde le libellé complet.
     const providerTitle = p.label || p.id;
-    head.append(h("h3", { class: "item-title", text: providerTitle, attrs: { title: providerTitle } }));
-    const badges = h("div", { class: "badges" });
-    badges.append(badge(p.id, "id"));
-    badges.append(badge(typeLabel(p.type)));
-    badges.append(p.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
-    badges.append(
-      p.apiKey && p.apiKey.configured ? badge("clé configurée", "ok") : badge("sans clé", "warn"),
-    );
-    head.append(badges);
+    idBox.append(h("h3", { class: "item-title", text: providerTitle, attrs: { title: providerTitle } }));
+    idBox.append(h("p", { class: "item-desc", text: `${typeLabel(p.type)} · ${p.id}` }));
+    head.append(idBox);
 
     const actions = h("div", { class: "item-actions" });
-    actions.append(iconButton("pencil", "Modifier", { on: { click: () => openProviderForm(p) } }));
+    actions.append(
+      iconButton("pencil", "Modifier", { class: "btn btn--icon", iconOnly: true, on: { click: () => openProviderForm(p) } }),
+    );
     actions.append(
       iconButton("trash", "Supprimer", {
-        class: "btn btn--danger",
+        class: "btn btn--icon btn--danger",
+        iconOnly: true,
         on: { click: () => deleteProvider(p) },
       }),
     );
     head.append(actions);
     card.append(head);
 
-    const dl = h("dl", { class: "kv" });
+    // Rangée de pilules : état du compte, en un coup d'œil.
+    const pills = h("div", { class: "badges item-pills" });
+    pills.append(p.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
+    pills.append(
+      badge(
+        p.maxConcurrency !== undefined && p.maxConcurrency !== null
+          ? `${p.maxConcurrency} simultané(s)`
+          : "simultané : défaut global",
+      ),
+    );
+    pills.append(
+      p.apiKey && p.apiKey.configured ? badge("clé enregistrée", "ok") : badge("sans clé", "warn"),
+    );
+    card.append(pills);
+
+    // Détail des URL : mêmes informations qu'avant, en lignes lisibles.
+    const dl = h("dl", { class: "kv provider-urls" });
     dl.append(h("div", null, h("dt", { text: "/v1" }), h("dd", { text: p.baseUrl })));
     if (p.nativeUrl) dl.append(h("div", null, h("dt", { text: "native" }), h("dd", { text: p.nativeUrl })));
     if (p.systemOneUrl) dl.append(h("div", null, h("dt", { text: "system one" }), h("dd", { text: p.systemOneUrl })));
-    dl.append(
+    card.append(dl);
+
+    // Pied de carte : parallélisme du compte + hôte (même langage que `.svc-foot`).
+    const foot = h("footer", { class: "svc-foot" });
+    foot.append(
       h(
-        "div",
+        "span",
         null,
-        h("dt", { text: "simultané" }),
-        h("dd", {
+        "simultané ",
+        h("b", {
           text:
             p.maxConcurrency !== undefined && p.maxConcurrency !== null
-              ? `${p.maxConcurrency} appel(s) / compte`
-              : "défaut global",
+              ? String(p.maxConcurrency)
+              : "défaut",
         }),
       ),
     );
-    dl.append(
-      h(
-        "div",
-        null,
-        h("dt", { text: "clé" }),
-        h("dd", { text: p.apiKey && p.apiKey.configured ? `configurée ${p.apiKey.preview}` : "—" }),
-      ),
-    );
-    card.append(dl);
+    foot.append(h("span", null, "hôte ", h("b", { text: hostOf(p.baseUrl) || "—" })));
+    if (p.modelCount !== undefined) {
+      foot.append(h("span", null, "modèles ", h("b", { text: String(p.modelCount) })));
+    }
+    card.append(foot);
     return card;
+  }
+
+  /** Hôte d'une URL de base (`https://api.x.com/v1` → `api.x.com`), jamais l'URL entière. */
+  function hostOf(url) {
+    try {
+      return new URL(String(url)).host;
+    } catch {
+      return String(url || "");
+    }
   }
 
   function openProviderForm(provider) {
@@ -1588,35 +1623,45 @@ import {
     const card = h("article", { class: "card item-card" + (s.enabled ? "" : " is-disabled") });
 
     const head = h("header", { class: "item-head" });
+    const idBox = h("div", { class: "item-id" });
     // Titre tronqué à une ligne (CSS) : l'infobulle garde le nom complet.
-    head.append(h("h3", { class: "item-title", text: s.name, attrs: { title: s.name } }));
-    const badges = h("div", { class: "badges" });
-    // Badge ET bouton ON/OFF lisent le MÊME champ `enabled` : jamais deux vérités.
-    badges.append(s.enabled ? badge("activé", "ok") : badge("désactivé", "warn"));
-    if (s.rolling) badges.append(badge("rolling", "env"));
-    if (s.prioritaire) badges.append(badge("prioritaire", "env"));
-    if (s.vision) badges.append(badge("vision", "ok"));
-    badges.append(badge(`${s.fallbacks ? s.fallbacks.length : 0} repli(s)`));
-    // Étapes éteintes : annoncées sur la carte (une ligne grisée passe inaperçue).
-    const offSteps = serviceToSteps(s).length - enabledSteps(serviceToSteps(s)).length;
-    if (offSteps > 0) badges.append(badge(`${offSteps} étape(s) désactivée(s)`, "warn"));
-    head.append(badges);
+    idBox.append(h("h3", { class: "item-title", text: s.name, attrs: { title: s.name } }));
+    if (s.description) idBox.append(h("p", { class: "item-desc", text: s.description }));
+    head.append(idBox);
 
     const actions = h("div", { class: "item-actions" });
-    actions.append(serviceToggleButton(s));
-    actions.append(serviceRollingButton(s));
-    actions.append(iconButton("pencil", "Modifier", { on: { click: () => openServiceForm(s) } }));
+    actions.append(
+      iconButton("pencil", "Modifier", {
+        class: "btn btn--icon",
+        iconOnly: true,
+        on: { click: () => openServiceForm(s) },
+      }),
+    );
     actions.append(
       iconButton("trash", "Supprimer", {
-        class: "btn btn--danger",
+        class: "btn btn--icon btn--danger",
+        iconOnly: true,
         on: { click: () => deleteService(s) },
       }),
     );
     head.append(actions);
     card.append(head);
 
-    if (s.description) card.append(h("p", { class: "item-desc muted", text: s.description }));
+    // Rangée de PILULES : état du service, bascules immédiates (on/off,
+    // rolling) et capacités — tout se lit sans déplier la carte.
+    const pills = h("div", { class: "badges item-pills" });
+    // Bouton ET pastille lisent le MÊME champ `enabled` : jamais deux vérités.
+    pills.append(serviceToggleButton(s));
+    pills.append(serviceRollingButton(s));
+    if (s.prioritaire) pills.append(badge("prioritaire", "env"));
+    if (s.vision) pills.append(badge("vision", "ok"));
+    pills.append(badge(`${s.fallbacks ? s.fallbacks.length : 0} repli(s)`));
+    // Étapes éteintes : annoncées sur la carte (une ligne grisée passe inaperçue).
+    const offSteps = serviceToSteps(s).length - enabledSteps(serviceToSteps(s)).length;
+    if (offSteps > 0) pills.append(badge(`${offSteps} étape(s) désactivée(s)`, "warn"));
+    card.append(pills);
 
+    // Chaîne d'étapes en RAIL VERTICAL : pastille de rang → modèle → méta.
     const stepsEl = h("ol", { class: "steps steps--sortable" });
     let currentSteps = serviceToSteps(s);
     const drawSteps = () => {
@@ -1629,18 +1674,20 @@ import {
     attachStepReordering(stepsEl, (from, to) => void reorderServiceSteps(s, from, to));
     card.append(stepsEl);
 
-    const dl = h("dl", { class: "kv" });
-    dl.append(h("div", null, h("dt", { text: "contexte" }), h("dd", { text: formatNumber(s.contextWindow) })));
-    dl.append(h("div", null, h("dt", { text: "tokens max" }), h("dd", { text: formatNumber(s.maxOutputTokens) })));
-    if (s.prioritaire) {
-      dl.append(h("div", null, h("dt", { text: "priorité" }), h("dd", { text: "passe en premier" })));
-    }
-    dl.append(
-      h("div", null, h("dt", { text: "charge" }), h("dd", {
-        text: s.rolling ? "rolling — étape pleine sautée" : "file d'attente",
-      })),
+    // Pied de carte : contexte / tokens max / charge (l'essentiel chiffré).
+    const foot = h("footer", { class: "svc-foot" });
+    foot.append(h("span", null, "contexte ", h("b", { text: formatNumber(s.contextWindow) })));
+    foot.append(h("span", null, "tokens max ", h("b", { text: formatNumber(s.maxOutputTokens) })));
+    foot.append(
+      h(
+        "span",
+        null,
+        "charge ",
+        h("b", { text: s.rolling ? "rolling" : "file d'attente" }),
+      ),
     );
-    card.append(dl);
+    if (s.prioritaire) foot.append(h("span", null, "priorité ", h("b", { text: "passe en premier" })));
+    card.append(foot);
     return card;
   }
 
@@ -1660,22 +1707,27 @@ import {
    */
   function cardStepItem(service, step, index, total, onMove) {
     const on = isStepEnabled(step);
+    const role = stepRoleLabel(index);
     const li = h("li", {
-      class: `step step--sortable${on ? "" : " is-step-disabled"}`,
+      class: `step step--sortable${index === 0 ? " step--head" : ""}${on ? "" : " is-step-disabled"}`,
       attrs: { "data-step-index": String(index) },
     });
-    const role = stepRoleLabel(index);
-    // Bouton ON/OFF de la ligne : à part de la poignée, donc jamais un glisser.
-    li.append(stepEnabledButton(service, step, index));
-    const grip = stepGrip(role);
-    li.append(grip);
-    // Bloc central : libellé + modèle + fournisseur + réflexion (une seule
-    // colonne, pour que les flèches restent TOUJOURS alignées à droite).
+
+    // Pastille de RANG posée sur le rail (décor : le rôle reste écrit en toutes
+    // lettres dans la méta, l'information ne dépend donc pas du chiffre).
+    li.append(
+      h("span", { class: "step-rank", text: String(index + 1), attrs: { "aria-hidden": "true" } }),
+    );
+
+    // Bloc central : modèle en gras, puis la méta (rôle · fournisseur · réflexion).
     const main = h("div", { class: "step-main" });
-    main.append(h("span", { class: "step-role", text: role }));
-    main.append(h("span", { class: "step-model", text: step.model }));
-    main.append(h("span", { class: "step-provider muted", text: providerLabel(step.providerId) }));
-    main.append(h("span", { class: "step-reason muted", text: `réflexion: ${step.reasoning || "off"}` }));
+    const model = step.model || "(modèle vide)";
+    main.append(h("span", { class: "step-model", text: model, attrs: { title: model } }));
+    const meta = h("div", { class: "step-meta" });
+    meta.append(h("span", { class: "step-role", text: role }));
+    meta.append(h("span", { class: "step-provider", text: providerLabel(step.providerId) }));
+    meta.append(h("span", { class: "step-reason", text: `réflexion ${step.reasoning || "off"}` }));
+    main.append(meta);
     li.append(main);
 
     // Test de l'étape : le bouton rejoint les outils (à droite), le verdict
@@ -1703,13 +1755,16 @@ import {
       paintStepTestResult(service.name, index, resultEl);
     }
 
+    // Outils de la ligne : on/off · poignée · ↑ ↓ · Tester (tous à droite).
     const tools = stepMoveTools(index, total, role, onMove);
     tools.wrap.append(testBtn);
+    tools.wrap.prepend(stepGrip(role));
+    tools.wrap.prepend(stepEnabledButton(service, step, index));
     li.append(tools.wrap);
     li.append(resultEl);
     // Une seule étape : ni poignée ni flèches (rien à déplacer) — le test reste.
     if (total < 2) {
-      grip.hidden = true;
+      for (const node of tools.wrap.querySelectorAll(".step-grip")) node.hidden = true;
       tools.up.hidden = true;
       tools.down.hidden = true;
     }
@@ -2343,7 +2398,10 @@ import {
 
     const label = h("div", { class: "setting-label" });
     label.append(h("span", { class: "name", text: spec.name }));
-    const sourceVariant = spec.source === "env" ? "env" : spec.source === "file" ? "ok" : "warn";
+    // Source de la valeur : accent pour l'environnement (verrouillé), vert pour
+    // le fichier, NEUTRE pour le défaut (une absence de réglage n'est pas une
+    // alerte) — le badge « redémarrage requis » reste, lui, en avertissement.
+    const sourceVariant = spec.source === "env" ? "env" : spec.source === "file" ? "ok" : "";
     label.append(badge(SOURCE_LABEL[spec.source] || spec.source, sourceVariant));
     if (spec.restartRequired) label.append(badge("redémarrage requis", "warn"));
     if (!spec.editable) {
@@ -2656,93 +2714,245 @@ import {
     return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString("fr-FR", { hour12: false });
   }
 
-  /**
-   * Pastilles ● / ○ : jusqu'à 5 points, remplis ∝ aux places occupées (jamais
-   * 2500 points pour un plafond de 2500). Le chiffre exact reste affiché à côté.
-   */
-  function occupancyDots(active, limit) {
-    const total = Math.min(Math.max(Number(limit) || 1, 1), 5);
-    let filled = limit > 0 ? Math.round((active / limit) * total) : 0;
-    if (active > 0 && filled === 0) filled = 1;
-    if (active >= limit) filled = total;
-    const wrap = h("span", { class: "dots", attrs: { "aria-hidden": "true" } });
-    for (let i = 0; i < total; i++) wrap.append(h("span", { class: "dot" + (i < filled ? " dot--on" : "") }));
-    return wrap;
+  /** Élément SVG (le helper `h` ne construit que du HTML). */
+  function svgEl(tag, attrs, children) {
+    const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, String(v));
+    for (const child of children || []) node.append(child);
+    return node;
   }
 
+  /**
+   * Micro-graphique de tendance (SVG, zéro dépendance) tracé sur une série
+   * RÉELLE — les derniers appels journalisés. Jamais de courbe inventée :
+   * sans deux points connus, on n'affiche qu'un trait discret (`is-empty`).
+   */
+  function sparkline(values) {
+    const W = 100;
+    const H = 28;
+    const PAD = 2;
+    const series = (Array.isArray(values) ? values : []).map((v) => {
+      const num = Number(v);
+      return Number.isFinite(num) ? num : null;
+    });
+    const known = series.filter((v) => v !== null);
+    const svg = svgEl("svg", {
+      class: "kpi-spark" + (known.length < 2 ? " is-empty" : ""),
+      viewBox: `0 0 ${W} ${H}`,
+      preserveAspectRatio: "none",
+      "aria-hidden": "true",
+      focusable: "false",
+    });
+    if (known.length < 2) {
+      svg.append(svgEl("line", { class: "kpi-spark-line", x1: 0, y1: H - PAD, x2: W, y2: H - PAD }));
+      return svg;
+    }
+    const max = Math.max(...known);
+    const min = Math.min(...known);
+    const span = max - min || 1;
+    const stepX = (W - PAD * 2) / (series.length - 1);
+    const points = [];
+    series.forEach((value, index) => {
+      if (value === null) return;
+      points.push([PAD + index * stepX, H - PAD - ((value - min) / span) * (H - PAD * 2)]);
+    });
+    const round = (n) => Number(n.toFixed(2));
+    const path = points.map(([x, y], i) => `${i === 0 ? "M" : "L"}${round(x)} ${round(y)}`).join(" ");
+    const first = points[0];
+    const last = points[points.length - 1];
+    const area = `${path} L${round(last[0])} ${H - PAD} L${round(first[0])} ${H - PAD} Z`;
+    svg.append(svgEl("path", { class: "kpi-spark-area", d: area }));
+    svg.append(svgEl("path", { class: "kpi-spark-line", d: path }));
+    return svg;
+  }
+
+  /**
+   * Série temporelle RÉELLE des derniers appels : le journal récent est réparti
+   * en tranches égales entre la plus ancienne et la plus récente entrée.
+   * `reduce(bucketRows)` renvoie la valeur d'une tranche (null = tranche vide),
+   * donc un trou n'est jamais comblé par une valeur inventée.
+   */
+  function recentSeries(recent, reduce, buckets = 10) {
+    const rows = (Array.isArray(recent) ? recent : []).filter((r) => r && typeof r === "object");
+    if (rows.length === 0) return [];
+    const stamp = (row) => {
+      const t = new Date(String(row.ts || "")).getTime();
+      return Number.isFinite(t) ? t : null;
+    };
+    const times = rows.map(stamp).filter((t) => t !== null);
+    if (times.length === 0) return [];
+    const start = Math.min(...times);
+    const end = Math.max(...times);
+    const span = end - start;
+    const slots = Array.from({ length: buckets }, () => []);
+    for (const row of rows) {
+      const t = stamp(row);
+      if (t === null) continue;
+      const index = span <= 0 ? buckets - 1 : Math.min(buckets - 1, Math.floor(((t - start) / span) * buckets));
+      slots[index].push(row);
+    }
+    return slots.map((bucket) => (bucket.length === 0 ? null : reduce(bucket)));
+  }
+
+  const isOk = (row) => (row.result || "") === "ok";
+  const isSkipped = (row) => (row.result || "") === "skipped" || row.charge === true;
+
+  /**
+   * Tuile KPI : libellé en PETITES CAPITALES, chiffre géant, contexte dessous,
+   * puis un micro-graphique de tendance (données réelles) quand il y en a.
+   */
   function dashboardStat(label, value, opts) {
     opts = opts || {};
-    const box = h("div", { class: "stat" + (opts.alert ? " stat--alert" : "") });
-    box.append(h("span", { class: "stat-value", text: value }));
-    box.append(h("span", { class: "stat-label", text: label }));
-    if (opts.hint) box.append(h("span", { class: "stat-hint", text: opts.hint }));
-    return box;
+    const tile = h("article", {
+      class: "kpi" + (opts.alert ? " kpi--alert" : ""),
+      attrs: opts.title ? { title: opts.title } : null,
+    });
+    tile.append(h("span", { class: "kpi-label", text: label }));
+    tile.append(h("span", { class: "kpi-value", text: value, attrs: { title: String(value) } }));
+    if (opts.hint) tile.append(h("span", { class: "kpi-sub", text: opts.hint, attrs: { title: opts.hint } }));
+    if (Array.isArray(opts.series)) tile.append(sparkline(opts.series));
+    return tile;
   }
 
-  /** Bloc ① — « En ce moment » : concurrence par fournisseur. */
+  /**
+   * Barre de capacité SEGMENTÉE (remplace les anciennes pastilles) : nombre de
+   * segments ∝ au plafond du compte, jamais plus de 24 (un plafond de 2500 ne
+   * dessine pas 2500 traits). Le chiffre exact reste écrit à côté et la barre
+   * porte `role="progressbar"` avec ses bornes réelles.
+   */
+  function capacityBar(active, limit) {
+    const max = Math.max(Number(limit) || 0, 0);
+    const used = Math.max(Number(active) || 0, 0);
+    const total = Math.max(1, Math.min(max > 0 ? max : used || 1, 24));
+    let filled = max > 0 ? Math.round((used / max) * total) : used > 0 ? total : 0;
+    if (used > 0 && filled === 0) filled = 1;
+    if (max > 0 && used >= max) filled = total;
+    const bar = h("div", {
+      class: "cap-bar",
+      attrs: {
+        role: "progressbar",
+        "aria-valuemin": "0",
+        "aria-valuemax": String(max > 0 ? max : total),
+        "aria-valuenow": String(max > 0 ? Math.min(used, max) : used),
+        "aria-label": max > 0 ? `${used} place(s) sur ${max}` : `${used} place(s) occupée(s)`,
+      },
+    });
+    for (let i = 0; i < total; i++) {
+      bar.append(h("span", { class: "cap-seg" + (i < filled ? " is-on" : ""), attrs: { "aria-hidden": "true" } }));
+    }
+    return bar;
+  }
+
+  const LIVE_STATE_LABEL = { free: "libre", busy: "occupé", saturated: "saturé" };
+
+  /** Bloc — « En ce moment » : concurrence par fournisseur (barre segmentée). */
   function renderLiveBlock(live) {
-    const block = h("section", { class: "dash-block" });
-    block.append(h("h3", { class: "dash-title", text: "En ce moment" }));
+    const block = h("section", { class: "dash-block card" });
     const providers = (live && live.providers) || [];
+    const active = Number(live && live.active) || 0;
+    const queued = Number(live && live.queued) || 0;
+    const places = providers.reduce((sum, p) => sum + (Number(p.limit) || 0), 0);
+
+    const head = h("div", { class: "card-h" });
+    head.append(h("h3", { class: "dash-title", text: "En ce moment" }));
+    if (places > 0) {
+      head.append(h("span", { class: "card-h-meta", text: `${active} / ${places} places` }));
+    }
+    block.append(head);
+
+    const body = h("div", { class: "dash-body" });
     if (providers.length === 0) {
-      block.append(h("p", { class: "muted", text: "Aucun fournisseur configuré." }));
+      body.append(h("p", { class: "muted", text: "Aucun fournisseur configuré." }));
+      block.append(body);
       return block;
     }
-    const list = h("div", { class: "live-list" });
+
+    const list = h("div", { class: "cap-list" });
     for (const p of providers) {
-      const row = h("div", { class: `live-row live-row--${p.state || "free"}` });
-      row.append(h("span", { class: "live-name", text: p.label || p.id, attrs: { title: p.label || p.id } }));
-      row.append(occupancyDots(Number(p.active) || 0, Number(p.limit) || 0));
-      row.append(h("span", { class: "live-count", text: `${p.active}/${p.limit}` }));
-      row.append(
+      const state = p.state || "free";
+      const used = Number(p.active) || 0;
+      const limit = Number(p.limit) || 0;
+      const waiting = Number(p.queued) || 0;
+      const row = h("div", { class: "cap-row", attrs: { "data-state": state } });
+
+      const rowHead = h("div", { class: "cap-head" });
+      rowHead.append(h("span", { class: "cap-name", text: p.label || p.id, attrs: { title: p.label || p.id } }));
+      rowHead.append(h("span", { class: "cap-state", text: LIVE_STATE_LABEL[state] || state }));
+      rowHead.append(
+        h("span", { class: "cap-count", text: limit > 0 ? `${used} / ${limit}` : `${used}` }),
+      );
+      row.append(rowHead);
+      row.append(capacityBar(used, limit));
+
+      const note = h("div", { class: "cap-note" });
+      note.append(h("span", { text: `${used} appel(s) en cours` }));
+      note.append(
         h("span", {
-          class: "live-queued" + (p.queued > 0 ? " live-queued--busy" : ""),
-          text: p.queued > 0 ? `${p.queued} en attente` : "file vide",
+          class: waiting > 0 ? "cap-note--busy" : "",
+          text: waiting > 0 ? `${waiting} en attente` : "file vide",
         }),
       );
+      row.append(note);
       list.append(row);
     }
-    block.append(list);
+    body.append(list);
+    block.append(body);
     block.append(
       h("p", {
-        class: "dash-note muted",
-        text: `${Number(live.active) || 0} appel(s) en cours · ${Number(live.queued) || 0} en attente au total`,
+        class: "dash-foot",
+        text: `${active} appel(s) en cours · ${queued} en attente au total`,
       }),
     );
     return block;
   }
 
-  /** Bloc ② — « 24 h » : appels, réussite, replis (alerte), latence. */
-  function renderSummaryBlock(activity) {
+  /**
+   * Six tuiles KPI en tête de l'onglet Activité : appels, réussite, replis
+   * (alerte si > 0), sautés (charge), affinité, latence. Les quatre premières
+   * portent un micro-graphique de tendance calculé sur le journal récent.
+   */
+  function renderSummaryBlock(activity, recent) {
     activity = activity || {};
-    const block = h("section", { class: "dash-block" });
-    block.append(h("h3", { class: "dash-title", text: "24 h" }));
-    const stats = h("div", { class: "stats" });
-    stats.append(dashboardStat("appels", formatCompact(activity.calls)));
-    stats.append(dashboardStat("réussite", formatPercent(activity.successRate)));
-    stats.append(
-      dashboardStat("replis", formatCompact(activity.fallbacks), {
-        alert: Number(activity.fallbacks) > 0,
+    const grid = h("section", { class: "kpi-grid", attrs: { "aria-label": "Chiffres des 24 dernières heures" } });
+    const fallbacks = Number(activity.fallbacks) || 0;
+
+    grid.append(
+      dashboardStat("Appels", formatCompact(activity.calls), {
+        hint: `${formatCompact(activity.attempts)} tentative(s) · 24 h`,
+        series: recentSeries(recent, (rows) => rows.length),
+      }),
+    );
+    grid.append(
+      dashboardStat("Réussite", formatPercent(activity.successRate), {
+        hint: `${formatCompact(activity.succeeded)} appel(s) réussi(s)`,
+        series: recentSeries(recent, (rows) => rows.filter(isOk).length / rows.length),
+      }),
+    );
+    grid.append(
+      dashboardStat("Replis", formatCompact(activity.fallbacks), {
+        alert: fallbacks > 0,
         hint: `${formatPercent(activity.fallbackRate)} des appels`,
+        series: recentSeries(recent, (rows) => rows.filter((row) => row.isFallback === true).length),
       }),
     );
-    // Motifs DISTINCTS : une bascule pour CHARGE (rolling) n'est pas une erreur.
-    stats.append(
-      dashboardStat("sautés (charge)", formatCompact(activity.loadFallbacks), {
-        hint: "rolling : étape pleine, sans attente",
+    grid.append(
+      dashboardStat("Sautés (charge)", formatCompact(activity.loadFallbacks), {
+        hint: "rolling : étape pleine",
+        series: recentSeries(recent, (rows) => rows.filter(isSkipped).length),
       }),
     );
-    stats.append(
-      dashboardStat("affinité", formatCompact(activity.affinityHits), {
-        hint: "fournisseur repris (cache chaud)",
+    grid.append(
+      dashboardStat("Affinité", formatCompact(activity.affinityHits), {
+        hint: "fournisseur repris",
       }),
     );
     const latency = activity.latency || {};
-    stats.append(
-      dashboardStat("latence moy.", formatDuration(latency.avgMs), { hint: `max ${formatDuration(latency.maxMs)}` }),
+    grid.append(
+      dashboardStat("Latence moy.", formatDuration(latency.avgMs), {
+        hint: `max ${formatDuration(latency.maxMs)}`,
+      }),
     );
-    block.append(stats);
-    return block;
+    return grid;
   }
 
   /** Ligne du tableau de tokens (total, service ou fournisseur). */
@@ -2760,42 +2970,114 @@ import {
     return h("tr", { class: "token-group" }, h("th", { text: label, attrs: { colspan: "4" } }));
   }
 
-  /** Bloc ③ — « Tokens (24 h) » : total, par service, par fournisseur. */
+  /**
+   * Barre de RÉPARTITION entrée / sortie / réflexion (SVG) + légende chiffrée.
+   * Les parts sont calculées sur les seules valeurs CONNUES : une valeur non
+   * exposée par le fournisseur n'est ni comptée ni affichée comme un zéro.
+   */
+  function tokensSplit(total) {
+    const parts = [
+      { key: "prompt", label: "entrée", value: total.prompt },
+      { key: "completion", label: "sortie", value: total.completion },
+      { key: "reasoning", label: "réflexion", value: total.reasoning },
+    ].map((part) => {
+      const num = Number(part.value);
+      return { ...part, num: Number.isFinite(num) && num > 0 ? num : 0 };
+    });
+    const sum = parts.reduce((acc, part) => acc + part.num, 0);
+
+    const wrap = h("div", { class: "split" });
+    const bar = svgEl("svg", {
+      class: "split-bar",
+      viewBox: "0 0 100 12",
+      preserveAspectRatio: "none",
+      "aria-hidden": "true",
+      focusable: "false",
+    });
+    if (sum > 0) {
+      let x = 0;
+      for (const part of parts) {
+        if (part.num <= 0) continue;
+        const width = (part.num / sum) * 100;
+        bar.append(
+          svgEl("rect", {
+            class: `split-seg split-seg--${part.key}`,
+            x: Number(x.toFixed(3)),
+            y: 0,
+            width: Number(Math.max(width - 0.4, 0.4).toFixed(3)),
+            height: 12,
+            rx: 2,
+          }),
+        );
+        x += width;
+      }
+    }
+    wrap.append(bar);
+
+    const legend = h("ul", { class: "split-legend" });
+    for (const part of parts) {
+      const li = h("li", null);
+      li.append(h("span", { class: `split-key split-key--${part.key}`, attrs: { "aria-hidden": "true" } }));
+      li.append(document.createTextNode(part.label));
+      li.append(h("b", { text: formatTokens(part.value) }));
+      if (sum > 0 && part.num > 0) {
+        li.append(h("span", { text: formatPercent(part.num / sum) }));
+      }
+      legend.append(li);
+    }
+    wrap.append(legend);
+    return wrap;
+  }
+
+  /** Bloc — « Tokens (24 h) » : répartition, total, par service, par fournisseur. */
   function renderTokensBlock(tokens) {
     tokens = tokens || {};
-    const block = h("section", { class: "dash-block" });
-    block.append(h("h3", { class: "dash-title", text: "Tokens (24 h)" }));
+    const block = h("section", { class: "dash-block card" });
+
+    const head = h("div", { class: "card-h" });
+    head.append(h("h3", { class: "dash-title", text: "Tokens" }));
+    head.append(h("span", { class: "card-h-meta", text: "24 h" }));
+    block.append(head);
+
+    const body = h("div", { class: "dash-body" });
+    const totals = tokens.total || { prompt: null, completion: null, reasoning: null };
+    body.append(tokensSplit(totals));
 
     const table = h("table", { class: "token-table" });
-    const head = h("tr");
-    head.append(h("th", { text: "" }));
-    head.append(h("th", { text: "entrée" }));
-    head.append(h("th", { text: "sortie" }));
-    head.append(h("th", { text: "réflexion" }));
+    const headRow = h("tr");
+    headRow.append(h("th", { text: "" }));
+    headRow.append(h("th", { text: "entrée" }));
+    headRow.append(h("th", { text: "sortie" }));
+    headRow.append(h("th", { text: "réflexion" }));
     const thead = h("thead");
-    thead.append(head);
+    thead.append(headRow);
     table.append(thead);
 
     const tbody = h("tbody");
-    tbody.append(tokenRow("Total", tokens.total || { prompt: null, completion: null, reasoning: null }, { total: true }));
+    tbody.append(tokenRow("Total", totals, { total: true }));
     const services = Object.entries(tokens.byService || {});
     if (services.length > 0) {
       tbody.append(tokenGroupRow("Par service"));
-      for (const [name, totals] of services) tbody.append(tokenRow(name, totals));
+      for (const [name, values] of services) tbody.append(tokenRow(name, values));
     }
     const providers = Object.entries(tokens.byProvider || {});
     if (providers.length > 0) {
       tbody.append(tokenGroupRow("Par fournisseur"));
-      for (const [name, totals] of providers) tbody.append(tokenRow(name, totals));
+      for (const [name, values] of providers) tbody.append(tokenRow(name, values));
     }
     table.append(tbody);
-    block.append(table);
+    body.append(h("div", { class: "table-wrap" }, table));
+    block.append(body);
 
-    if (services.length === 0 && providers.length === 0) {
-      block.append(h("p", { class: "dash-note muted", text: "Aucune consommation rapportée sur la période." }));
-    } else {
-      block.append(h("p", { class: "dash-note muted", text: "« — » = non exposé par le fournisseur (ou compte inconnu)." }));
-    }
+    block.append(
+      h("p", {
+        class: "dash-foot",
+        text:
+          services.length === 0 && providers.length === 0
+            ? "Aucune consommation rapportée sur la période."
+            : "« — » = non exposé par le fournisseur (ou compte inconnu).",
+      }),
+    );
     return block;
   }
 
@@ -2805,11 +3087,18 @@ import {
    * places par fournisseur du bloc « En ce moment »).
    */
   function renderKeyBlock(byKey) {
-    const block = h("section", { class: "dash-block" });
-    block.append(h("h3", { class: "dash-title", text: "Par clé d'API" }));
+    const block = h("section", { class: "dash-block card" });
     const rows = Array.isArray(byKey) ? byKey : [];
+
+    const headCard = h("div", { class: "card-h" });
+    headCard.append(h("h3", { class: "dash-title", text: "Par clé d'API" }));
+    headCard.append(
+      h("span", { class: "card-h-meta", text: rows.length === 0 ? "—" : `${rows.length} clé(s)` }),
+    );
+    block.append(headCard);
+
     if (rows.length === 0) {
-      block.append(h("p", { class: "muted", text: "Aucune clé d'API utilisée sur la période." }));
+      block.append(h("div", { class: "dash-body" }, h("p", { class: "muted", text: "Aucune clé d'API utilisée sur la période." })));
       return block;
     }
 
@@ -2847,10 +3136,11 @@ import {
       tbody.append(tr);
     }
     table.append(tbody);
-    block.append(table);
+    const body = h("div", { class: "dash-body" }, h("div", { class: "table-wrap" }, table));
+    block.append(body);
     block.append(
       h("p", {
-        class: "dash-note muted",
+        class: "dash-foot",
         text: "« en cours » = appels en vol de la clé · « — » = valeur non exposée par le fournisseur.",
       }),
     );
@@ -2864,30 +3154,76 @@ import {
     return badge(labels[result] || result, variant);
   }
 
-  /** Une ligne « Derniers appels » (badge REPLI visible). */
-  function recentRow(entry) {
-    const li = h("li", { class: "recent-row" });
-    li.append(h("span", { class: "recent-time", text: formatClock(entry.ts) }));
-    li.append(h("span", { class: "recent-service", text: entry.service || "?", attrs: { title: entry.service || "?" } }));
-    li.append(h("span", { class: "recent-provider muted", text: providerLabel(entry.provider) }));
-    li.append(resultBadge(entry));
-    li.append(h("span", { class: "recent-duration muted", text: formatDuration(entry.durationMs) }));
-    if (entry.isFallback) li.append(h("span", { class: "badge badge--danger repli-badge", text: "REPLI" }));
-    return li;
+  /** Total de tokens d'une ligne du journal (`—` si le fournisseur ne l'expose pas). */
+  function recentTokens(entry) {
+    const tokens = entry.tokens || {};
+    if (Number.isFinite(Number(tokens.totalTokens))) return formatCompact(tokens.totalTokens);
+    const parts = [tokens.promptTokens, tokens.completionTokens, tokens.reasoningTokens]
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v) && v > 0);
+    return parts.length === 0 ? "—" : formatCompact(parts.reduce((a, b) => a + b, 0));
   }
 
-  /** Bloc ④ — « Derniers appels » (badge REPLI visible). */
+  /** Une ligne du tableau « Derniers appels » (état en PILULE, aucune clé, aucun prompt). */
+  function recentRow(entry) {
+    const tr = h("tr");
+    tr.append(h("td", { class: "calls-time", text: formatClock(entry.ts) }));
+
+    const state = h("td", { class: "calls-state" });
+    state.append(resultBadge(entry));
+    if (entry.isFallback) state.append(h("span", { class: "badge badge--danger repli-badge", text: "REPLI" }));
+    tr.append(state);
+
+    tr.append(h("td", { class: "calls-service", text: entry.service || "?", attrs: { title: entry.service || "?" } }));
+
+    const model = entry.model || "—";
+    const modelCell = h("td", { class: "calls-model" });
+    modelCell.append(h("span", { class: "ellipsis", text: model, attrs: { title: model } }));
+    tr.append(modelCell);
+
+    tr.append(h("td", { class: "calls-duration", text: formatDuration(entry.durationMs) }));
+    tr.append(h("td", { class: "calls-tokens", text: recentTokens(entry) }));
+    return tr;
+  }
+
+  /** Bloc — « Derniers appels » : vrai tableau aligné (heure, état, service, modèle, durée, tokens). */
   function renderRecentBlock(recent) {
-    const block = h("section", { class: "dash-block" });
-    block.append(h("h3", { class: "dash-title", text: "Derniers appels" }));
-    const rows = recent || [];
+    const block = h("section", { class: "dash-block card" });
+    const rows = Array.isArray(recent) ? recent : [];
+
+    const headCard = h("div", { class: "card-h" });
+    headCard.append(h("h3", { class: "dash-title", text: "Derniers appels" }));
+    headCard.append(
+      h("span", { class: "card-h-meta", text: rows.length === 0 ? "—" : `${rows.length} dernier(s)` }),
+    );
+    block.append(headCard);
+
     if (rows.length === 0) {
-      block.append(h("p", { class: "muted", text: "Aucun appel journalisé." }));
+      block.append(h("div", { class: "dash-body" }, h("p", { class: "muted", text: "Aucun appel journalisé." })));
       return block;
     }
-    const list = h("ol", { class: "recent-list" });
-    for (const entry of rows) list.append(recentRow(entry));
-    block.append(list);
+
+    const table = h("table", { class: "calls-table" });
+    const head = h("tr");
+    for (const [label, title] of [
+      ["heure", "heure de la tentative"],
+      ["état", "verdict de la tentative"],
+      ["service", "nom du service appelé"],
+      ["modèle", "modèle réellement appelé"],
+      ["durée", "durée de la tentative"],
+      ["tokens", "tokens consommés (— = non exposé)"],
+    ]) {
+      head.append(h("th", { text: label, attrs: { title } }));
+    }
+    const thead = h("thead");
+    thead.append(head);
+    table.append(thead);
+
+    const tbody = h("tbody");
+    for (const entry of rows) tbody.append(recentRow(entry));
+    table.append(tbody);
+
+    block.append(h("div", { class: "dash-body" }, h("div", { class: "table-wrap" }, table)));
     return block;
   }
 
@@ -3013,14 +3349,15 @@ import {
     lastDashboard = data;
     recentEntries = Array.isArray(data.recent) ? data.recent.slice(0, RECENT_LIMIT) : [];
 
+    // Ordre validé : KPI 24 h → (En ce moment | Tokens) → Par clé → Derniers appels.
     const view = liveState ? liveView() : data.live;
     const row = h("div", { class: "dash-row" });
     const liveHost = renderLiveBlock(view);
     const keyHost = renderKeyBlock(keysWithLive(data.byKey));
     const recentHost = renderRecentBlock(recentEntries);
     row.append(liveHost);
-    row.append(renderSummaryBlock(data.activity));
-    host.replaceChildren(row, keyHost, renderTokensBlock(data.tokens), recentHost);
+    row.append(renderTokensBlock(data.tokens));
+    host.replaceChildren(renderSummaryBlock(data.activity, recentEntries), row, keyHost, recentHost);
     // Références des blocs DIRECT (seuls repeints par le WebSocket).
     dashHosts = { live: liveHost, key: keyHost, recent: recentHost };
   }
@@ -3219,6 +3556,16 @@ import {
     if (appShell) appShell.hidden = true;
     if (loginScreen) loginScreen.hidden = false;
     const input = $("login-password");
+    // Retour à l'écran de connexion : la saisie repasse TOUJOURS en masqué.
+    if (input && input.type === "text") {
+      input.type = "password";
+      const reveal = $("login-reveal");
+      if (reveal) {
+        reveal.classList.remove("is-revealed");
+        reveal.setAttribute("aria-pressed", "false");
+        reveal.setAttribute("aria-label", "Afficher le mot de passe");
+      }
+    }
     if (input) input.focus();
   }
 
@@ -3260,6 +3607,41 @@ import {
     }
   }
 
+  /**
+   * État de chargement du bouton de connexion : le libellé change, un fouet
+   * tourne et `aria-busy` l'annonce. Jamais un clic muet (le bouton reste
+   * désactivé pendant la requête, le double envoi est impossible).
+   */
+  function setLoginBusy(button, busy) {
+    if (!button) return;
+    button.disabled = busy;
+    button.classList.toggle("is-busy", busy);
+    if (busy) button.setAttribute("aria-busy", "true");
+    else button.removeAttribute("aria-busy");
+    const label = button.querySelector(".login-submit-label");
+    if (label) label.textContent = busy ? "Connexion…" : "Se connecter";
+  }
+
+  /**
+   * Bouton œil du champ mot de passe : affiche ou masque la SAISIE (la valeur
+   * n'est jamais journalisée ni envoyée ailleurs), et remet le focus au champ.
+   */
+  function wireLoginReveal() {
+    const toggle = $("login-reveal");
+    const input = $("login-password");
+    if (!toggle || !input) return;
+    toggle.addEventListener("click", () => {
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      toggle.classList.toggle("is-revealed", reveal);
+      toggle.setAttribute("aria-pressed", reveal ? "true" : "false");
+      const label = reveal ? "Masquer le mot de passe" : "Afficher le mot de passe";
+      toggle.setAttribute("aria-label", label);
+      toggle.setAttribute("title", label);
+      input.focus();
+    });
+  }
+
   /** Soumission du mot de passe : connexion ou message d'erreur clair. */
   async function submitLogin(event) {
     event.preventDefault();
@@ -3274,7 +3656,7 @@ import {
     if (!password) return;
     // GET /api/session (au chargement) a déjà posé le cookie CSRF anonyme.
     if (!state.csrfToken) await refreshSession();
-    if (button) button.disabled = true;
+    setLoginBusy(button, true);
     try {
       const data = await apiRequest("/api/session/login", { method: "POST", body: { password } });
       if (input) input.value = "";
@@ -3290,7 +3672,7 @@ import {
         input.focus();
       }
     } finally {
-      if (button) button.disabled = false;
+      setLoginBusy(button, false);
     }
   }
 
@@ -3373,6 +3755,7 @@ import {
   function wireSession() {
     const loginForm = $("login-form");
     if (loginForm) loginForm.addEventListener("submit", submitLogin);
+    wireLoginReveal();
     const logoutBtn = $("logout-btn");
     if (logoutBtn) logoutBtn.addEventListener("click", () => logout());
     const passwordForm = $("password-form");

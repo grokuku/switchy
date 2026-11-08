@@ -31,6 +31,9 @@ describe("interface — onglets et endpoints", () => {
     const res = await request(env.app).get("/app.js");
     expect(res.status).toBe(200);
     expect(res.text).toContain("/api/providers");
+    // Compteur de modèles : affiché seulement si le champ est présent (jamais inventé).
+    expect(res.text).toContain("p.modelCount !== undefined");
+    expect(res.text).toContain("modèles ");
     expect(res.text).toContain("/api/services");
     expect(res.text).toContain("/api/settings");
     expect(res.text).toContain("/api/keys");

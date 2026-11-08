@@ -20,14 +20,29 @@ import {
   deleteProvider,
   toPublicProvider,
 } from "../catalog-store.js";
-import { describeProviderModel, listProviderModels } from "../llm/model-catalog.js";
+import { describeProviderModel, listProviderModels, cachedModelCount } from "../llm/model-catalog.js";
 import { errorBody } from "../utils/api-error.js";
 import { requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 
 const router = Router();
 
+/** Fournisseur public enrichi du compteur de modèles (calculé en mémoire,
+ * jamais par appel réseau au fournisseur). */
+function toPublicProviderWithCount(provider: ReturnType<typeof listProviders>[number]) {
+  const record = provider as unknown as Record<string, unknown>;
+  const storedModels = record.models
+    ?? record.modelIds
+    ?? record.availableModels
+    ?? record.modelList;
+  let count: number | undefined;
+  if (Array.isArray(storedModels)) count = storedModels.length;
+  else if (storedModels && typeof storedModels === "object") count = Object.keys(storedModels as Record<string, unknown>).length;
+  if (count === undefined) count = cachedModelCount(provider.id) ?? 0;
+  return { ...toPublicProvider(provider), modelCount: count };
+}
+
 router.get("/", (_req: Request, res: Response) => {
-  res.json({ providers: listProviders().map(toPublicProvider) });
+  res.json({ providers: listProviders().map(toPublicProviderWithCount) });
 });
 
 /** `?refresh=1` contourne le cache court (bouton « rafraîchir » de l'interface). */
@@ -76,7 +91,7 @@ router.get("/:id/models/*", async (req: Request, res: Response) => {
 router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     const provider = createProvider(req.body);
-    res.status(201).json({ provider: toPublicProvider(provider) });
+    res.status(201).json({ provider: toPublicProviderWithCount(provider) });
   } catch (err) {
     const { status, body } = errorBody(err);
     res.status(status).json(body);
@@ -86,7 +101,7 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
 router.put("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
   try {
     const provider = updateProvider(String(req.params.id), req.body);
-    res.json({ provider: toPublicProvider(provider) });
+    res.json({ provider: toPublicProviderWithCount(provider) });
   } catch (err) {
     const { status, body } = errorBody(err);
     res.status(status).json(body);
