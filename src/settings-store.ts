@@ -343,7 +343,9 @@ export function isSecretSetting(spec: SettingSpec): boolean {
 
 // ── Validation d'une valeur proposée ──
 
-export type ValidationResult = { ok: true; value: string } | { ok: false; error: string };
+export type ValidationResult =
+  | { ok: true; value: string }
+  | { ok: false; error: string; code?: "PATH_OUTSIDE_DATA_DIR" };
 
 /** Normalise et valide une valeur selon le type déclaré du réglage. */
 export function validateSettingValue(spec: SettingSpec, raw: unknown): ValidationResult {
@@ -373,8 +375,30 @@ export function validateSettingValue(spec: SettingSpec, raw: unknown): Validatio
         .filter(Boolean);
       return { ok: true, value: items.join(",") };
     }
+    // ── Chemins : CONFINÉS au répertoire de données ──
+    // ⚠️ Sans ce contrôle, `POST /api/settings` laissait une session (ou une
+    // simple CLÉ D'API) faire écrire un JSON contrôlé en 0600 + `rename`
+    // N'IMPORTE OÙ (ex. `/etc/cron.d/x`) : SWITCHY_KEYS_FILE,
+    // SWITCHY_CATALOG_FILE et SWITCHY_CALLS_LOG_FILE sont éditables.
+    case "path": {
+      if (spec.options && !spec.options.includes(trimmed)) {
+        return { ok: false, error: `${spec.name}: expected one of ${spec.options.join(", ")}` };
+      }
+      if (trimmed === "") return { ok: false, error: `${spec.name}: expected a path` };
+      const resolved = path.resolve(trimmed);
+      const base = envDataDir();
+      const relative = path.relative(base, resolved);
+      const outside = relative === "" ? false : relative.startsWith("..") || path.isAbsolute(relative);
+      if (outside) {
+        return {
+          ok: false,
+          error: `${spec.name}: path must stay inside the data directory (${base})`,
+          code: "PATH_OUTSIDE_DATA_DIR",
+        };
+      }
+      return { ok: true, value: resolved };
+    }
     case "secret":
-    case "path":
     case "string":
     default: {
       if (spec.options && !spec.options.includes(trimmed)) {

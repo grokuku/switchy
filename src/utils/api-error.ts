@@ -53,6 +53,9 @@ export function errorBody(err: unknown): { status: number; body: Record<string, 
     if (err.errors) body.errors = err.errors;
     return { status: err.status, body };
   }
-  const message = err instanceof Error ? err.message : String(err);
-  return { status: 500, body: { error: message || "Internal error", code: "INTERNAL_ERROR" } };
+  // Erreur INATTENDUE : son message brut (chemins du dossier de données,
+  // `EACCES`, `ENOTDIR`…) ne sort JAMAIS vers le client — c'est de la
+  // reconnaissance gratuite. Il reste côté serveur, où il est journalisé
+  // (voir le gestionnaire d'erreurs de `index.ts`).
+  return { status: 500, body: { error: "Internal error", code: "INTERNAL_ERROR" } };
 }

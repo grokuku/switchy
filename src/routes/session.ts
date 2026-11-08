@@ -10,17 +10,20 @@
  *                                n'est révélé QUE dans une session valide.
  *   POST /api/session/password → change le mot de passe admin (vérifie `current`)
  *                                et incrémente l'époque → invalide toutes les sessions.
+ *   POST /api/session/revoke   → révoque TOUTES les sessions (incrémente l'époque
+ *                                de session, distincte de celle du mot de passe).
  *
  * Aucune clé d'API n'est créée ni stockée ici : les CLÉS D'API des outils restent
  * gérées par `/api/keys` (voir `routes/keys.ts`).
  */
 import { Router, type Request, type Response } from "express";
 import rateLimit, { MemoryStore } from "express-rate-limit";
-import { requireApiAuth, requireCsrf, requireCsrfForSession } from "../middleware/api-auth.js";
+import { requireCsrf, requireCsrfForSession, requireSession } from "../middleware/api-auth.js";
 import {
   issueSession,
   verifyAdminPassword,
   setAdminPassword,
+  revokeAllSessions,
   getSessionFromRequest,
   isPasswordDefault,
   csrfTokenForRequest,
@@ -101,9 +104,27 @@ router.get("/", (req: Request, res: Response) => {
   }
 });
 
+// POST /api/session/revoke — révoque TOUTES les sessions (y compris la courante).
+// Incrémente l'époque de SESSION (distincte de celle du mot de passe) : tout jeton
+// déjà émis — donc tout cookie intercepté — est refusé au prochain appel.
+// ⚠️ Session obligatoire (une clé d'API ne peut pas révoquer la session d'un humain),
+// mais PAS de garde-fou « mot de passe par défaut » : la révocation ne peut pas
+// enfermer dehors (on se reconnecte avec le mot de passe courant, `admin` compris).
+router.post("/revoke", requireSession, requireCsrf, (req: Request, res: Response) => {
+  const epoch = revokeAllSessions();
+  res.setHeader("Set-Cookie", clearSessionCookieHeader(req));
+  res.json({ success: true, sessionEpoch: epoch });
+});
+
 // POST /api/session/password — change le mot de passe admin (invalide les sessions).
-// Autorisé même tant que le mot de passe courant est le défaut (c'est la sortie).
-router.post("/password", requireApiAuth, requireCsrfForSession, (req: Request, res: Response) => {
+// ⚠️ SESSION OBLIGATOIRE (cookie) : une clé d'API est REFUSÉE ici. Sinon un
+// porteur de `SWITCHY_API_KEY` pouvait changer le mot de passe admin — y compris
+// pendant que le défaut `admin` était encore en vigueur.
+// ⚠️ LIMITEUR de login appliqué : sans lui, un porteur de clé testait `current`
+// à ~600 essais/minute (scrypt synchrone à chaque fois).
+// Autorisé même tant que le mot de passe courant est le défaut (c'est la sortie) :
+// l'amorçage reste possible (login `admin` → cette route).
+router.post("/password", loginRateLimiter, requireSession, requireCsrf, (req: Request, res: Response) => {
   const { current, next } = (req.body ?? {}) as { current?: unknown; next?: unknown };
   if (typeof current !== "string" || typeof next !== "string") {
     return res.status(400).json({ error: "current and next are required" });

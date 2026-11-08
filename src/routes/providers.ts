@@ -19,6 +19,7 @@ import {
   updateProvider,
   deleteProvider,
   toPublicProvider,
+  runCatalogMutation,
 } from "../catalog-store.js";
 import { describeProviderModel, listProviderModels, cachedModelCount } from "../llm/model-catalog.js";
 import { errorBody } from "../utils/api-error.js";
@@ -88,9 +89,9 @@ router.get("/:id/models/*", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.post("/", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   try {
-    const provider = createProvider(req.body);
+    const provider = await runCatalogMutation(() => createProvider(req.body));
     res.status(201).json({ provider: toPublicProviderWithCount(provider) });
   } catch (err) {
     const { status, body } = errorBody(err);
@@ -98,9 +99,9 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
   }
 });
 
-router.put("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.put("/:id", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   try {
-    const provider = updateProvider(String(req.params.id), req.body);
+    const provider = await runCatalogMutation(() => updateProvider(String(req.params.id), req.body));
     res.json({ provider: toPublicProviderWithCount(provider) });
   } catch (err) {
     const { status, body } = errorBody(err);
@@ -108,9 +109,9 @@ router.put("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, 
   }
 });
 
-router.delete("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.delete("/:id", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   try {
-    deleteProvider(String(req.params.id));
+    await runCatalogMutation(() => deleteProvider(String(req.params.id)));
     res.status(204).end();
   } catch (err) {
     const { status, body } = errorBody(err);

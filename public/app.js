@@ -78,6 +78,18 @@ import {
       const selected = tab.dataset.tab === name;
       tab.classList.toggle("is-active", selected);
       tab.setAttribute("aria-selected", selected ? "true" : "false");
+      // Motif ARIA « tabs » : un seul onglet est atteignable par Tab, les
+      // flèches parcourent le groupe (voir onTabKeydown).
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    // Deep-link cohérent : l'ancre suit l'onglet affiché, pour qu'un F5 (ou un
+    // partage d'URL) retombe sur le MÊME onglet. `replaceState` n'empile pas
+    // d'historique et ne déclenche pas `hashchange` (pas de boucle).
+    if (window.history && typeof window.history.replaceState === "function") {
+      const hash = name === "activity" ? window.location.pathname + window.location.search : `#${name}`;
+      if (window.location.hash !== (name === "activity" ? "" : `#${name}`)) {
+        window.history.replaceState(null, "", hash);
+      }
     }
     for (const [key, panel] of Object.entries(panels)) {
       if (panel) panel.hidden = key !== name;
@@ -407,22 +419,44 @@ import {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(init.body);
     }
-    const res = await fetch(path, opts);
-    const text = await res.text();
-    let data = null;
+    // `fetch` ne connaît pas `timeout` : on le traduit en AbortController. Sans
+    // cela, un appel qui pend (test d'étape, fournisseur muet) laisserait
+    // « Appel en cours… » affiché indéfiniment et le bouton `#test-run`
+    // désactivé : l'interface ne rendrait jamais la main.
+    const timeoutMs = Number.isFinite(init.timeout) && init.timeout > 0 ? init.timeout : 0;
+    let timer = null;
+    if (timeoutMs > 0 && typeof AbortController === "function") {
+      const controller = new AbortController();
+      opts.signal = controller.signal;
+      timer = setTimeout(() => controller.abort(), timeoutMs);
+    }
     try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = null;
-    }
-    if (!res.ok) {
-      const err = new Error((data && (data.error || data.detail)) || `Erreur HTTP ${res.status}`);
-      err.status = res.status;
-      err.data = data;
-      err.body = text;
+      const res = await fetch(path, opts);
+      const text = await res.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+      if (!res.ok) {
+        const err = new Error((data && (data.error || data.detail)) || `Erreur HTTP ${res.status}`);
+        err.status = res.status;
+        err.data = data;
+        err.body = text;
+        throw err;
+      }
+      return data;
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        const timeoutErr = new Error(`Délai dépassé (${Math.round(timeoutMs / 1000)} s).`);
+        timeoutErr.timeout = true;
+        throw timeoutErr;
+      }
       throw err;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
     }
-    return data;
   }
 
   /**
@@ -842,6 +876,7 @@ import {
       return [p.id, p.label, p.type].some((v) => String(v || "").toLowerCase().includes(filter));
     });
 
+    const focusMemo = captureFocusKey(list);
     list.replaceChildren();
     if (state.providers.length === 0) {
       empty.hidden = false;
@@ -859,6 +894,33 @@ import {
     if (status) status.textContent = `${visible.length} / ${state.providers.length}`;
 
     for (const p of visible) list.append(renderProviderCard(p));
+    restoreFocusKey(list, focusMemo);
+  }
+
+  /**
+   * Mémo du focus avant recréation d'une liste : `replaceChildren()` détruit le
+   * bouton qui porte le focus (bascule au clavier → focus sur <body>, `Tab`
+   * repart du début de page). On note la CLÉ stable du bouton (data-focus-key)
+   * et son rang parmi ses jumeaux, puis on la refocalise après reconstruction.
+   */
+  function captureFocusKey(list) {
+    const active = document.activeElement;
+    if (!list || !active || !list.contains(active)) return null;
+    const key = active.getAttribute("data-focus-key");
+    if (!key) return null;
+    const same = Array.from(list.querySelectorAll("[data-focus-key]")).filter(
+      (el) => el.getAttribute("data-focus-key") === key,
+    );
+    return { key, index: same.indexOf(active) };
+  }
+
+  function restoreFocusKey(list, memo) {
+    if (!list || !memo) return;
+    const same = Array.from(list.querySelectorAll("[data-focus-key]")).filter(
+      (el) => el.getAttribute("data-focus-key") === memo.key,
+    );
+    const target = same[memo.index] || same[0];
+    if (target && typeof target.focus === "function") target.focus();
   }
 
   function renderProviderCard(p) {
@@ -874,12 +936,18 @@ import {
 
     const actions = h("div", { class: "item-actions" });
     actions.append(
-      iconButton("pencil", "Modifier", { class: "btn btn--icon", iconOnly: true, on: { click: () => openProviderForm(p) } }),
+      iconButton("pencil", "Modifier", {
+        class: "btn btn--icon",
+        iconOnly: true,
+        attrs: { "data-focus-key": `provider:${p.id}:edit` },
+        on: { click: () => openProviderForm(p) },
+      }),
     );
     actions.append(
       iconButton("trash", "Supprimer", {
         class: "btn btn--icon btn--danger",
         iconOnly: true,
+        attrs: { "data-focus-key": `provider:${p.id}:delete` },
         on: { click: () => deleteProvider(p) },
       }),
     );
@@ -1100,6 +1168,7 @@ import {
     renderTestServiceSelect();
 
     const visible = servicesView();
+    const focusMemo = captureFocusKey(list);
     list.replaceChildren();
     if (state.services.length === 0) {
       empty.hidden = false;
@@ -1117,6 +1186,7 @@ import {
     if (status) status.textContent = `${visible.length} / ${state.services.length}`;
 
     for (const s of visible) list.append(renderServiceCard(s));
+    restoreFocusKey(list, focusMemo);
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1139,6 +1209,7 @@ import {
       attrs: {
         type: "button",
         "aria-pressed": on ? "true" : "false",
+        "data-focus-key": `service:${service.name}:toggle`,
         title: on ? `Désactiver « ${service.name} »` : `Activer « ${service.name} »`,
       },
       on: { click: () => void toggleServiceEnabled(service) },
@@ -1634,6 +1705,7 @@ import {
       iconButton("pencil", "Modifier", {
         class: "btn btn--icon",
         iconOnly: true,
+        attrs: { "data-focus-key": `service:${s.name}:edit` },
         on: { click: () => openServiceForm(s) },
       }),
     );
@@ -1641,6 +1713,7 @@ import {
       iconButton("trash", "Supprimer", {
         class: "btn btn--icon btn--danger",
         iconOnly: true,
+        attrs: { "data-focus-key": `service:${s.name}:delete` },
         on: { click: () => deleteService(s) },
       }),
     );
@@ -2536,6 +2609,7 @@ import {
     const list = $("keys-list");
     const empty = $("keys-empty");
     if (!list || !empty) return;
+    const focusMemo = captureFocusKey(list);
     list.replaceChildren();
     if (state.keys.length === 0) {
       empty.hidden = false;
@@ -2553,11 +2627,16 @@ import {
 
       const actions = h("div", { class: "list-actions" });
       actions.append(
-        iconButton("trash", "Révoquer", { class: "btn btn--danger", on: { click: () => revokeKey(k) } }),
+        iconButton("trash", "Révoquer", {
+          class: "btn btn--danger",
+          attrs: { "data-focus-key": `key:${k.name || k.keyPreview || ""}:revoke` },
+          on: { click: () => revokeKey(k) },
+        }),
       );
       li.append(actions);
       list.append(li);
     }
+    restoreFocusKey(list, focusMemo);
   }
 
   async function createKey() {
@@ -3120,6 +3199,9 @@ import {
     const tbody = h("tbody");
     for (const row of rows) {
       const tr = h("tr", { class: "key-row" });
+      // Identifiant d'affichage : permet la mise à jour EN PLACE de la seule
+      // cellule « en cours » (voir `paintKeyBlock`) sans reconstruire le bloc.
+      tr.dataset.key = row.key || "inconnu";
       tr.append(h("th", { text: row.key || "inconnu", attrs: { scope: "row", title: row.key || "inconnu" } }));
       const inFlight = Number(row.inFlight) || 0;
       tr.append(h("td", { class: inFlight > 0 ? "key-inflight key-inflight--on" : "key-inflight", text: String(inFlight) }));
@@ -3294,16 +3376,52 @@ import {
     dashHosts.live.replaceChildren(...Array.from(renderLiveBlock(view).childNodes));
   }
 
-  /** Repeint « Par clé » (colonne « en cours » seulement, depuis le direct). */
-  function paintKeyBlock() {
+  /**
+   * « Par clé » : sur une frame `live` (jusqu'à ~3 fois par seconde), SEULE la
+   * cellule « en cours » est réécrite. Le rendu COMPLET n'a lieu que pour le
+   * snapshot initial (reconnexion) ou si la composition du tableau a changé —
+   * un `replaceChildren` global à chaque frame détruisait la sélection, le
+   * focus et le défilement.
+   */
+  function paintKeyBlock(full) {
     if (!dashHosts || !dashHosts.key || !lastDashboard) return;
-    dashHosts.key.replaceChildren(...Array.from(renderKeyBlock(keysWithLive(lastDashboard.byKey)).childNodes));
+    const rows = keysWithLive(lastDashboard.byKey);
+    const tbody = full ? null : dashHosts.key.querySelector("tbody");
+    const domRows = tbody ? Array.from(tbody.querySelectorAll("tr.key-row")) : [];
+    const wanted = rows.map((row) => row.key || "inconnu");
+    const sameShape =
+      domRows.length === wanted.length &&
+      domRows.every((tr, i) => (tr.dataset.key || "") === wanted[i]);
+    if (!tbody || !sameShape) {
+      dashHosts.key.replaceChildren(...Array.from(renderKeyBlock(rows).childNodes));
+      return;
+    }
+    rows.forEach((row, i) => {
+      const cell = domRows[i].querySelector("td.key-inflight");
+      if (!cell) return;
+      const inFlight = Number(row.inFlight) || 0;
+      cell.textContent = String(inFlight);
+      cell.className = inFlight > 0 ? "key-inflight key-inflight--on" : "key-inflight";
+    });
   }
 
-  /** Repeint « Derniers appels » (les nouvelles lignes arrivent en tête). */
-  function paintRecent() {
+  /**
+   * « Derniers appels » : une frame `call` PRÉPEND la nouvelle ligne et retire
+   * la dernière (au-delà de RECENT_LIMIT), au lieu de reconstruire tout le
+   * tableau à chaque appel. Rendu complet seulement pour le snapshot.
+   */
+  function paintRecent(full) {
     if (!dashHosts || !dashHosts.recent) return;
-    dashHosts.recent.replaceChildren(...Array.from(renderRecentBlock(recentEntries).childNodes));
+    const tbody = full ? null : dashHosts.recent.querySelector("tbody");
+    const entry = recentEntries[0];
+    if (!tbody || !entry) {
+      dashHosts.recent.replaceChildren(...Array.from(renderRecentBlock(recentEntries).childNodes));
+      return;
+    }
+    tbody.prepend(recentRow(entry));
+    while (tbody.children.length > RECENT_LIMIT) tbody.removeChild(tbody.lastElementChild);
+    const meta = dashHosts.recent.querySelector(".card-h-meta");
+    if (meta) meta.textContent = `${recentEntries.length} dernier(s)`;
   }
 
   /** Applique une frame du direct (`snapshot`, `live` ou `call`). */
@@ -3314,17 +3432,20 @@ import {
       if (!entry || typeof entry !== "object") return;
       recentEntries.unshift(entry);
       if (recentEntries.length > RECENT_LIMIT) recentEntries.length = RECENT_LIMIT;
-      paintRecent();
+      paintRecent(false);
       return;
     }
     if (frame.type !== "snapshot" && frame.type !== "live") return;
+    const isSnapshot = frame.type === "snapshot";
     liveState = {
       providers: Array.isArray(frame.providers) ? frame.providers : [],
       keys: Array.isArray(frame.keys) ? frame.keys : [],
       totals: frame.totals || { active: 0, queued: 0 },
     };
     paintLiveBlock();
-    paintKeyBlock();
+    // Snapshot (connexion / reconnexion) = rendu COMPLET ; `live` = en place.
+    paintKeyBlock(isSnapshot);
+    if (isSnapshot) paintRecent(true);
   }
 
   /**
@@ -3751,6 +3872,21 @@ import {
     }
   }
 
+  /**
+   * Révocation de TOUTES les sessions (époque de session côté serveur).
+   * Inverse du logout simple : un cookie intercepté cesse d'être valable.
+   * Le mot de passe n'est pas touché → reconnexion possible immédiatement.
+   */
+  async function revokeSessions() {
+    try {
+      await apiRequest("/api/session/revoke", { method: "POST" });
+      notify("Sessions révoquées — reconnectez-vous.", "success");
+      showLogin();
+    } catch (err) {
+      handleApiError(err, "Échec de la révocation des sessions.");
+    }
+  }
+
   /** Câble les contrôles de session (connexion, déconnexion, mot de passe). */
   function wireSession() {
     const loginForm = $("login-form");
@@ -3760,6 +3896,8 @@ import {
     if (logoutBtn) logoutBtn.addEventListener("click", () => logout());
     const passwordForm = $("password-form");
     if (passwordForm) passwordForm.addEventListener("submit", changePassword);
+    const revokeBtn = $("revoke-sessions-btn");
+    if (revokeBtn) revokeBtn.addEventListener("click", () => revokeSessions());
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -3767,7 +3905,33 @@ import {
   // ════════════════════════════════════════════════════════════════════════
 
   function wireTabs() {
-    for (const tab of tabs) tab.addEventListener("click", () => activate(tab.dataset.tab));
+    for (const tab of tabs) {
+      tab.addEventListener("click", () => activate(tab.dataset.tab));
+      tab.addEventListener("keydown", onTabKeydown);
+    }
+    // L'ancre est la source de vérité du deep-link : la modifier (bouton
+    // précédent/suivant, saisie manuelle) change d'onglet.
+    window.addEventListener("hashchange", () => {
+      const name = tabFromHash();
+      if (name !== activeTab) activate(name);
+    });
+  }
+
+  /** Motif ARIA « tabs » : ←/→/Home/End déplacent le focus ET activent. */
+  function onTabKeydown(event) {
+    const current = tabs.indexOf(event.currentTarget);
+    if (current < 0) return;
+    let next = current;
+    if (event.key === "ArrowRight") next = (current + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") next = (current - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    const target = tabs[next];
+    if (!target) return;
+    activate(target.dataset.tab);
+    target.focus();
   }
 
   function wireToolbars() {
@@ -3837,7 +4001,10 @@ import {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       stopLive();
-    } else if (activeTab === "activity") {
+    } else if (state.authenticated && activeTab === "activity") {
+      // ⚠️ Sans la garde, le retour d'onglet AVANT connexion (ou après
+      // expiration) appelait /api/dashboard → 401 → toast « Session expirée »
+      // alors qu'aucune session n'avait jamais existé.
       loadDashboard();
       startLive();
     }

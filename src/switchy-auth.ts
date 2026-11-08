@@ -22,6 +22,7 @@ import crypto from "crypto";
 import { type Request } from "express";
 import { hashSecret, verifySecretHash, safeEqualSecret } from "./utils/secret-hash.js";
 import { getKeysFile, getApiKey } from "./config.js";
+import { AsyncMutex } from "./utils/async-mutex.js";
 
 // ── Types ──
 
@@ -74,6 +75,7 @@ export function loadKeys(): ApiKeyRecord[] {
       const stat = statSync(keysFile);
       if (stat.mtimeMs !== keysFileMtimeMs) {
         validationCache.clear();
+        negativeCache.clear();
         keysFileMtimeMs = stat.mtimeMs;
       }
       const raw = JSON.parse(readFileSync(keysFile, "utf-8")) as unknown;
@@ -92,6 +94,12 @@ export function saveKeys(keys: ApiKeyRecord[]): void {
   const tmpFile = `${keysFile}.tmp`;
   writeFileSync(tmpFile, JSON.stringify(keys, null, 2), { mode: 0o600 });
   renameSync(tmpFile, keysFile);
+  // Le mtime que NOUS venons d'écrire est mémorisé : sans cela, la prochaine
+  // `loadKeys` croirait à une modification externe et viderait le cache de
+  // validation (⇒ un scryptSync par clé au premier appel suivant).
+  try {
+    keysFileMtimeMs = statSync(keysFile).mtimeMs;
+  } catch {}
 }
 
 /** Nouvelle clé API : « switchy_ » + 32 caractères hexadécimaux. */
@@ -140,7 +148,21 @@ export function createKey(name: string): { key: PublicApiKey; secret: string } {
   keys.push(record);
   saveKeys(keys);
   validationCache.clear();
+  negativeCache.clear();
   return { key: toPublicKey(record), secret };
+}
+
+/**
+ * File d'écriture du fichier de clés : création et révocation sont sérialisées
+ * (« lire → modifier → écrire »), pour qu'un `recordUsage` (qui réécrit tout le
+ * fichier) ne puisse jamais réécrire une version antérieure et perdre une clé
+ * fraîchement créée.
+ */
+const keysMutex = new AsyncMutex();
+
+/** Exécute une mutation du fichier de clés en série (voir `utils/async-mutex.ts`). */
+export function runKeysMutation<T>(fn: () => T | Promise<T>): Promise<T> {
+  return keysMutex.run(fn);
 }
 
 /** Révoque (supprime) une clé par son identifiant NON secret. */
@@ -150,14 +172,78 @@ export function revokeKey(id: string): boolean {
   if (filtered.length === keys.length) return false;
   saveKeys(filtered);
   validationCache.clear();
+  negativeCache.clear();
   return true;
 }
 
 // ── Validation ──
 
-/** Cache mémo (mémoire vive uniquement) : secret présenté → identité validée. */
+/**
+ * Cache mémo (mémoire vive uniquement) : identité validée d'un candidat.
+ *
+ * ⚠️ L'INDEX est l'empreinte SHA-256 du candidat — un identifiant NON SECRET et
+ * non réversible — jamais le secret en clair : une carte mémoire (core dump,
+ * inspection de tas) ne doit jamais révéler de secret utilisable.
+ *
+ * ⚠️ Pourquoi pas l'`id` de la clé en index : le but du cache est précisément
+ * d'éviter `loadKeys()` + `scryptSync` (~100 ms) ; or l'`id` n'est connu qu'APRÈS
+ * cette vérification. L'empreinte est donc le seul identifiant non secret
+ * disponible AVANT le lookup. L'identité (id + nom) reste portée par la valeur.
+ *
+ * Éviction LRU (et non `clear()` global) : au-delà du plafond, seule l'entrée la
+ * moins récemment utilisée est jetée. Un `clear()` faisait retomber la prochaine
+ * rafale de requêtes sur `#clés × ~100 ms` de `scryptSync` synchrone.
+ */
 const validationCache = new Map<string, ResolvedIdentity>();
 const VALIDATION_CACHE_MAX = 500;
+
+/** Plafond EFFECTIF du cache positif (abaissé par les tests seulement). */
+let validationCacheMax = VALIDATION_CACHE_MAX;
+
+/**
+ * Cache NÉGATIF borné des candidats REFUSÉS.
+ *
+ * ⚠️ Sans lui, un candidat invalide repartait dans `matchFileKey` à CHAQUE
+ * essai, soit un `scryptSync` (~100 ms, SYNCHRONE, thread principal) par clé
+ * stockée : un anonyme envoyant `Bearer x` en boucle gelait toute la passerelle
+ * (HTTP comme WebSocket).
+ *
+ * La clé du cache est, comme pour le cache positif depuis le constat [17],
+ * l'empreinte SHA-256 du candidat — un hash NON réversible, jamais le secret.
+ * TTL court (10 s) et taille plafonnée : une clé créée entre-temps est vue au
+ * plus tard après expiration, et la mémoire reste bornée.
+ */
+const negativeCache = new Map<string, number>();
+const NEGATIVE_CACHE_MAX = 500;
+const NEGATIVE_CACHE_TTL_MS = 10_000;
+
+/** Empreinte non réversible d'un candidat présenté. */
+function fingerprint(candidate: string): string {
+  return crypto.createHash("sha256").update(candidate, "utf-8").digest("hex");
+}
+
+function isNegativelyCached(fp: string): boolean {
+  const expiresAt = negativeCache.get(fp);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= Date.now()) {
+    negativeCache.delete(fp);
+    return false;
+  }
+  return true;
+}
+
+function rememberNegative(fp: string): void {
+  if (negativeCache.size >= NEGATIVE_CACHE_MAX) {
+    const now = Date.now();
+    for (const [key, expiresAt] of negativeCache) if (expiresAt <= now) negativeCache.delete(key);
+    // Toujours plein : éviction de l'entrée la plus ancienne (Map = ordre d'insertion).
+    if (negativeCache.size >= NEGATIVE_CACHE_MAX) {
+      const oldest = negativeCache.keys().next();
+      if (!oldest.done) negativeCache.delete(oldest.value);
+    }
+  }
+  negativeCache.set(fp, Date.now() + NEGATIVE_CACHE_TTL_MS);
+}
 
 function matchFileKey(secret: string, keys: ApiKeyRecord[]): ApiKeyRecord | null {
   for (const k of keys) {
@@ -181,14 +267,56 @@ export function resolveIdentity(secret: string): ResolvedIdentity | null {
   return null;
 }
 
+/**
+ * Résout un candidat en identité EN PASSANT PAR LES CACHES (positif puis
+ * négatif) : un candidat déjà validé ne repaie JAMAIS les ~100 ms de scrypt,
+ * et un candidat déjà refusé non plus (pendant le TTL du cache négatif).
+ *
+ * C'est cette fonction que doit utiliser tout appelant ayant besoin de
+ * l'identité (nom de clé, horodatage d'usage) : appeler `validateKey` PUIS
+ * `resolveIdentity` repayait un scrypt complet à chaque requête relayée.
+ */
+export function resolveKeyIdentity(candidate: string): ResolvedIdentity | null {
+  const fp = fingerprint(candidate);
+  // 1. cache positif (empreinte non secrète) — LRU : une lecture réinsère l'entrée.
+  const cached = validationCache.get(fp);
+  if (cached) {
+    validationCache.delete(fp);
+    validationCache.set(fp, cached);
+    return cached;
+  }
+  // 2. cache négatif (empreinte, TTL court)
+  if (isNegativelyCached(fp)) return null;
+  // 3. vérification réelle (scrypt)
+  const identity = resolveIdentity(candidate);
+  if (!identity) {
+    rememberNegative(fp);
+    return null;
+  }
+  // 4. mémorisation bornée : éviction de l'entrée la MOINS récemment utilisée
+  //    (Map = ordre d'insertion) — jamais un `clear()` global.
+  while (validationCache.size >= validationCacheMax) {
+    const oldest = validationCache.keys().next();
+    if (oldest.done) break;
+    validationCache.delete(oldest.value);
+  }
+  validationCache.set(fp, identity);
+  return identity;
+}
+
+/** Abaisse le plafond du cache positif (outil de test) ; `null` rétablit le défaut. */
+export function setValidationCacheMaxForTests(max: number | null): void {
+  validationCacheMax = max === null ? VALIDATION_CACHE_MAX : Math.max(1, Math.floor(max));
+}
+
+/** Empreintes actuellement en cache positif (outil de test — jamais des secrets). */
+export function positiveCacheKeysForTests(): string[] {
+  return [...validationCache.keys()];
+}
+
 /** Valide une clé API présentée (true si connue et active). */
 export function validateKey(key: string): boolean {
-  if (validationCache.has(key)) return true;
-  const identity = resolveIdentity(key);
-  if (!identity) return false;
-  if (validationCache.size >= VALIDATION_CACHE_MAX) validationCache.clear();
-  validationCache.set(key, identity);
-  return true;
+  return resolveKeyIdentity(key) !== null;
 }
 
 // ── Horodatage d'usage (lastUsedAt), écrit au plus une fois par minute ──
@@ -214,7 +342,9 @@ export function recordUsage(id: string): void {
 
 /** Réinitialise les caches mémo (outil de test). */
 export function resetAuthCaches(): void {
+  validationCacheMax = VALIDATION_CACHE_MAX;
   validationCache.clear();
+  negativeCache.clear();
   lastTouchMs.clear();
   keysFileMtimeMs = -1;
 }

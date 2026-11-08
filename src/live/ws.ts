@@ -43,6 +43,57 @@ export const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_MS * 3;
 /** Taille maximale d'une frame entrante (aucune commande n'est attendue). */
 const MAX_INBOUND_FRAME = 64 * 1024;
 
+/**
+ * Seau anti-abus du handshake `/ws/activity`.
+ *
+ * ⚠️ Le rate-limit d'Express ne voit JAMAIS les `upgrade` (ils n'entrent pas
+ * dans la pile HTTP). Sans ce seau, un anonyme pouvait ouvrir des milliers de
+ * handshakes : chacun déclenchait une validation de clé (potentiellement un
+ * `scryptSync` par clé stockée) et faisait grossir l'ensemble des connexions.
+ * Le compteur est tenu AVANT l'authentification, par IP.
+ */
+export const WS_UPGRADE_RATE_LIMIT = 30;
+export const WS_UPGRADE_RATE_WINDOW_MS = 60_000;
+const WS_UPGRADE_BUCKETS_MAX = 10_000;
+
+const upgradeBuckets = new Map<string, { count: number; resetAt: number }>();
+
+/** Purge périodique (unref : ne retient jamais le processus en vie). */
+const upgradePrune = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, bucket] of upgradeBuckets) if (bucket.resetAt <= now) upgradeBuckets.delete(ip);
+}, WS_UPGRADE_RATE_WINDOW_MS);
+(upgradePrune as { unref?: () => void })?.unref?.();
+
+/**
+ * Consomme une tentative de handshake pour `ip`. `false` = quota épuisé
+ * (429), l'authentification n'est même pas tentée.
+ */
+export function consumeUpgradeAttempt(ip: string): boolean {
+  const now = Date.now();
+  const bucket = upgradeBuckets.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    // Plafond dur de la carte : évite une croissance mémoire par IP usurpée.
+    if (!bucket && upgradeBuckets.size >= WS_UPGRADE_BUCKETS_MAX) {
+      for (const [oldIp, b] of upgradeBuckets) if (b.resetAt <= now) upgradeBuckets.delete(oldIp);
+      if (upgradeBuckets.size >= WS_UPGRADE_BUCKETS_MAX) {
+        const oldest = upgradeBuckets.keys().next();
+        if (!oldest.done) upgradeBuckets.delete(oldest.value);
+      }
+    }
+    upgradeBuckets.set(ip, { count: 1, resetAt: now + WS_UPGRADE_RATE_WINDOW_MS });
+    return true;
+  }
+  if (bucket.count >= WS_UPGRADE_RATE_LIMIT) return false;
+  bucket.count += 1;
+  return true;
+}
+
+/** Réinitialise les seaux du handshake (outil de test). */
+export function resetUpgradeRateLimit(): void {
+  upgradeBuckets.clear();
+}
+
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /** En-tête `Sec-WebSocket-Accept` attendu pour une clé cliente donnée. */
@@ -99,15 +150,25 @@ export function isActivityConnectionAuthorized(req: IncomingMessage, url: URL): 
 
 /** Réponse HTTP minimale puis fermeture (handshake refusé). */
 function rejectUpgrade(socket: Duplex, status: number, reason: string, body: string): void {
-  const payload = JSON.stringify({ error: reason, code: reason });
+  const payload = JSON.stringify({ error: body, code: reason });
+  const statusText =
+    status === 401 ? "Unauthorized" : status === 429 ? "Too Many Requests" : "Bad Request";
   socket.write(
-    `HTTP/1.1 ${status} ${status === 401 ? "Unauthorized" : "Bad Request"}\r\n` +
+    `HTTP/1.1 ${status} ${statusText}\r\n` +
       "Content-Type: application/json\r\n" +
       `Content-Length: ${Buffer.byteLength(payload)}\r\n` +
       "Connection: close\r\n\r\n" +
       payload,
   );
   socket.destroy();
+}
+
+/** IP de l'appelant pour le seau du handshake (X-Forwarded-For si proxy de confiance). */
+function upgradeClientIp(req: IncomingMessage): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
+  if (first) return first;
+  return req.socket?.remoteAddress ?? "unknown";
 }
 
 /** Une connexion du direct : envoi de frames + lecture des pings/close. */
@@ -224,6 +285,17 @@ export function attachActivityWs(server: Server): () => void {
       rejectUpgrade(socket, 400, "BAD_REQUEST", "unknown websocket path");
       return;
     }
+
+    // ── Seau anti-abus AVANT l'authentification (le rate-limit HTTP ne voit
+    // pas les `upgrade`) ──
+    if (!consumeUpgradeAttempt(upgradeClientIp(req))) {
+      rejectUpgrade(socket, 429, "RATE_LIMITED", "too many websocket handshakes");
+      return;
+    }
+
+    // ── Seau anti-abus AVANT l'authentification (le rate-limit HTTP ne voit
+    // pas les `upgrade`) ──
+
 
     // ── Authentification AVANT le 101 ──
     if (!isActivityConnectionAuthorized(req, url)) {

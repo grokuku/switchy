@@ -12,7 +12,14 @@
  * la logique fournisseur, et l'appel est journalisé comme les autres.
  */
 import { Router, type Request, type Response } from "express";
-import { listServices, createService, updateService, deleteService, getService } from "../catalog-store.js";
+import {
+  listServices,
+  createService,
+  updateService,
+  deleteService,
+  getService,
+  runCatalogMutation,
+} from "../catalog-store.js";
 import { testServiceStep, TEST_TIMEOUT_MS } from "../llm/relay.js";
 import { requestKeyName, requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
@@ -72,9 +79,9 @@ router.get("/", (_req: Request, res: Response) => {
   res.json({ services: listServices() });
 });
 
-router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.post("/", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   try {
-    const service = createService(req.body);
+    const service = await runCatalogMutation(() => createService(req.body));
     res.status(201).json({ service });
   } catch (err) {
     const { status, body } = errorBody(err);
@@ -82,9 +89,9 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
   }
 });
 
-router.put("/:name", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.put("/:name", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   try {
-    const service = updateService(String(req.params.name), req.body);
+    const service = await runCatalogMutation(() => updateService(String(req.params.name), req.body));
     res.json({ service });
   } catch (err) {
     const { status, body } = errorBody(err);
@@ -92,9 +99,9 @@ router.put("/:name", requireCsrfForSession, rejectDefaultPassword, (req: Request
   }
 });
 
-router.delete("/:name", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.delete("/:name", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   try {
-    deleteService(String(req.params.name));
+    await runCatalogMutation(() => deleteService(String(req.params.name)));
     res.status(204).end();
   } catch (err) {
     const { status, body } = errorBody(err);

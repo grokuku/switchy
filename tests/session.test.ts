@@ -18,7 +18,10 @@ import {
   CSRF_COOKIE,
   DEFAULT_ADMIN_PASSWORD,
   getStoredPasswordHash,
+  getSessionSecret,
+  getSessionEpoch,
 } from "../src/session-store.js";
+import { signSession } from "../src/utils/session-crypto.js";
 import { verifySecretHash } from "../src/utils/secret-hash.js";
 import { resetSettingsCache } from "../src/settings-store.js";
 
@@ -158,6 +161,119 @@ describe("POST /api/session/password", () => {
       .set("X-CSRF-Token", lg.body.csrfToken as string)
       .send({ current: "faux", next: "nouveau-secret" });
     expect(res.status).toBe(401);
+  });
+});
+
+
+// ────────────────────────────────────────────────────────────────────────────
+// Constat [11] — `/api/session/password` : SESSION obligatoire (une clé d'API
+// est refusée) et limiteur de login appliqué (anti-force brute sur `current`).
+// ────────────────────────────────────────────────────────────────────────────
+describe("[11] changement de mot de passe réservé à une session", () => {
+  it("une clé d'API ne peut PAS changer le mot de passe admin → 401 SESSION_REQUIRED", async () => {
+    const key = await createApiKey(env.app, "outil-malin");
+    const res = await request(env.app)
+      .post("/api/session/password")
+      .set("X-API-Key", key)
+      .send({ current: DEFAULT_ADMIN_PASSWORD, next: "pris-par-loutil" });
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("SESSION_REQUIRED");
+
+    // Le mot de passe est INCHANGÉ : `admin` fonctionne encore.
+    const state = await sessionState();
+    expect((await login(DEFAULT_ADMIN_PASSWORD, state.csrfToken)).status).toBe(200);
+  });
+
+  it("le limiteur de login s'applique : 5 `current` faux → 429 sur la route", async () => {
+    const { csrfToken } = await sessionState();
+    const lg = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    const csrf = lg.body.csrfToken as string;
+    for (let i = 0; i < 5; i += 1) {
+      const res = await agent
+        .post("/api/session/password")
+        .set("X-CSRF-Token", csrf)
+        .send({ current: "faux", next: "autre-secret" });
+      expect(res.status).toBe(401);
+    }
+    const blocked = await agent
+      .post("/api/session/password")
+      .set("X-CSRF-Token", csrf)
+      .send({ current: "faux", next: "autre-secret" });
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.code).toBe("LOGIN_RATE_LIMITED");
+  });
+
+  it("PARCOURS COMPLET d'amorçage : login `admin` → changement → login avec le nouveau", async () => {
+    // Dossier de données NEUF, aucun hash stocké : l'utilisateur doit pouvoir
+    // définir son mot de passe sans jamais être enfermé dehors.
+    expect(getStoredPasswordHash()).toBeNull();
+    const { csrfToken } = await sessionState();
+    const lg = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    expect(lg.status).toBe(200);
+
+    const changed = await agent
+      .post("/api/session/password")
+      .set("X-CSRF-Token", lg.body.csrfToken as string)
+      .send({ current: DEFAULT_ADMIN_PASSWORD, next: "mon-vrai-secret" });
+    expect(changed.status).toBe(200);
+
+    // Session invalidée par le changement d'époque, puis reconnexion réussie.
+    expect((await agent.get("/api/session")).body.authenticated).toBe(false);
+    const fresh = await sessionState();
+    expect((await login("mon-vrai-secret", fresh.csrfToken)).status).toBe(200);
+    // L'ancien défaut n'est plus accepté (attendu, non ambigu).
+    const again = await sessionState();
+    expect((await login(DEFAULT_ADMIN_PASSWORD, again.csrfToken)).status).toBe(401);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Constat [10] — révocation globale des sessions (époque de session distincte).
+// ────────────────────────────────────────────────────────────────────────────
+describe("[10] révocation de toutes les sessions", () => {
+  it("un jeton émis AVANT la révocation est refusé APRÈS (logout ne suffisait pas)", async () => {
+    const { csrfToken } = await sessionState();
+    const lg = await login(DEFAULT_ADMIN_PASSWORD, csrfToken);
+    const csrf = lg.body.csrfToken as string;
+    // Jeton « intercepté » : une copie indépendante du cookie de session.
+    const stolen = (lg.headers["set-cookie"] as unknown as string[])
+      .map((c) => c.split(";")[0])
+      .find((c) => c.startsWith(`${SESSION_COOKIE}=`)) as string;
+    const withStolen = () => request(env.app).get("/api/keys").set("Cookie", stolen);
+    expect((await withStolen()).status).toBe(200);
+
+    const revoked = await agent.post("/api/session/revoke").set("X-CSRF-Token", csrf);
+    expect(revoked.status).toBe(200);
+
+    // Avant le correctif : le jeton restait valide jusqu'à `exp` (12 h).
+    expect((await withStolen()).status).toBe(401);
+    expect((await agent.get("/api/session")).body.authenticated).toBe(false);
+
+    // On n'est PAS enfermé dehors : reconnexion avec le même mot de passe.
+    const state = await sessionState();
+    expect((await login(DEFAULT_ADMIN_PASSWORD, state.csrfToken)).status).toBe(200);
+    expect((await agent.get("/api/keys")).status).toBe(200);
+  });
+
+  it("une clé d'API ne peut pas révoquer la session d'un humain", async () => {
+    const key = await createApiKey(env.app, "outil");
+    const res = await request(env.app)
+      .post("/api/session/revoke")
+      .set("X-API-Key", key)
+      .send({});
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("SESSION_REQUIRED");
+  });
+
+  it("compatibilité : un jeton ANTÉRIEUR (sans champ `sep`) reste valide", async () => {
+    const legacy = signSession(
+      { sid: "0123456789abcdef", exp: Math.floor(Date.now() / 1000) + 3600, ep: getSessionEpoch() },
+      getSessionSecret(),
+    );
+    const res = await request(env.app)
+      .get("/api/keys")
+      .set("Cookie", `${SESSION_COOKIE}=${legacy}`);
+    expect(res.status).toBe(200);
   });
 });
 

@@ -34,7 +34,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import { getProvider, getService, type ProviderRecord, type ServiceRecord, type ServiceStep } from "../catalog-store.js";
 import { getConcurrency } from "../config.js";
 import { ApiError } from "../utils/api-error.js";
-import { classifyReason, logCall, newCallId, type CallLogTokens } from "./calls-log.js";
+import { classifyReason, logCall, newCallId, type CallLogTokens, type CallReason } from "./calls-log.js";
 import { preferredProvider, rememberProvider } from "./key-affinity.js";
 import { isReasoningLevel, normalizeMessagesForProvider, reasoningWireValue } from "./reasoning.js";
 import { llmSlots, QueueFullError, QueueTimeoutError } from "./slot-queue.js";
@@ -212,13 +212,14 @@ export function normalizeUsage(raw: unknown): CallLogTokens | undefined {
     positiveInt(obj.completion_tokens) ?? positiveInt(obj.eval_count) ?? positiveInt(obj.output_tokens);
   const totalTokens = positiveInt(obj.total_tokens);
   // Tokens de RÉFLEXION : détaillés par certains fournisseurs (OpenAI/OpenRouter/
-  // DeepSeek) sous `completion_tokens_details.reasoning_tokens`. Absent = le
-  // fournisseur ne les expose pas (l'interface affiche « — »).
+  // DeepSeek) sous `completion_tokens_details.reasoning_tokens`, ou exposés à plat
+  // (`reasoning_tokens`) — le détail PRIME, le plat sert de second recours.
+  // Absent = le fournisseur ne les expose pas (l'interface affiche « — »).
   const details = obj.completion_tokens_details;
   const reasoningTokens =
-    details && typeof details === "object" && !Array.isArray(details)
+    (details && typeof details === "object" && !Array.isArray(details)
       ? positiveInt((details as Record<string, unknown>).reasoning_tokens)
-      : positiveInt(obj.reasoning_tokens);
+      : undefined) ?? positiveInt(obj.reasoning_tokens);
   if (promptTokens === undefined && completionTokens === undefined && totalTokens === undefined && reasoningTokens === undefined) {
     return undefined;
   }
@@ -241,6 +242,27 @@ function usageFromJsonPayload(text: string): CallLogTokens | undefined {
 
 /** Taille maximale observée par le détecteur d'usage (jamais de rétention). */
 const USAGE_SNIFF_MAX_CHARS = 64 * 1024;
+
+/**
+ * Nombre d'octets d'un corps d'erreur examinés pour CLASSIFIER un échec.
+ *
+ * `classifyReason` ne cherche que quelques mots-clés (« quota », « rate
+ * limit »…) dans le DÉBUT du corps : convertir et minusculer une page HTML de
+ * proxy ou un JSON verbeux de plusieurs centaines de Ko sur le chemin chaud
+ * coûtait cher pour zéro information supplémentaire.
+ */
+const CLASSIFY_BODY_BYTES = 2048;
+
+/**
+ * Cause d'une tentative INTERROMPUE — jamais devinée :
+ *   - `watchdog`          : le watchdog de slot a coupé (appel anormalement long) ;
+ *   - `client_disconnect` : le client a coupé (fermeture d'onglet, cas normal).
+ * Le watchdog PRIME : s'il a sonné, c'est lui qui a interrompu l'appel, quelle
+ * que soit l'heure de la déconnexion client.
+ */
+function abortReason(watchdog: AbortSignal): CallReason {
+  return watchdog.aborted ? "watchdog" : "client_disconnect";
+}
 
 function usageFromSseLine(line: string): CallLogTokens | undefined {
   const trimmed = line.trim();
@@ -529,7 +551,10 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     if (!upstream.ok) {
       const errorBody = Buffer.from(await upstream.arrayBuffer());
       const fallbackable = shouldFallback(upstream.status);
-      const reason = classifyReason(upstream.status, errorBody.toString("utf-8"));
+      const reason = classifyReason(
+        upstream.status,
+        errorBody.subarray(0, CLASSIFY_BODY_BYTES).toString("utf-8"),
+      );
       logCall({
         ...common,
         result: "error",
@@ -554,7 +579,11 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
           ...common,
           result: report.aborted ? "aborted" : report.error ? "error" : "ok",
           status: upstream.status,
-          ...(report.error && !report.aborted ? { error: report.error, reason: "upstream_error" as const } : {}),
+          ...(report.aborted
+            ? { reason: abortReason(watchdog.signal) }
+            : report.error
+              ? { error: report.error, reason: "upstream_error" as const }
+              : {}),
           durationMs: Date.now() - startedAt,
           tokens: report.usage,
           stream: true,
@@ -577,12 +606,33 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     release();
     return { ok: true, output: { status: upstream.status, headers: responseHeaders, payload: buffer, streaming: false } };
   } catch (err) {
+    // ── DÉCISION ASSUMÉE (revue du cœur LLM, constat [09]) ──
+    // Un refus de la FILE (`QueueFullError` / `QueueTimeoutError`) N'EST PAS un
+    // échec fournisseur : il est RELANCÉ tel quel et remonte au client en 429 +
+    // `Retry-After`, sans basculer vers l'étape suivante. Justification :
+    //   1. `QueueFullError` porte sur la file GLOBALE de Switchy
+    //      (`SWITCHY_QUEUE_MAX`, tous fournisseurs confondus — voir
+    //      `slot-queue.ts`) : la place manque PARTOUT, essayer le repli
+    //      relancerait le même refus immédiat, en ajoutant seulement des lignes
+    //      de journal trompeuses ;
+    //   2. `QueueTimeoutError` : chaque étape supplémentaire patienterait à
+    //      nouveau jusqu'au MÊME `SWITCHY_QUEUE_TIMEOUT_MS` — la latence
+    //      multipliait par le nombre d'étapes pour un gain incertain ;
+    //   3. en mode `rolling`, le chemin « toutes les étapes saturées »
+    //      (`tryAcquire`) traite DÉJÀ la charge en basculant puis en attendant
+    //      sur le fournisseur mémorisé : convertir ces erreurs en `saturated`
+    //      ferait doublon et risquerait de casser cette passe d'attente ;
+    //   4. la limite appartient au COMPTE du fournisseur : un 429 explicite dit
+    //      au client d'attendre, ce qui protège le compte mieux qu'un repli
+    //      silencieux vers un autre fournisseur.
     if (err instanceof QueueFullError || err instanceof QueueTimeoutError) throw err;
     const aborted = attemptSignal.aborted || (err instanceof Error && err.name === "AbortError");
     logCall({
       ...common,
       result: aborted ? "aborted" : "error",
-      ...(aborted ? {} : { error: err instanceof Error ? err.message : String(err), reason: "network_error" as const }),
+      ...(aborted
+        ? { reason: abortReason(watchdog.signal) }
+        : { error: err instanceof Error ? err.message : String(err), reason: "network_error" as const }),
       durationMs: Date.now() - startedAt,
       stream,
     });
@@ -745,6 +795,12 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
   // Nombre d'étapes écartées pour CHARGE : sert à distinguer « bascule pour
   // charge » de « bascule pour erreur » dans le journal (tentatives suivantes).
   let loadSkips = 0;
+  // Étapes ÉCARTÉES DÉFINITIVEMENT (fournisseur absent ou désactivé) : elles
+  // sont journalisées UNE SEULE FOIS, à la première rencontre. La passe
+  // d'attente du rolling reconstruit `order` : sans cette mémoire, les mêmes
+  // étapes étaient re-journalisées en `skipped` avec le MÊME `attempt`, ce qui
+  // doublait les lignes de `calls.jsonl` et gonflait le compte de tentatives.
+  const unavailable = new Set<number>();
 
   for (;;) {
     let usableSteps = 0;
@@ -752,10 +808,13 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
     let stopped = false;
 
     for (const index of order) {
+      if (unavailable.has(index)) continue;
       const step = steps[index];
       const provider = getProvider(step.providerId);
       if (!provider || !provider.enabled) {
-        // Étape impossible : journalisée (jamais silencieuse), aucun appel réseau.
+        // Étape impossible : journalisée UNE fois (jamais silencieuse), aucun
+        // appel réseau, et écartée définitivement pour la suite de l'appel.
+        unavailable.add(index);
         logCall({
           callId,
           keyName: input.keyName,
@@ -818,7 +877,10 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
     if (!allSaturated) break;
     const waitIndex = pickWaitStep(steps, affinityIndex);
     if (waitIndex === null) break; // aucune étape utilisable : 503 plus bas
-    order = [waitIndex, ...catalogueOrder.filter((index) => index !== waitIndex)];
+    order = [
+      waitIndex,
+      ...catalogueOrder.filter((index) => index !== waitIndex && !unavailable.has(index)),
+    ];
     acquireMode = "wait";
     lastFailure = null; // la passe d'attente repart d'un bilan vierge
   }
@@ -848,6 +910,9 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
  * Jette `ApiError` (service inconnu/désactivé), `QueueFullError` /
  * `QueueTimeoutError` (429 côté route) ou `UpstreamFailure` (dernier échec à
  * relayer tel quel).
+ *
+ * ⚠️ Un refus de FILE ne fait PAS basculer la chaîne (décision assumée, voir
+ * le commentaire du `catch` d'`attemptStep`) : le 429 remonte tel quel.
  */
 export async function relayService(input: RelayInput): Promise<RelayOutput> {
   const service = getService(input.serviceName);

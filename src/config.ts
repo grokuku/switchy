@@ -22,6 +22,40 @@ export function getHost(): string {
   return readEnv("SWITCHY_HOST", "0.0.0.0");
 }
 
+/**
+ * Réglage `trust proxy` d'Express — `SWITCHY_TRUST_PROXY` (redémarrage requis).
+ *
+ * ⚠️ POURQUOI ce réglage : derrière un reverse proxy (cas de déploiement
+ * normal), sans `trust proxy` `req.ip` vaut l'IP du PROXY pour tout le monde.
+ * Les seaux de limitation (600/min global, 5 échecs de login/min) devenaient
+ * donc COMMUNS à tous les clients : 5 mauvais mots de passe envoyés par
+ * n'importe qui bloquaient l'admin, et un seul client pouvait épuiser le quota
+ * global.
+ *
+ * Valeurs acceptées :
+ *   - absent / « 1 » (DÉFAUT) : on fait confiance à UN saut (un proxy en amont);
+ *   - « 0 » / « false » / « off » : aucun proxy de confiance (accès direct) ;
+ *   - un entier : nombre de sauts de confiance (n) ;
+ *   - « true » : tout faire confiance (⚠️ dangereux : l'en-tête
+ *     `X-Forwarded-For` devient forgeable par le client — à réserver à un
+ *     réseau 100 % maîtrisé) ;
+ *   - une liste/expression d'adresses Express (« loopback »,
+ *     « 10.0.0.0/8,172.16.0.0/12 ») — la forme la PLUS sûre.
+ *
+ * Se tromper vers le haut autorise l'usurpation de `req.ip` (contournement des
+ * limiteurs) ; se tromper vers le bas rend les limiteurs globaux. Le défaut
+ * « 1 saut » correspond au déploiement documenté (proxy devant Switchy).
+ */
+export function getTrustProxy(): number | boolean | string {
+  const raw = (process.env.SWITCHY_TRUST_PROXY ?? "").trim();
+  if (raw === "") return 1;
+  const lower = raw.toLowerCase();
+  if (lower === "false" || lower === "no" || lower === "off") return false;
+  if (lower === "true" || lower === "yes" || lower === "on") return true;
+  if (/^\d+$/.test(lower)) return Number.parseInt(lower, 10);
+  return raw;
+}
+
 /** Port d'écoute (redémarrage requis ; Pi-Web 3000/3005, WebClaw 3006, Libry 3007). */
 export function getPort(): number {
   const parsed = Number.parseInt(readEnv("SWITCHY_PORT", "3008"), 10);

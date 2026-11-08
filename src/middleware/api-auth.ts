@@ -20,7 +20,7 @@
  * lire et changer le mot de passe restent permis.
  */
 import { type Request, type Response, type NextFunction } from "express";
-import { extractApiKeys, validateKey, resolveIdentity, recordUsage } from "../switchy-auth.js";
+import { extractApiKeys, validateKey, resolveKeyIdentity, recordUsage } from "../switchy-auth.js";
 import { getSessionFromRequest, hasSessionCookie, verifyCsrfToken, isPasswordDefault } from "../session-store.js";
 
 /**
@@ -57,11 +57,15 @@ export function isApiAuthorized(req: Request): boolean {
 /** Exige une clé d'API valide OU une session admin ; 401 sinon. */
 export function requireApiAuth(req: Request, res: Response, next: NextFunction): void {
   for (const candidate of extractApiKeys(req)) {
-    if (validateKey(candidate)) {
-      const identity = resolveIdentity(candidate);
-      if (identity) recordUsage(identity.id);
+    // ⚠️ UN SEUL passage : `resolveKeyIdentity` consulte les caches (positif puis
+    // négatif) et renvoie l'identité. Un `validateKey` suivi d'un
+    // `resolveIdentity` repayait loadKeys + scryptSync (~100 ms) à CHAQUE
+    // requête relayée, hors cache.
+    const identity = resolveKeyIdentity(candidate);
+    if (identity) {
+      recordUsage(identity.id);
       // ⚠️ Seul le NOM est attaché (et journalisé) : jamais la valeur ni le hash.
-      req.apiKeyName = identity?.name ?? KEY_NAME_UNKNOWN;
+      req.apiKeyName = identity.name;
       next();
       return;
     }
@@ -76,6 +80,28 @@ export function requireApiAuth(req: Request, res: Response, next: NextFunction):
     code: "UNAUTHORIZED",
     authRequired: true,
   });
+}
+
+/**
+ * Exige une SESSION d'administration valide (cookie signé) et REFUSE une clé
+ * d'API. Réservé aux actions qui n'ont de sens que pour l'HUMAIN dans son
+ * navigateur — typiquement le changement du mot de passe admin : une clé d'API
+ * (contrat des OUTILS) ne doit jamais pouvoir changer le mot de passe admin.
+ *
+ * ⚠️ Aucun risque d'enfermement : à l'amorçage, `admin` reste accepté par
+ * `POST /api/session/login`, qui émet précisément la session exigée ici.
+ */
+export function requireSession(req: Request, res: Response, next: NextFunction): void {
+  if (getSessionFromRequest(req) === null) {
+    res.status(401).json({
+      error: "An admin session (browser login) is required for this action",
+      code: "SESSION_REQUIRED",
+      authRequired: true,
+    });
+    return;
+  }
+  req.apiKeyName = KEY_NAME_SESSION;
+  next();
 }
 
 /** Exige le double-submit CSRF (en-tête `X-CSRF-Token` == cookie `switchy_csrf`). */

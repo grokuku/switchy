@@ -7,6 +7,7 @@ import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { makeTestEnv, type TestEnv } from "./helpers.js";
 import {
+  compactCallsLog,
   logCall,
   readAllCallsLog,
   readCallsLog,
@@ -73,7 +74,7 @@ describe("journal d'appels — cache de lecture", () => {
 });
 
 describe("journal d'appels — maintenance en mode off", () => {
-  it("purge les entrées trop vieilles sans journaliser le nouvel appel", () => {
+  it("la purge d'ÂGE s'applique hors du chemin d'écriture (timer de rétention → compactCallsLog)", () => {
     env.cleanup();
     env = makeTestEnv({ SWITCHY_CALLS_LOG_MODE: "off", SWITCHY_CALLS_LOG_RETENTION_DAYS: "1" });
     const now = Date.now();
@@ -82,8 +83,13 @@ describe("journal d'appels — maintenance en mode off", () => {
       entry("fresh", new Date(now - 60_000).toISOString()),
     ]);
 
+    // Le chemin d'écriture n'ajoute rien et NE purge PAS l'âge (compaction
+    // complète interdite à chaque tentative) : c'est `compactCallsLog` —
+    // appelée par le timer de rétention — qui purge.
     logCall(entry("not-logged", new Date(now).toISOString()));
+    expect(rawEntries().map((item) => item.callId)).toEqual(["old", "fresh"]);
 
+    compactCallsLog(now);
     expect(rawEntries().map((item) => item.callId)).toEqual(["fresh"]);
   });
 

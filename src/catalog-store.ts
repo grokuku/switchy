@@ -21,6 +21,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, chmodSy
 import path from "path";
 import { getCatalogFile } from "./config.js";
 import { ApiError } from "./utils/api-error.js";
+import { AsyncMutex } from "./utils/async-mutex.js";
 
 // ── Vocabulaires fermés ──
 
@@ -223,6 +224,9 @@ function sanitizeCatalog(raw: unknown): Catalog {
 /** Contenu du catalogue (jamais `null`). Cache invalidé au mtime du fichier. */
 export function loadCatalog(): Catalog {
   const file = getCatalogFile();
+  // ── 1) Lecture : un fichier ABSENT est légitime (catalogue vide) ──
+  let raw: string;
+  let mtimeMs: number;
   try {
     if (!existsSync(file)) {
       cache = null;
@@ -230,13 +234,45 @@ export function loadCatalog(): Catalog {
     }
     const stat = statSync(file);
     if (cache && cache.mtimeMs === stat.mtimeMs) return cache.data;
-    const data = sanitizeCatalog(JSON.parse(readFileSync(file, "utf-8")));
-    cache = { mtimeMs: stat.mtimeMs, data };
+    mtimeMs = stat.mtimeMs;
+    raw = readFileSync(file, "utf-8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+      cache = null;
+      return { ...EMPTY, providers: [], services: [] };
+    }
+    // Le fichier EXISTE mais est illisible : on ne simule JAMAIS un catalogue
+    // vide (une réponse vide est un mensonge, et la mutation suivante
+    // écraserait le fichier).
+    console.error("[catalog] catalog.json unreadable:", e);
+    cache = null;
+    throw catalogUnreadable();
+  }
+  // ── 2) Décodage : erreur de CONTENU → refus explicite (503) ──
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!asRecord(parsed)) throw new Error("catalog.json must contain an object");
+    const data = sanitizeCatalog(parsed);
+    cache = { mtimeMs, data };
     return data;
   } catch (e) {
     console.error("[catalog] Failed to load catalog.json:", e);
-    return { ...EMPTY, providers: [], services: [] };
+    cache = null;
+    throw catalogUnreadable();
   }
+}
+
+/**
+ * 503 `CATALOG_UNREADABLE` — même patron que `CONFIG_UNREADABLE`
+ * (`settings-store.ts`) : un fichier présent mais illisible n'est PAS un
+ * catalogue vide. Tant qu'il n'est pas réparé, lecture ET écriture refusent.
+ */
+function catalogUnreadable(): ApiError {
+  return new ApiError(
+    503,
+    "CATALOG_UNREADABLE",
+    "Cannot read catalog.json; restore a valid catalog before continuing (no write was attempted)",
+  );
 }
 
 /** Répertoire du catalogue (créé si absent, permissions 0700). */
@@ -251,17 +287,48 @@ function ensureCatalogDir(): string {
 
 /** Écrit le catalogue en ATOMIQUE (tmp + rename), permissions 0600. */
 export function saveCatalog(catalog: Catalog): void {
+  // ⚠️ Le cache est invalidé AVANT l'écriture (et non après) : si l'écriture
+  // échoue, l'objet MUTÉ (référence partagée avec le cache) ne doit jamais
+  // rester servi comme s'il avait été persisté — état fantôme.
+  cache = null;
+  // Refus d'écriture tant que le fichier existant n'est pas sain : lève
+  // `CATALOG_UNREADABLE` et n'écrit rien.
+  loadCatalog();
   ensureCatalogDir();
   const file = getCatalogFile();
   const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(catalog, null, 2), { mode: 0o600 });
-  renameSync(tmp, file);
-  cache = null;
+  try {
+    writeFileSync(tmp, JSON.stringify(catalog, null, 2), { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
+    throw ApiError.storage(
+      `Cannot write "${file}" (${code}). Ensure $SWITCHY_DATA_DIR exists and is writable by Switchy.`,
+    );
+  } finally {
+    cache = null;
+  }
 }
 
 /** Réinitialise le cache (outil de test). */
 export function resetCatalogCache(): void {
   cache = null;
+}
+
+/**
+ * File d'écriture du catalogue (voir `utils/async-mutex.ts`).
+ *
+ * Toute mutation « lire → modifier → écrire » passe par ici : deux créations
+ * simultanées ne peuvent plus partir du même état lu et perdre l'une des deux.
+ */
+const catalogMutex = new AsyncMutex();
+
+/**
+ * Exécute une mutation du catalogue en série (une seule à la fois).
+ * À utiliser DANS les routes : `await runCatalogMutation(() => createProvider(...))`.
+ */
+export function runCatalogMutation<T>(fn: () => T | Promise<T>): Promise<T> {
+  return catalogMutex.run(fn);
 }
 
 /** Compteurs exposés par `GET /health` (nombre de fournisseurs et de services). */

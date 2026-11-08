@@ -14,7 +14,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import rateLimit from "express-rate-limit";
 import { readFileSync } from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
-import { getHost, getPort, getRateLimitPerMin } from "./config.js";
+import { getHost, getPort, getRateLimitPerMin, getTrustProxy } from "./config.js";
 import { catalogCounts } from "./catalog-store.js";
 import { checkDataDir } from "./settings-store.js";
 import { describeAdminPasswordState } from "./session-store.js";
@@ -46,6 +46,11 @@ export const version: string = (() => {
 export function createApp(): express.Express {
   const app = express();
   app.disable("x-powered-by");
+  // ⚠️ `trust proxy` AVANT les limiteurs : sans lui, `req.ip` = IP du reverse
+  // proxy pour tout le monde ⇒ seaux de limitation COMMUNS (5 échecs de login
+  // par minute bloquaient l'admin, quota global épuisable par un seul client).
+  // Configurable par `SWITCHY_TRUST_PROXY` (défaut : 1 saut — voir config.ts).
+  app.set("trust proxy", getTrustProxy());
   app.use(express.json({ limit: "5mb" }));
 
   // ── Limitation de débit ──

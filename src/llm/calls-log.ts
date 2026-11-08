@@ -62,7 +62,14 @@ export type CallResult = "ok" | "error" | "aborted" | "skipped";
  *   - `step_disabled` : l'étape est DÉSACTIVÉE dans le catalogue (bouton on/off
  *                       de la ligne). Elle est sautée sans aucun appel réseau —
  *                       motif distinct de `saturated` (ce n'est pas la charge)
- *                       et des erreurs fournisseur (il n'y a pas eu d'appel).
+ *                       et des erreurs fournisseur (il n'y a pas eu d'appel) ;
+ *   - `watchdog`      : tentative INTERROMPUE par le watchdog de slot (appel
+ *                       anormalement long, `SWITCHY_SLOT_WATCHDOG_MS`, 30 min
+ *                       par défaut). C'est une COUPE, pas une erreur amont ;
+ *   - `client_disconnect` : tentative INTERROMPUE par la déconnexion du client
+ *                       (cas NORMAL : l'utilisateur a fermé l'onglet).
+ * Les deux derniers n'accompagnent que `result: "aborted"` : ils rendent une
+ * coupe EXPLICABLE sans quoi un flux interrompu restait indéchiffrable.
  */
 export const CALL_REASONS = [
   "quota",
@@ -73,6 +80,8 @@ export const CALL_REASONS = [
   "upstream_error",
   "saturated",
   "step_disabled",
+  "watchdog",
+  "client_disconnect",
 ] as const;
 export type CallReason = (typeof CALL_REASONS)[number];
 
@@ -237,11 +246,18 @@ function truncateError(message: unknown): string | undefined {
  */
 export function logCall(input: CallLogInput): void {
   try {
+    // ⚠️ CHEMIN CHAUD : seule la borne par NOMBRE est vérifiée ici, et elle ne
+    // déclenche une compaction qu'au FRANCHISSEMENT (`lineCount > max`). La
+    // purge par ÂGE n'est PAS faite ici : elle l'est par le timer de rétention
+    // (`RETENTION_TICK_MS`) et par la compaction déclenchée par la borne. Un
+    // `retentionDays > 0` par défaut (7 j) ne doit JAMAIS provoquer une
+    // réécriture complète du journal à chaque tentative.
+    // Le mode `off` n'ajoute rien (donc n'incrémente pas `lineCount`) mais
+    // applique tout de même la borne : un journal déjà trop gros est compacté.
     const max = getCallsLogMaxEntries();
-    const retentionDays = getCallsLogRetentionDays();
-    if (max > 0 || retentionDays > 0) {
+    if (max > 0) {
       if (lineCount === null) lineCount = countLines(getCallsLogFile());
-      if (retentionDays > 0 || (max > 0 && lineCount > max)) compactCallsLog();
+      if (lineCount > max) compactCallsLog();
     }
     if (getCallsLogMode() === "off") return;
     const entry: CallLogEntry = {
@@ -431,9 +447,9 @@ export interface ActivitySummary {
   windowHours: number;
   /** Appels LOGIQUES (identifiants `callId` distincts) dans la fenêtre. */
   calls: number;
-  /** Tentatives journalisées (principal + replis). */
+  /** Tentatives RÉELLEMENT exécutées (principal + replis) — les entrées `skipped` sont exclues. */
   attempts: number;
-  /** Appels logiques terminés par un succès (dernière tentative `ok`). */
+  /** Appels logiques terminés par un succès (dernière tentative EXÉCUTÉE `ok`). */
   succeeded: number;
   /** Appels logiques terminés par un échec/abandon. */
   failed: number;
@@ -441,7 +457,7 @@ export interface ActivitySummary {
   successRate: number | null;
   /** Appels logiques ayant utilisé AU MOINS un repli. */
   fallbacks: number;
-  /** Tentatives de repli (pour information). */
+  /** Tentatives de repli RÉELLEMENT exécutées (pour information). */
   fallbackAttempts: number;
   /** `fallbacks / calls`, ou `null` si aucun appel. */
   fallbackRate: number | null;
@@ -484,6 +500,8 @@ interface CallGroup {
   last: CallLogEntry;
   lastAttempt: number;
   hasFallback: boolean;
+  /** Le `last` courant est-il une tentative RÉELLEMENT exécutée (pas `skipped`) ? */
+  lastRan: boolean;
 }
 
 /**
@@ -510,21 +528,33 @@ export function summarizeActivity(
 
   entries.forEach((entry, index) => {
     if (!withinWindow(entry.ts, cutoff)) return;
-    attempts += 1;
+    // Une entrée `skipped` n'a PAS atteint le fournisseur (étape désactivée,
+    // fournisseur absent, ou place indisponible en mode rolling) : elle ne
+    // compte ni comme tentative exécutée, ni comme tentative de repli. Les
+    // sauts pour CHARGE restent comptés à part (`loadFallbacks`), justement
+    // pour ne jamais les confondre avec des échecs fournisseur.
+    const ran = entry.result !== "skipped";
+    if (ran) attempts += 1;
     if (entry.reason === "saturated") loadFallbacks += 1;
     if (entry.affinity === true) affinityHits += 1;
     const attempt = typeof entry.attempt === "number" ? entry.attempt : 0;
     const isFallback = entry.isFallback === true || attempt > 0;
-    if (isFallback) fallbackAttempts += 1;
+    if (isFallback && ran) fallbackAttempts += 1;
 
     const key = typeof entry.callId === "string" && entry.callId !== "" ? entry.callId : `__${index}`;
     const group = groups.get(key);
     if (!group) {
-      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback });
+      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback, lastRan: ran });
     } else {
-      if (attempt >= group.lastAttempt) {
+      // ⚠️ Le « dernier essai » se choisit parmi les tentatives RÉELLEMENT
+      // EXÉCUTÉES (`ok`/`error`/`aborted`). Une entrée `skipped` (étape
+      // désactivée ou fournisseur absent, rang supérieur) n'a jamais atteint le
+      // fournisseur : elle ne doit PAS écraser le `ok` du principal (sinon le
+      // taux de réussite tombe à 0 % dès qu'un repli est désactivé).
+      if (ran && (attempt >= group.lastAttempt || !group.lastRan)) {
         group.last = entry;
         group.lastAttempt = attempt;
+        group.lastRan = true;
       }
       if (isFallback) group.hasFallback = true;
     }

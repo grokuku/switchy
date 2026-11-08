@@ -5,21 +5,36 @@
  *
  * Modèle de jeton : `<payload base64url>.<signature base64url>`, où la signature
  * est un HMAC-SHA256 du payload encodé, calculé avec le secret de session. Le
- * payload est `{sid, exp, ep}` :
+ * payload est `{sid, exp, ep, sep}` :
  *   - `sid` : identifiant aléatoire de la session (permet de dériver un jeton
  *     CSRF propre à la session) ;
  *   - `exp` : expiration, en SECONDES Unix ;
  *   - `ep`   : époque de mot de passe ; change à chaque changement de mot de
  *     passe → invalide d'un coup TOUTES les sessions émises avant.
+ *   - `sep` : époque de session ; change à chaque « révoquer toutes les
+ *     sessions » → invalide les sessions sans toucher au mot de passe.
  *
  * La vérification est à temps constant et rejette tout jeton malformé ou expiré.
  */
 import crypto from "crypto";
 
+/**
+ * Payload signé d'une session.
+ *
+ * `ep` = époque du MOT DE PASSE (incrémentée par `setAdminPassword`).
+ * `sep` = époque de SESSION (incrémentée par « Révoquer toutes les sessions »).
+ * Les deux sont DISTINCTES : révoquer les sessions ne touche pas au mot de passe,
+ * et changer le mot de passe invalide aussi les sessions (via `ep`).
+ *
+ * COMPATIBILITÉ : un jeton émis AVANT l'introduction de `sep` n'en a pas ; il est
+ * normalisé à `0`, qui est l'époque de session par défaut. Les sessions en cours
+ * au moment du déploiement restent donc valides (aucune déconnexion de masse).
+ */
 export interface SessionPayload {
   sid: string;
   exp: number;
   ep: number;
+  sep: number;
 }
 
 /** Encodage base64url (RFC 4648 §5) sans remplissage, sûr en cookie. */
@@ -78,9 +93,11 @@ export function verifySessionToken(token: string, secret: string, nowMs: number 
   if (typeof p.sid !== "string" || p.sid === "") return null;
   if (typeof p.exp !== "number" || !Number.isFinite(p.exp)) return null;
   if (typeof p.ep !== "number" || !Number.isFinite(p.ep)) return null;
+  // `sep` absent (jeton antérieur à l'époque de session) ⇒ 0, l'époque par défaut.
+  if (p.sep !== undefined && (typeof p.sep !== "number" || !Number.isFinite(p.sep))) return null;
   if (p.exp <= Math.floor(nowMs / 1000)) return null; // expiré (comparaison en secondes)
 
-  return { sid: p.sid, exp: p.exp, ep: p.ep };
+  return { sid: p.sid, exp: p.exp, ep: p.ep, sep: typeof p.sep === "number" ? p.sep : 0 };
 }
 
 /**

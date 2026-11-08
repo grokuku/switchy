@@ -12,12 +12,23 @@
  *   - `SWITCHY_ADMIN_PASSWORD_HASH` : hash scrypt du mot de passe admin ;
  *   - `SWITCHY_SESSION_EPOCH`       : époque de mot de passe (incrémentée à
  *                                     chaque changement → invalide les sessions).
+ *   - `SWITCHY_SESSION_REVOKE_EPOCH`: époque de SESSION (distincte ; incrémentée
+ *                                     par « Révoquer toutes les sessions »).
  *
  * Modèle de session :
  *   - cookie `switchy_session` HttpOnly / SameSite=Strict / Secure si HTTPS ;
- *   - payload `{sid, exp, ep}` signé HMAC-SHA256 (cf. utils/session-crypto.ts) ;
+ *   - payload `{sid, exp, ep, sep}` signé HMAC-SHA256 (cf. utils/session-crypto.ts) ;
  *   - durée 12 h par défaut (`SWITCHY_SESSION_TTL_HOURS`) ;
  *   - mot de passe admin par défaut `admin` tant qu'aucun hash n'existe.
+ *
+ * RÉVOCATION : il n'y a pas de store de sessions (jeton sans état). `logout` vide
+ * le cookie ; pour tuer un jeton intercepté, `revokeAllSessions()` incrémente
+ * l'époque de session persistée, ce qui invalide d'un coup tous les jetons émis
+ * avant.
+ *
+ * COMPATIBILITÉ : l'époque de session vaut 0 par défaut et un jeton sans champ
+ * `sep` est traité comme `sep = 0` → le déploiement de ce code ne déconnecte
+ * PERSONNE. Seule une révocation explicite invalide les jetons en cours.
  *
  * ⚠️ DISTINCTION : la CONNEXION (mot de passe + session) est pour l'HUMAIN qui
  * configure depuis le navigateur. Les CLÉS D'API de `switchy-auth.ts` restent,
@@ -42,6 +53,7 @@ import {
 const KEY_SESSION_SECRET = "SWITCHY_SESSION_SECRET";
 const KEY_PASSWORD_HASH = "SWITCHY_ADMIN_PASSWORD_HASH";
 const KEY_SESSION_EPOCH = "SWITCHY_SESSION_EPOCH";
+const KEY_SESSION_REVOKE_EPOCH = "SWITCHY_SESSION_REVOKE_EPOCH";
 
 // ── Noms publics ──
 
@@ -105,6 +117,28 @@ export function getSessionEpoch(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+// ── Époque de SESSION (révocation globale, distincte du mot de passe) ──
+
+/** Époque de session courante (0 si jamais révoqué) — persistée dans le data dir. */
+export function getSessionRevokeEpoch(): number {
+  const raw = internalSetting(KEY_SESSION_REVOKE_EPOCH);
+  const parsed = raw !== null ? Number.parseInt(raw, 10) : 0;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+/**
+ * Révoque TOUTES les sessions : incrémente l'époque de session persistée.
+ *
+ * Effet immédiat : tout jeton déjà émis (donc tout `sid` en circulation, même
+ * intercepté) est refusé au prochain appel. Le mot de passe admin n'est PAS
+ * touché — l'utilisateur se reconnecte avec le mot de passe qu'il connaît.
+ */
+export function revokeAllSessions(): number {
+  const next = getSessionRevokeEpoch() + 1;
+  writeSettings({ [KEY_SESSION_REVOKE_EPOCH]: String(next) });
+  return next;
+}
+
 // ── Mot de passe admin ──
 
 let defaultCache: { hash: string; value: boolean } | null = null;
@@ -166,7 +200,12 @@ export interface IssuedSession {
 export function issueSession(): IssuedSession {
   const secret = getSessionSecret();
   const sid = crypto.randomBytes(16).toString("hex");
-  const payload: SessionPayload = { sid, exp: nowSeconds() + getSessionTtlSeconds(), ep: getSessionEpoch() };
+  const payload: SessionPayload = {
+    sid,
+    exp: nowSeconds() + getSessionTtlSeconds(),
+    ep: getSessionEpoch(),
+    sep: getSessionRevokeEpoch(),
+  };
   return { token: signSession(payload, secret), payload, csrfToken: deriveCsrfToken(secret, sid) };
 }
 
@@ -181,9 +220,9 @@ export function hasSessionCookie(req: Request): boolean {
 }
 
 /**
- * Session valide d'une requête : cookie présent, signature correcte ET époque
- * alignée. Un cookie falsifié, expiré, ou émis avant un changement de mot de
- * passe renvoie `null`.
+ * Session valide d'une requête : cookie présent, signature correcte, époque de
+ * MOT DE PASSE et époque de SESSION alignées. Un cookie falsifié, expiré, émis
+ * avant un changement de mot de passe ou avant une révocation renvoie `null`.
  */
 export function getSessionFromRequest(req: Request): SessionPayload | null {
   const token = readCookie(req, SESSION_COOKIE);
@@ -191,6 +230,7 @@ export function getSessionFromRequest(req: Request): SessionPayload | null {
   const payload = verifySessionToken(token, getSessionSecret());
   if (!payload) return null;
   if (payload.ep !== getSessionEpoch()) return null;
+  if (payload.sep !== getSessionRevokeEpoch()) return null;
   return payload;
 }
 

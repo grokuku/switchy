@@ -137,19 +137,19 @@
       <nav class="tabs" role="tablist" aria-label="Sections de l'interface">
         <!-- Activité = PAGE D'ENTRÉE (état initial, pas un clic simulé). -->
         <button type="button" class="tab is-active" role="tab" id="tab-activity"
-                data-tab="activity" aria-selected="true" aria-controls="panel-activity">
+                data-tab="activity" aria-selected="true" aria-controls="panel-activity" tabindex="0">
           Activité
         </button>
         <button type="button" class="tab" role="tab" id="tab-services"
-                data-tab="services" aria-selected="false" aria-controls="panel-services">
+                data-tab="services" aria-selected="false" aria-controls="panel-services" tabindex="-1">
           Services
         </button>
         <button type="button" class="tab" role="tab" id="tab-providers"
-                data-tab="providers" aria-selected="false" aria-controls="panel-providers">
+                data-tab="providers" aria-selected="false" aria-controls="panel-providers" tabindex="-1">
           Fournisseurs
         </button>
         <button type="button" class="tab" role="tab" id="tab-settings"
-                data-tab="settings" aria-selected="false" aria-controls="panel-settings">
+                data-tab="settings" aria-selected="false" aria-controls="panel-settings" tabindex="-1">
           Réglages
         </button>
       </nav>
@@ -157,7 +157,7 @@
       <div class="topbar-end">
         <!-- Pilule « direct » : état réel de la socket /ws/activity (jamais un
              faux vert — voir setLiveStatus dans app.js). -->
-        <span class="live-conn" id="live-conn" data-state="off">
+        <span class="live-conn" id="live-conn" data-state="off" role="status" aria-live="polite">
           <span class="live-dot" aria-hidden="true"></span>
           <span class="live-conn-label">en pause</span>
         </span>
@@ -328,6 +328,15 @@
                 <button type="submit" class="btn btn--accent">Changer le mot de passe</button>
               </div>
             </form>
+          </details>
+          <details class="disclosure" id="session-revoke">
+            <summary>Révoquer toutes les sessions</summary>
+            <p class="muted">Déconnecte tous les navigateurs connectés, y compris celui-ci —
+              un cookie de session intercepté cesse alors d'être valable. Le mot de passe
+              n'est pas modifié : vous vous reconnectez avec le même.</p>
+            <div class="form-actions">
+              <button type="button" class="btn btn--ghost" id="revoke-sessions-btn">Révoquer toutes les sessions</button>
+            </div>
           </details>
         </div>
       </section>

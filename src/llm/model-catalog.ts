@@ -17,6 +17,7 @@
  * ⚠️ CACHE COURT (pour ne pas interroger le fournisseur à chaque frappe) ;
  * `refresh: true` le contourne (bouton « rafraîchir » de l'interface).
  */
+import { createHash } from "node:crypto";
 import { getProvider, type ProviderRecord, type ReasoningLevel } from "../catalog-store.js";
 import { ApiError } from "../utils/api-error.js";
 import { normalizeReasoningLevel, STANDARD_REASONING_LEVELS } from "./reasoning.js";
@@ -96,11 +97,39 @@ function upstreamError(provider: ProviderRecord, action: string, status: number)
   return new ApiError(502, "PROVIDER_ERROR", `provider "${provider.id}": upstream error (HTTP ${status}) while ${action}.`);
 }
 
-/** Encapsule un `fetch` réseau : échec = message clair, jamais une exception brute. */
+/**
+ * Délai maximal d'une requête de DÉCOUVERTE (liste des modèles, capacités).
+ * Sans lui, un fournisseur muet retient indéfiniment le socket d'un simple
+ * rafraîchissement de liste. Volontairement court : la découverte est légère.
+ */
+const DISCOVERY_TIMEOUT_MS = 10_000;
+
+/**
+ * Encapsule un `fetch` réseau : échec = message clair, jamais une exception brute.
+ *
+ * ⚠️ TIMEOUT OBLIGATOIRE (`AbortSignal.timeout`) : un fournisseur qui ne répond
+ * jamais ne doit pas figer la requête HTTP de l'utilisateur.
+ *
+ * ⚠️ La découverte NE PASSE PAS par `llmSlots` (décision assumée) : la file de
+ * slots appartient au COMPTE du fournisseur et sert à sérialiser les appels
+ * LLM longs. Y soumettre la découverte ferait attendre un clic « rafraîchir »
+ * derrière des générations de plusieurs minutes (le refresh expirerait ou
+ * paraîtrait bloqué), alors que la découverte est un `GET /models` court et
+ * bon marché. Le risque de dépassement de concurrence est borné autrement :
+ * cache court (30 s) + timeout de 10 s ci-dessous.
+ */
 async function safeFetch(provider: ProviderRecord, url: string, init: RequestInit, action: string): Promise<Response> {
   try {
-    return await fetch(url, init);
+    return await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
   } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+      throw new ApiError(
+        504,
+        "PROVIDER_TIMEOUT",
+        `provider "${provider.id}" did not answer within ${DISCOVERY_TIMEOUT_MS} ms while ${action}`,
+      );
+    }
     const reason = err instanceof Error ? err.message : String(err);
     throw new ApiError(502, "PROVIDER_UNREACHABLE", `provider "${provider.id}" is unreachable while ${action}: ${reason}`);
   }
@@ -120,8 +149,43 @@ interface CacheEntry<T> {
 const modelsCache = new Map<string, CacheEntry<ProviderModel[]>>();
 const detailsCache = new Map<string, CacheEntry<ProviderModelDetails>>();
 
+/**
+ * Empreinte COURTE et NON RÉVERSIBLE d'une clé d'API (`sha256` tronqué).
+ *
+ * Elle ne sert qu'à INVALIDER le cache de découverte quand la clé du
+ * fournisseur CHANGE (rotation) : sans elle, une liste obtenue avec l'ancienne
+ * clé restait servie 30 s — voire un échec d'authentification restait « collé ».
+ * ⚠️ Jamais la clé elle-même, même tronquée : seuls 8 caractères hexadécimaux
+ * d'un condensat, inexploitables pour retrouver le secret.
+ */
+function apiKeyFingerprint(apiKey: string | null | undefined): string {
+  if (!apiKey) return "nokey";
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 8);
+}
+
 function cacheKey(provider: ProviderRecord, extra = ""): string {
-  return `${provider.id}|${modelSourceFor(provider)}|${provider.baseUrl}|${provider.nativeUrl ?? ""}|${extra}`;
+  return `${provider.id}|${modelSourceFor(provider)}|${provider.baseUrl}|${provider.nativeUrl ?? ""}|${apiKeyFingerprint(provider.apiKey)}|${extra}`;
+}
+
+/**
+ * Insère une entrée en PURGEANT d'abord les entrées expirées.
+ *
+ * Les caches ne sont alimentés que par des noms de modèles essayés et par des
+ * listes de fournisseurs : sans purge, la mémoire croît indéfiniment (chaque
+ * couple fournisseur/modèle/clé laisse sa trace) alors que la quasi-totalité
+ * des entrées est déjà périmée à l'instant de l'insertion.
+ */
+function setCacheEntry<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T): void {
+  const now = Date.now();
+  for (const [existingKey, existing] of cache) {
+    if (existing.expiresAt <= now) cache.delete(existingKey);
+  }
+  cache.set(key, { expiresAt: now + CACHE_TTL_MS, value });
+}
+
+/** Tailles courantes des caches de découverte (diagnostic et tests). */
+export function modelCatalogCacheSizes(): { models: number; details: number } {
+  return { models: modelsCache.size, details: detailsCache.size };
 }
 
 /** Vide le cache (outil de test). */
@@ -187,7 +251,7 @@ export async function listProviderModels(providerId: string, opts: { refresh?: b
       .map((id) => ({ id, label: id }));
   }
 
-  modelsCache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, value: models });
+  setCacheEntry(modelsCache, key, models);
   modelCounts.set(provider.id, models.length);
   return models;
 }
@@ -388,15 +452,37 @@ export async function describeProviderModel(
     };
   }
 
-  detailsCache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, value: details });
+  setCacheEntry(detailsCache, key, details);
   return details;
 }
 
+/**
+ * Lit le corps JSON d'une réponse de découverte.
+ *
+ * ⚠️ Un corps NON VIDE qui n'est pas du JSON (page HTML d'un portail captif,
+ * 502 d'un proxy en HTML…) est une ERREUR `PROVIDER_BAD_RESPONSE` : la
+ * convertir en `{}` ferait passer une panne pour « aucun modèle ».
+ * Un corps VIDE reste TOLÉRÉ (= `{}`) : certains fournisseurs répondent 200
+ * sans corps.
+ */
 async function parseJson(res: Response): Promise<Record<string, unknown>> {
+  let text: string;
   try {
-    const data = (await res.json()) as unknown;
-    return data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
-  } catch {
-    return {};
+    text = await res.text();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new ApiError(502, "PROVIDER_BAD_RESPONSE", `cannot read provider response body: ${reason}`);
   }
+  if (text.trim() === "") return {};
+  let data: unknown;
+  try {
+    data = JSON.parse(text) as unknown;
+  } catch {
+    throw new ApiError(
+      502,
+      "PROVIDER_BAD_RESPONSE",
+      `provider returned a non-JSON response (HTTP ${res.status}) — check the base/native URL`,
+    );
+  }
+  return data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
 }

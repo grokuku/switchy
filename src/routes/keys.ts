@@ -12,7 +12,7 @@
  * défaut (403 `PASSWORD_NOT_CHANGED`).
  */
 import { Router, type Request, type Response } from "express";
-import { listKeys, createKey, revokeKey } from "../switchy-auth.js";
+import { listKeys, createKey, revokeKey, runKeysMutation } from "../switchy-auth.js";
 import { requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 
 const router = Router();
@@ -21,13 +21,14 @@ router.get("/", (_req: Request, res: Response) => {
   res.json({ keys: listKeys() });
 });
 
-router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
+router.post("/", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { name?: unknown };
   if (typeof body.name !== "string" || body.name.trim() === "") {
     return res.status(400).json({ error: "name is required", code: "VALIDATION_ERROR" });
   }
+  const name = body.name;
   try {
-    const { key, secret } = createKey(body.name);
+    const { key, secret } = await runKeysMutation(() => createKey(name));
     res.status(201).json({ key, secret });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -35,8 +36,8 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
   }
 });
 
-router.delete("/:id", requireCsrfForSession, rejectDefaultPassword, (req: Request, res: Response) => {
-  if (!revokeKey(String(req.params.id))) {
+router.delete("/:id", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
+  if (!(await runKeysMutation(() => revokeKey(String(req.params.id))))) {
     return res.status(404).json({ error: "key not found", code: "NOT_FOUND" });
   }
   res.status(204).end();

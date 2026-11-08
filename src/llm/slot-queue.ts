@@ -214,20 +214,36 @@ export class ProviderSlotQueue {
   }
 
   /**
-   * Interrompt les appels dépassant le watchdog. Leur place reste occupée
-   * jusqu'à la fin de l'appel ; seuls les slots sans appel associé sont
-   * libérés immédiatement. Retourne les identifiants expirés.
+   * Interrompt les appels dépassant le watchdog et RÉCUPÈRE leur place.
+   *
+   * 1ʳᵉ visite : le slot est marqué `expiring`, l'appel amont est interrompu
+   * (`onExpire`) et sa place reste occupée le temps qu'il se termine —
+   * un `release()` propre rend la place.
+   * 2ᵉ visite (le slot a déjà été marqué lors d'un tick précédent sans que
+   * l'appelant n'ait jamais libéré) : la place est REPRISE de force et drainée.
+   * Sinon un appel orphelin (fetch ignorant l'abort, flux dont le consommateur
+   * ne lit ni n'annule) retirerait définitivement une place au fournisseur
+   * jusqu'au redémarrage. Le `release()` tardif est un no-op idempotent.
+   * Retourne les identifiants expirés.
    */
   forceReleaseStale(now: number = Date.now()): string[] {
     const threshold = getSlotWatchdogMs();
     if (threshold <= 0) return [];
     const stale: ActiveSlot[] = [];
     for (const slot of this.active.values()) {
-      if (!slot.expiring && now - slot.acquiredAt > threshold) stale.push(slot);
+      if (now - slot.acquiredAt > threshold) stale.push(slot);
     }
     const freedProviders = new Set<string>();
     for (const slot of stale) {
+      const alreadyExpiring = slot.expiring === true;
       slot.expiring = true;
+      if (alreadyExpiring) {
+        // L'appel n'a jamais rendu sa place depuis le tick précédent : on la
+        // récupère. Son `release()` ultérieur sera un no-op.
+        this.active.delete(slot.slotKey);
+        freedProviders.add(slot.provider);
+        continue;
+      }
       if (slot.onExpire) {
         slot.onExpire();
       } else {

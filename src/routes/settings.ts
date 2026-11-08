@@ -88,6 +88,7 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
   const updates: Record<string, string | null> = {};
   const lockedErrors: string[] = [];
   const invalidErrors: string[] = [];
+  const forbiddenErrors: string[] = [];
 
   for (const [name, raw] of Object.entries(incoming as Record<string, unknown>)) {
     const spec = getSettingSpec(name);
@@ -106,7 +107,10 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
     if (typeof raw === "string" && raw.trim() === "") continue; // champ vide = inchangé
     const result = validateSettingValue(spec, raw);
     if (!result.ok) {
-      invalidErrors.push(result.error);
+      // Un chemin hors du répertoire de données est un refus SÉCURITÉ (403),
+      // pas une simple valeur invalide : il ne doit jamais être écrit.
+      if (result.code === "PATH_OUTSIDE_DATA_DIR") forbiddenErrors.push(result.error);
+      else invalidErrors.push(result.error);
       continue;
     }
     updates[name] = result.value;
@@ -118,6 +122,13 @@ router.post("/", requireCsrfForSession, rejectDefaultPassword, (req: Request, re
       error: "Some settings are locked by the environment",
       code: "LOCKED_BY_ENV",
       errors: lockedErrors,
+    });
+  }
+  if (forbiddenErrors.length > 0) {
+    return res.status(403).json({
+      error: "Path outside the data directory",
+      code: "PATH_OUTSIDE_DATA_DIR",
+      errors: forbiddenErrors,
     });
   }
   if (invalidErrors.length > 0) {
