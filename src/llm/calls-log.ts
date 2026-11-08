@@ -19,13 +19,14 @@
  *   - `SWITCHY_CALLS_LOG_MAX_ENTRIES`    : compaction par NOMBRE (0 = illimité) ;
  *   - `SWITCHY_CALLS_LOG_RETENTION_DAYS` : purge par ÂGE (0 = jamais).
  * La compaction est synchrone et déclenchée par l'écriture (ou périodiquement
- * pour la seule purge d'âge) ; le fichier ne dépasse jamais `max + 1` entrées
- * (compaction immédiate au franchissement).
+ * pour la seule purge d'âge) ; la borne s'applique quel que soit le mode, y
+ * compris `off`, et le fichier ne dépasse jamais `max + 1` entrées (compaction
+ * immédiate au franchissement).
  *
  * Écriture en AJOUT (`append`), fichier 0600, répertoire 0700, réécriture de
  * compaction via tmp + rename — même pattern que les autres magasins.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync, statSync } from "fs";
 import { randomUUID } from "node:crypto";
 import path from "path";
 import { getCallsLogFile, getCallsLogMaxEntries, getCallsLogMode, getCallsLogRetentionDays } from "../config.js";
@@ -188,6 +189,7 @@ const READ_FIELDS: (keyof CallLogEntry)[] = [...ESSENTIAL, "prioritaire", "endpo
 
 let lineCount: number | null = null;
 let dirEnsured: string | null = null;
+let entriesCache: { mtimeMs: number; size: number; entries: CallLogEntry[] } | null = null;
 
 function ensureLogDir(): void {
   const dir = path.dirname(getCallsLogFile());
@@ -229,11 +231,18 @@ function truncateError(message: unknown): string | undefined {
 }
 
 /**
- * Journalise une tentative (append JSONL). No-op en mode `off`. Ne lève
- * JAMAIS : le journal ne doit pas faire échouer un appel LLM.
+ * Journalise une tentative (append JSONL). En mode `off`, n'ajoute aucune
+ * entrée mais applique tout de même la borne et la rétention. Ne lève JAMAIS :
+ * le journal ne doit pas faire échouer un appel LLM.
  */
 export function logCall(input: CallLogInput): void {
   try {
+    const max = getCallsLogMaxEntries();
+    const retentionDays = getCallsLogRetentionDays();
+    if (max > 0 || retentionDays > 0) {
+      if (lineCount === null) lineCount = countLines(getCallsLogFile());
+      if (retentionDays > 0 || (max > 0 && lineCount > max)) compactCallsLog();
+    }
     if (getCallsLogMode() === "off") return;
     const entry: CallLogEntry = {
       ...input,
@@ -258,8 +267,8 @@ export function logCall(input: CallLogInput): void {
     if (lineCount === null) lineCount = countLines(getCallsLogFile());
     else lineCount += 1;
 
-    const max = getCallsLogMaxEntries();
     if (max > 0 && lineCount > max) compactCallsLog();
+    entriesCache = null;
 
     // DIRECT : la tentative vient d'être journalisée → une ligne en tête de
     // « Derniers appels ». Le filtrage des champs (ni identité d'appelant, ni
@@ -287,6 +296,7 @@ export function compactCallsLog(now: number = Date.now()): CompactResult {
   try {
     if (!existsSync(file)) {
       lineCount = 0;
+      entriesCache = null;
       return { before: 0, after: 0, removed: 0 };
     }
     const lines = readFileSync(file, "utf-8").split("\n");
@@ -315,10 +325,12 @@ export function compactCallsLog(now: number = Date.now()): CompactResult {
       renameSync(tmp, file);
     }
     lineCount = kept.length;
+    entriesCache = null;
     return { before: entries.length, after: kept.length, removed: entries.length - kept.length };
   } catch (err) {
     console.error("[calls-log] Failed to compact:", err);
     lineCount = null;
+    entriesCache = null;
     return { before: 0, after: 0, removed: 0 };
   }
 }
@@ -679,17 +691,29 @@ function toPublicEntry(raw: CallLogEntry): CallLogEntry {
 /**
  * Lit TOUTES les entrées publiques du journal (ordre chronologique croissant,
  * whitelist appliquée). Base commune de la pagination et des agrégations.
+ * Lecture bornée par la compaction + cache mémoire invalidé par mtime/taille
+ * (le tableau renvoyé est une COPIE, les appelants le trient).
  */
 function readPublicEntries(): CallLogEntry[] {
   const file = getCallsLogFile();
   try {
-    if (!existsSync(file)) return [];
-    return readFileSync(file, "utf-8")
+    if (!existsSync(file)) {
+      entriesCache = null;
+      return [];
+    }
+    const stat = statSync(file);
+    if (entriesCache && entriesCache.mtimeMs === stat.mtimeMs && entriesCache.size === stat.size) {
+      return entriesCache.entries.slice();
+    }
+    const entries = readFileSync(file, "utf-8")
       .split("\n")
       .map(parseLine)
       .filter((e): e is CallLogEntry => e !== null)
       .map(toPublicEntry);
+    entriesCache = { mtimeMs: stat.mtimeMs, size: stat.size, entries };
+    return entriesCache.entries.slice();
   } catch (err) {
+    entriesCache = null;
     console.error("[calls-log] Failed to read:", err);
     return [];
   }
@@ -697,8 +721,8 @@ function readPublicEntries(): CallLogEntry[] {
 
 /**
  * Toutes les entrées du journal (pour les agrégations du tableau de bord).
- * Le fichier est borné par la compaction : une lecture complète reste
- * raisonnable.
+ * Lecture bornée par la compaction + cache mémoire invalidé par mtime/taille
+ * (le tableau renvoyé est une COPIE, les appelants le trient).
  */
 export function readAllCallsLog(): CallLogEntry[] {
   return readPublicEntries();
@@ -706,8 +730,8 @@ export function readAllCallsLog(): CallLogEntry[] {
 
 /**
  * Lit le journal, du PLUS RÉCENT au plus ancien, avec pagination et filtres
- * facultatifs (`service`, `result`). Le fichier est borné par la compaction :
- * une lecture complète reste raisonnable.
+ * facultatifs (`service`, `result`). Lecture bornée par la compaction + cache
+ * mémoire invalidé par mtime/taille (les entrées lues sont une copie avant tri).
  */
 export function readCallsLog(query: CallsLogQuery = {}): CallsLogPage {
   const limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(query.limit ?? DEFAULT_LIMIT)));
@@ -733,7 +757,7 @@ const retentionTimer = setInterval(() => {
   try {
     const max = getCallsLogMaxEntries();
     const retentionDays = getCallsLogRetentionDays();
-    if (retentionDays > 0 || (max > 0 && lineCount !== null && lineCount > max)) compactCallsLog();
+    if (retentionDays > 0 || (max > 0 && (lineCount === null || lineCount > max))) compactCallsLog();
   } catch {
     /* la purge ne doit jamais faire tomber le process */
   }
@@ -744,4 +768,5 @@ const retentionTimer = setInterval(() => {
 export function resetCallsLogState(): void {
   lineCount = null;
   dirEnsured = null;
+  entriesCache = null;
 }
