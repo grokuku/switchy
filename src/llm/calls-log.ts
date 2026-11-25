@@ -116,6 +116,26 @@ export function newCallId(): string {
 }
 
 /**
+ * Fournisseur FICTIF des lignes de GROUPE du panel (`panel_all_failed`) —
+ * décision utilisateur : cette ligne CONSTATE la fin du panel, elle n'est pas un
+ * appel réseau. L'attribuer au principal fabriquait un faux échec au nom d'un
+ * modèle qui n'a jamais été appelé ; lui donner son propre `provider` explicite
+ * garde la trace du passage au repli SANS polluer les statistiques d'un modèle
+ * réel. Les agrégations (`summarizeActivity`, `summarizeTokens`,
+ * `summarizeFallbacks`, `summarizeByKey`) l'EXCLUENT : ce n'est ni une
+ * tentative, ni un fournisseur, ni une consommation.
+ */
+export const PANEL_CONTEXT_PROVIDER = "__panel__";
+
+/** Modèle FICTIF des mêmes lignes de groupe (aucun modèle réel appelé). */
+export const PANEL_CONTEXT_MODEL = "__panel__";
+
+/** Vrai pour une ligne de CONTEXTE du panel (constat, pas un appel fournisseur). */
+export function isPanelContextEntry(entry: Pick<CallLogEntry, "provider">): boolean {
+  return entry.provider === PANEL_CONTEXT_PROVIDER;
+}
+
+/**
  * Catégorise un échec fournisseur en motif court (voir `CallReason`).
  * `bodyText` sert UNIQUEMENT à distinguer un quota épuisé d'un simple débit
  * dépassé : il n'est JAMAIS journalisé (il peut contenir du contexte compte).
@@ -438,7 +458,12 @@ export function summarizeFallbacks(
     const ts = typeof entry.ts === "string" ? Date.parse(entry.ts) : Number.NaN;
     const inWindow = Number.isFinite(ts) ? ts >= cutoff : true;
     // Un repli est une tentative de rang > 0 (isFallback explicite ou ancien journal).
-    const isFallback = entry.isFallback === true || (typeof entry.attempt === "number" && entry.attempt > 0);
+    // Une ligne de CONTEXTE du panel n'est PAS une tentative de repli : elle ne
+    // gonfle ni le bilan ni la répartition par fournisseur (pas de faux
+    // fournisseur « __panel__ »).
+    const isFallback =
+      !isPanelContextEntry(entry) &&
+      (entry.isFallback === true || (typeof entry.attempt === "number" && entry.attempt > 0));
     if (isFallback) {
       stats.total += 1;
       if (inWindow) {
@@ -573,7 +598,12 @@ export function summarizeActivity(
     // compte ni comme tentative exécutée, ni comme tentative de repli. Les
     // sauts pour CHARGE restent comptés à part (`loadFallbacks`), justement
     // pour ne jamais les confondre avec des échecs fournisseur.
-    const ran = entry.result !== "skipped";
+    //
+    // ⚠️ Une ligne de CONTEXTE du panel (`panel_all_failed`, provider
+    // `__panel__`) n'a déclenché AUCUN appel réseau : elle ne compte pas non
+    // plus comme tentative, et n'écrase pas le « dernier essai » du groupe
+    // (sinon un appel réussi paraîtrait échoué à cause d'un constat de repli).
+    const ran = entry.result !== "skipped" && !isPanelContextEntry(entry);
     if (ran) attempts += 1;
     if (entry.reason === "saturated") loadFallbacks += 1;
     if (entry.affinity === true) affinityHits += 1;
@@ -670,6 +700,9 @@ export function summarizeTokens(
   const byProvider: Record<string, TokenTotals> = {};
   for (const entry of entries) {
     if (!entry.tokens || !withinWindow(entry.ts, cutoff)) continue;
+    // Une ligne de CONTEXTE du panel ne désigne aucun fournisseur réel : la
+    // compter ferait apparaître un faux fournisseur « __panel__ ».
+    if (isPanelContextEntry(entry)) continue;
     addTokens(total, entry);
     addTokens((byService[String(entry.service ?? "?")] ??= emptyTokenTotals()), entry);
     addTokens((byProvider[String(entry.provider ?? "?")] ??= emptyTokenTotals()), entry);

@@ -266,7 +266,7 @@ La ligne `désaccord —` est une **citation**, pas un ajout : elle ne contient 
 |---|---|---|
 | 1 proposeur échoue | on continue, quorum atteint, juge appelé | motif existant (`quota`, `rate_limit`, `network_error`, `panel_member_timeout`) |
 | 2 échouent (1 utilisable) | **servie telle quelle, sans juge** (décision utilisateur) | membre `ok` + `panel_no_quorum` |
-| 3 échouent | **repli sur la chaîne normale** (`principal → fallbacks`), même `callId` | `panel_all_failed` + lignes chaîne |
+| 3 échouent | **repli sur la chaîne normale** (`principal → fallbacks`), même `callId` | ligne de GROUPE `panel_all_failed` (provider `__panel__`) + lignes chaîne |
 | 1 proposeur renvoie un outil | écarté, les autres suffisent | `skipped` / `panel_tool_call_skipped` |
 | **les 3** renvoient des outils | **repli** sur la chaîne normale **complète** | 3 × `panel_tool_call_skipped` + lignes chaîne |
 | juge en échec | **première proposition utilisable A→B→C** (décision utilisateur) | `judge_failed` + `panelServed: true` |
@@ -301,6 +301,7 @@ La ligne `désaccord —` est une **citation**, pas un ajout : elle ne contient 
 | `judge_empty` | `error` | juge vide |
 | `panel_degraded` | `ok`/`skipped` | réponse servie **sans** le juge |
 
+- **⚠️ La ligne de GROUPE n'est imputée à AUCUN modèle réel** (décision utilisateur) : `panel_all_failed` est journalisée avec `provider: "__panel__"` / `model: "__panel__"` et `durationMs: 0` (`src/llm/panel.ts`, `PANEL_CONTEXT_PROVIDER`). Avant, elle portait le fournisseur/modèle du **principal** alors qu'aucun appel réseau n'avait eu lieu — un faux échec au nom d'un modèle jamais sollicité. Les agrégations excluent ce provider (`isPanelContextEntry`) : la ligne n'est **ni une tentative, ni un repli, ni un fournisseur, ni une consommation** dans `summarizeActivity`, `summarizeTokens`, `summarizeFallbacks` et `summarizeByKey`. La trace du passage au repli reste visible dans « Derniers appels ».
 - **Comptage** : `summarizeActivity` (`calls-log.ts:514`) groupe par `callId` et retient le rang le plus haut exécuté (`:554`). Règle : **une entrée `panelServed === true` vaut succès pour le groupe.**
 - **UI** : pilules `panel 3+1`, `quorum 2/3`, `lang fr` sur la carte ; dans « Derniers appels », la pastille de rang existante devient `A`/`B`/`C`/`juge` ; badge `dégradé` quand `panel_degraded`.
 
@@ -309,6 +310,8 @@ La ligne `désaccord —` est une **citation**, pas un ajout : elle ne contient 
 - **Où** : une section `Panel` **dans la modale de service existante** (`openServiceForm`, `public/app.js:2268`), entre « Étapes d'appel » et « Capacités ». **Aucun onglet nouveau, aucun écran de réglages.**
 - **Quoi** : une case `Mode panel (3 proposeurs + 1 juge)`, **décochée par défaut**, corps masqué quand elle l'est. Cochée : 3 lignes `A`/`B`/`C`, 1 ligne « juge », un champ `quorum` (1-3, défaut 2), un select `langue` (fr/en). Les deux délais dans un `<details>` **replié** « réglages avancés ».
 - **Contraintes** : pleine largeur (`grid-column: 1 / -1`), **tout en français**, couleurs **uniquement** `--switchy-*` qui dérivent des `--holaf-*` (`public/styles.css:16-40`).
+- **Titre conditionnel** : la section des étapes s'appelle « Étapes d'appel » hors panel, et « Repli si le panel échoue (principal + replis) » dès que la case est cochée — avec une aide qui dit que ces étapes ne servent que si les 3 proposeurs ne rendent **aucune proposition utilisable**, et que les boutons « Tester » de cette section testent **le repli, pas les membres** (`refreshStepsSectionTitle`, mise à jour EN PLACE : aucun re-render).
+- **Tester le panel** : la zone « Tester les modèles » propose, dans un `optgroup` distinct, les cibles du panel — `A — <modèle>`, `B — …`, `C — …`, `Juge — <modèle>` — à côté des étapes de la chaîne (`Principal`, `Repli 1`…). Contrat serveur **additif** : `POST /api/services/:name/test` accepte `panel: "member"` + `panelIndex: 0|1|2` ou `panel: "judge"` (exclusif de `stepIndex`, 400 sinon). Un membre se teste **seul** avec le corps de production (squelette du panel, `maxTokens` plafonné par la route) ; le juge se teste **seul** avec des propositions **factices** annoncées — les 3 membres ne sont jamais appelés (coût ÷4). Les deux passent par `attemptStep` : aucune copie de la logique du panel.
 - **Garde-fou affiché** : si membres activés < quorum → pilule `warn` « panel inopérant ».
 
 ## 8. Coût et latence (ordres de grandeur, non mesurés)

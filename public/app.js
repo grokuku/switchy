@@ -1415,6 +1415,9 @@ import {
   /** `max_tokens` de l'interface (le serveur plafonne de toute façon à 256). */
   const DEFAULT_TEST_MAX_TOKENS = 64;
 
+  /** Étiquettes des propositions du panel (ordre figé : A, B, C). */
+  const PANEL_MEMBER_LETTERS = ["A", "B", "C"];
+
   /** Résultats des tests d'étape, clé `service:index` — survivent à un re-rendu. */
   const stepTestResults = new Map();
 
@@ -1586,12 +1589,70 @@ import {
       return;
     }
     stepSelect.disabled = false;
+
+    // Groupe 1 — la CHAÎNE de repli (`stepIndex` du contrat historique).
+    const chainGroup = h("optgroup", { attrs: { label: "chaîne d'appel (principal + replis)" } });
     serviceToSteps(service).forEach((step, index) => {
       const off = !isStepEnabled(step) ? " (désactivé)" : "";
-      const label = `${stepRoleLabel(index)} — ${step.model || "(modèle vide)"}${off}`;
-      stepSelect.append(h("option", { text: label, attrs: { value: String(index) } }));
+      const label = `${capitalizeRole(stepRoleLabel(index))} — ${step.model || "(modèle vide)"}${off}`;
+      chainGroup.append(h("option", { text: label, attrs: { value: String(index) } }));
     });
-    if (current !== "" && Number(current) < stepSelect.options.length) stepSelect.value = current;
+    stepSelect.append(chainGroup);
+
+    // Groupe 2 — le PANEL (3 propositions + le juge), cibles `panel`/`panelIndex`.
+    // Libellés EXPLICITES (`A — modèle`, `Juge — modèle`) et groupe distinct :
+    // on ne confond jamais une proposition avec un repli de la chaîne.
+    if (service.panel) {
+      const panelGroup = h("optgroup", { attrs: { label: "panel (propositions A/B/C + juge)" } });
+      const members = Array.isArray(service.panel.members) ? service.panel.members : [];
+      members.forEach((step, index) => {
+        const off = !isStepEnabled(step) ? " (désactivé)" : "";
+        const letter = PANEL_MEMBER_LETTERS[index] || String(index + 1);
+        panelGroup.append(
+          h("option", {
+            text: `${letter} — ${step.model || "(modèle vide)"}${off}`,
+            attrs: { value: `panel:${index}` },
+          }),
+        );
+      });
+      if (service.panel.judge) {
+        const judge = service.panel.judge;
+        const off = !isStepEnabled(judge) ? " (désactivé)" : "";
+        panelGroup.append(
+          h("option", {
+            text: `Juge — ${judge.model || "(modèle vide)"}${off}`,
+            attrs: { value: "panel:judge" },
+          }),
+        );
+      }
+      stepSelect.append(panelGroup);
+    }
+
+    if (current !== "" && [...stepSelect.options].some((opt) => opt.value === current)) stepSelect.value = current;
+  }
+
+  /**
+   * Cible de test lue dans le sélecteur : une étape de la CHAÎNE (`stepIndex`) ou
+   * une cible du PANEL (`panel` + `panelIndex`). `null` = sélection inutilisable.
+   */
+  function readTestTarget(rawValue) {
+    const value = String(rawValue == null ? "" : rawValue);
+    if (value.startsWith("panel:")) {
+      const rest = value.slice("panel:".length);
+      if (rest === "judge") return { panel: "judge" };
+      const index = Number(rest);
+      if (!Number.isInteger(index) || index < 0) return null;
+      return { panel: "member", panelIndex: index };
+    }
+    const stepIndex = Number(value);
+    if (!Number.isInteger(stepIndex) || stepIndex < 0) return null;
+    return { stepIndex };
+  }
+
+  /** « principal » → « Principal » : les libellés du sélecteur commencent par une majuscule. */
+  function capitalizeRole(label) {
+    const text = String(label || "");
+    return text === "" ? text : text.charAt(0).toUpperCase() + text.slice(1);
   }
 
   /**
@@ -1614,11 +1675,12 @@ import {
       notify("Choisissez un service à tester.", "warning");
       return;
     }
-    const stepIndex = Number(stepSelect.value);
-    if (!Number.isInteger(stepIndex) || stepIndex < 0) {
-      notify("Choisissez une étape à tester.", "warning");
+    const target = readTestTarget(stepSelect.value);
+    if (!target) {
+      notify("Choisissez une étape ou une cible du panel à tester.", "warning");
       return;
     }
+    const stepIndex = Number.isInteger(target.stepIndex) ? target.stepIndex : 0;
     const prompt = String((promptInput && promptInput.value) || "").trim() || DEFAULT_TEST_PROMPT;
     const rawMax = Number((maxTokensInput && maxTokensInput.value) || DEFAULT_TEST_MAX_TOKENS);
     const maxTokens = Number.isFinite(rawMax) && rawMax >= 1 ? Math.min(256, Math.round(rawMax)) : DEFAULT_TEST_MAX_TOKENS;
@@ -1634,7 +1696,7 @@ import {
     try {
       result = await apiRequest(`/api/services/${encodeURIComponent(serviceName)}/test`, {
         method: "POST",
-        body: { stepIndex, prompt, maxTokens },
+        body: { ...target, prompt, maxTokens },
         timeout: 40000,
       });
     } catch (err) {
@@ -1655,8 +1717,10 @@ import {
     }
 
     renderTestOutcome(result || {}, out);
-    // Le verdict de la CARTE suit celui de la zone : une seule vérité.
-    stepTestResults.set(stepTestKey(serviceName, stepIndex), result);
+    // Le verdict de la CARTE suit celui de la zone : une seule vérité — et
+    // seulement pour une étape de la CHAÎNE (un verdict de panel n'a pas de
+    // ligne de carte à peindre).
+    if (!target.panel) stepTestResults.set(stepTestKey(serviceName, stepIndex), result);
     renderServices();
   }
 
@@ -1673,7 +1737,14 @@ import {
     const dl = h("dl", { class: "kv" });
     const row = (term, value) => dl.append(h("div", null, h("dt", { text: term }), h("dd", { text: value })));
     const stepIndex = data && Number.isInteger(data.stepIndex) ? data.stepIndex : 0;
-    row("étape", `${stepRoleLabel(stepIndex)}${data && data.fellBack ? " (repli sollicité)" : " (aucun repli)"}`);
+    // Cible RÉELLEMENT testée : une étape de la chaîne (principal/repli) ou une
+    // cible du panel (proposition A/B/C, juge) — jamais une confusion entre les deux.
+    if (data && data.panel) {
+      const isJudge = data.panel.role === "judge";
+      row("cible", isJudge ? "juge du panel" : `proposition ${PANEL_MEMBER_LETTERS[data.panel.index] || data.panel.index + 1} du panel`);
+    } else {
+      row("étape", `${capitalizeRole(stepRoleLabel(stepIndex))}${data && data.fellBack ? " (repli sollicité)" : " (aucun repli)"}`);
+    }
     row("fournisseur", data && data.providerId ? providerLabel(data.providerId) : "—");
     row("modèle", (data && data.model) || "—");
     row("réflexion", (data && data.reasoning) || "off");
@@ -2333,13 +2404,27 @@ import {
     // Étapes d'appel : UNE liste ordonnée (1re = principal, puis replis 1, 2…).
     // Le glisser-déposer, les flèches et la renumérotation viennent de
     // public/service-steps.js (source de vérité unique, partagée avec la carte).
-    form.append(formSection("Étapes d'appel"));
-    form.append(
-      h("p", {
-        class: "field-hint muted",
-        text: "La 1re étape est le principal ; les suivantes sont les replis, essayés dans cet ordre. Glissez la poignée ⠿ ou utilisez les flèches ↑/↓ (clavier, mobile).",
-      }),
-    );
+    //
+    // ⚠️ Ces étapes changent de SENS quand le mode panel est actif : elles ne
+    // servent plus d'appel normal mais de REPLI. Le titre et la phrase d'aide
+    // sont donc CONDITIONNELS (`refreshStepsSectionTitle`, mis à jour EN PLACE
+    // depuis la case « Mode panel » : rien n'est reconstruit, les éditeurs et
+    // leurs écouteurs restent intacts).
+    const stepsSectionTitle = formSection("Étapes d'appel");
+    form.append(stepsSectionTitle);
+    const STEPS_HINT_CHAIN =
+      "La 1re étape est le principal ; les suivantes sont les replis, essayés dans cet ordre. Glissez la poignée ⠿ ou utilisez les flèches ↑/↓ (clavier, mobile).";
+    const STEPS_HINT_PANEL =
+      "Ces étapes ne servent QUE si le panel échoue : les 3 proposeurs n'ont rendu aucune proposition utilisable (échec, saturation du fournisseur, réponse en appel d'outil). Les boutons « Tester » de cette section testent ce repli — pas les membres du panel (zone « Tester les modèles »).";
+    const stepsSectionHint = h("p", { class: "field-hint muted", text: STEPS_HINT_CHAIN });
+    form.append(stepsSectionHint);
+
+    /** Titre + aide de la section des étapes, selon que le mode panel est actif. */
+    function refreshStepsSectionTitle() {
+      const panelOn = panelBox.input.checked;
+      stepsSectionTitle.textContent = panelOn ? "Repli si le panel échoue (principal + replis)" : "Étapes d'appel";
+      stepsSectionHint.textContent = panelOn ? STEPS_HINT_PANEL : STEPS_HINT_CHAIN;
+    }
     const stepsEditor = buildStepsEditor(editing ? serviceToSteps(service) : [], { onCapabilities });
     form.append(stepsEditor.wrap);
 
@@ -2426,9 +2511,12 @@ import {
     panelBox.input.addEventListener("change", () => {
       panelBody.hidden = !panelBox.input.checked;
       refreshPanelWarn();
+      // Le titre des étapes DIT ce qu'elles deviennent : repli, ou appel normal.
+      refreshStepsSectionTitle();
     });
     form.append(panelBody);
     refreshPanelWarn();
+    refreshStepsSectionTitle();
 
     // Capacités
     form.append(formSection("Capacités"));

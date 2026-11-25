@@ -34,7 +34,7 @@
  */
 import { getProvider, type ServiceRecord, type ServiceStep } from "../catalog-store.js";
 import { getConcurrency } from "../config.js";
-import { logCall, type CallReason, type CallResult } from "./calls-log.js";
+import { logCall, PANEL_CONTEXT_MODEL, PANEL_CONTEXT_PROVIDER, type CallReason, type CallResult } from "./calls-log.js";
 import { buildJudgeUserMessage, judgePrompt, panelSkeleton, PANEL_LABELS } from "./panel-prompts.js";
 import {
   attemptStep,
@@ -177,14 +177,14 @@ export function appendSkeleton(raw: unknown, skeleton: string): Array<Record<str
 
 /** Corps d'un MEMBRE : corps client, `stream: false`, squelette, étape imposée. */
 function memberBody(
-  input: RelayInput,
+  rawBody: Record<string, unknown>,
   skeleton: string,
   step: ServiceStep,
   provider: Parameters<typeof buildUpstreamBody>[2],
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    ...input.body,
-    messages: appendSkeleton(input.body.messages, skeleton),
+    ...rawBody,
+    messages: appendSkeleton(rawBody.messages, skeleton),
     stream: false, // le panel ne peut pas streamer : il lui faut les corps complets
   };
   return buildUpstreamBody(body, step, provider, "chat");
@@ -195,7 +195,7 @@ function memberBody(
  * historique nettoyé, puis le message `user` du §3.3.
  */
 function judgeBody(
-  input: RelayInput,
+  rawBody: Record<string, unknown>,
   instruction: string,
   userMessage: string,
   history: Array<Record<string, unknown>>,
@@ -203,7 +203,7 @@ function judgeBody(
   provider: Parameters<typeof buildUpstreamBody>[2],
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    ...input.body,
+    ...rawBody,
     messages: [{ role: "system", content: instruction }, ...history, { role: "user", content: userMessage }],
     stream: false,
   };
@@ -226,6 +226,81 @@ function payloadObject(output: RelayOutput): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+// ── Test de DIAGNOSTIC d'une cible du panel (`POST /api/services/:name/test`) ──
+
+/**
+ * Cible d'un test du panel : UN membre (`A`/`B`/`C`) ou LE juge. Jamais les
+ * 3 membres + le juge : ce serait 4 appels pour un simple diagnostic.
+ */
+export type PanelTestTarget = { role: "member"; index: number } | { role: "judge" };
+
+/**
+ * Propositions FACTICES envoyées au juge lors d'un test : courtes, fixes et
+ * ANNONCÉES comme telles (on teste la configuration du juge, pas la qualité
+ * d'une recomposition).
+ */
+export const PANEL_TEST_FAKE_PROPOSAL = "PROPOSITION FACTICE — test de configuration, aucun contenu réel.";
+
+/** Fournisseur résolu (même type que celui attendu par `buildUpstreamBody`). */
+type PanelProvider = Parameters<typeof buildUpstreamBody>[2];
+
+/** Cible de test RÉSOLUE : l'étape, son rang de journal et son corps de production. */
+export interface ResolvedPanelTestTarget {
+  step: ServiceStep;
+  /** Rang journalisé (`attempt`) : 0/1/2 pour les membres, 3 pour le juge. */
+  attempt: number;
+  panelRole: "member" | "judge";
+  /**
+   * Corps EXACT qu'enverrait le panel (squelette d'un membre, consigne et
+   * propositions factices du juge) — construit avec le fournisseur résolu.
+   */
+  body: (provider: PanelProvider) => Record<string, unknown>;
+}
+
+/**
+ * Résout une cible de test du panel. Source de vérité UNIQUE des corps : ce sont
+ * `memberBody`/`judgeBody` de la production qui sont employés, jamais une copie
+ * (un test qui n'enverrait pas le même corps ne dirait rien de la production).
+ *
+ * Renvoie `null` quand la cible n'existe pas sur ce service (aucun panel, index
+ * de membre hors bornes) : l'appelant en fait un 400, jamais un appel inutile.
+ */
+export function resolvePanelTestTarget(
+  service: ServiceRecord,
+  rawBody: Record<string, unknown>,
+  target: PanelTestTarget,
+): ResolvedPanelTestTarget | null {
+  const panel = service.panel;
+  if (!panel) return null;
+
+  if (target.role === "member") {
+    const rank = target.index;
+    if (!Number.isInteger(rank) || rank < 0 || rank >= panel.members.length) return null;
+    const member = panel.members[rank];
+    const skeleton = panelSkeleton(panel.lang);
+    return {
+      step: member,
+      attempt: rank,
+      panelRole: "member",
+      body: (provider) => memberBody(rawBody, skeleton, member, provider),
+    };
+  }
+
+  const judge = panel.judge;
+  const instruction = judgePrompt(panel.lang);
+  const conversation = splitJudgeConversation(rawBody.messages);
+  const userMessage = buildJudgeUserMessage(
+    conversation.request,
+    PANEL_LABELS.map((label) => ({ label, text: PANEL_TEST_FAKE_PROPOSAL })),
+  );
+  return {
+    step: judge,
+    attempt: PANEL_JUDGE_ATTEMPT,
+    panelRole: "judge",
+    body: (provider) => judgeBody(rawBody, instruction, userMessage, conversation.history, judge, provider),
+  };
 }
 
 // ── Orchestration ──
@@ -384,7 +459,7 @@ export async function runPanel({ service, input, callId }: PanelRunRequest): Pro
         attempt: rank,
         callId,
         provider,
-        body: memberBody(input, skeleton, member, provider),
+        body: memberBody(input.body, skeleton, member, provider),
         headers: input.headers,
         prioritaire,
         signal,
@@ -462,10 +537,24 @@ export async function runPanel({ service, input, callId }: PanelRunRequest): Pro
 
   // ── 4) Aucune proposition → repli sur la chaîne normale ──
   if (usableRanks.length === 0) {
-    logLine(service.principal, {
+    // ⚠️ Ligne de GROUPE : aucun appel réseau n'a été fait, elle n'est donc
+    // attribuée à AUCUN modèle réel. L'attribuer à `service.principal`
+    // fabriquait un faux échec (et une durée nulle) au nom d'un modèle jamais
+    // appelé ; le provider de contexte `__panel__` garde la trace du passage au
+    // repli sans polluer les statistiques du principal (les agrégations du
+    // journal excluent ce provider — `calls-log.ts`).
+    logCall({
+      callId,
+      service: service.name,
+      keyName: input.keyName,
       attempt: PANEL_FALLBACK_ATTEMPT,
+      provider: PANEL_CONTEXT_PROVIDER,
+      model: PANEL_CONTEXT_MODEL,
       result: "error",
       reason: "panel_all_failed",
+      durationMs: 0,
+      prioritaire,
+      endpoint: input.endpoint,
       panelRole: "fallback",
     });
     return null;
@@ -613,7 +702,7 @@ async function runJudge(run: JudgeRun): Promise<PanelServed | null> {
       attempt: PANEL_JUDGE_ATTEMPT,
       callId,
       provider,
-      body: judgeBody(input, instruction, userMessage, history, judge, provider),
+      body: judgeBody(input.body, instruction, userMessage, history, judge, provider),
       headers: input.headers,
       prioritaire,
       signal,

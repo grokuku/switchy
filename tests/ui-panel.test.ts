@@ -47,8 +47,30 @@ describe("interface — section Panel de la fenêtre de service", () => {
     expect(stepsAt).toBeGreaterThan(0);
     expect(panelAt).toBeGreaterThan(stepsAt);
     expect(capsAt).toBeGreaterThan(panelAt);
+    // Le titre de la section des étapes est CONDITIONNEL (voir le test suivant) :
+    // la section reste À SA PLACE, seul son libellé change avec le mode panel.
+    expect(app.match(/formSection\("Étapes d'appel"\)/g)?.length ?? 0).toBe(1);
     // Aucun onglet nouveau : les onglets restent ceux de l'index.
     expect(app).not.toContain('data-tab="panel"');
+  });
+
+  it("titre et aide des étapes CONDITIONNELS : « repli » dès que le mode panel est actif", () => {
+    // Hors panel, rien ne change : « Étapes d'appel » + l'aide historique.
+    expect(app).toContain('const stepsSectionTitle = formSection("Étapes d\'appel");');
+    expect(app).toContain("const STEPS_HINT_CHAIN =");
+    // Mode panel : le titre dit la VÉRITÉ (ces étapes ne sont qu'un repli).
+    expect(app).toContain('"Repli si le panel échoue (principal + replis)"');
+    // L'aide du mode panel : 3 proposeurs muets ⇒ repli, et les « Tester » de
+    // cette section testent le REPLI, pas les membres du panel.
+    expect(app).toContain("Ces étapes ne servent QUE si le panel échoue");
+    expect(app).toContain("aucune proposition utilisable (échec, saturation du fournisseur, réponse en appel d'outil)");
+    expect(app).toContain("testent ce repli — pas les membres du panel");
+    // Mise à jour EN PLACE dans le handler de la case : aucun re-render du
+    // formulaire (les éditeurs d'étapes gardent leur état et leurs écouteurs).
+    const handler = between(app, 'panelBox.input.addEventListener("change", () => {', "});");
+    expect(handler).toContain("refreshStepsSectionTitle();");
+    expect(handler).toContain("refreshPanelWarn();");
+    expect(app).toContain('stepsSectionTitle.textContent = panelOn ? "Repli si le panel échoue (principal + replis)" : "Étapes d\'appel";');
   });
 
   it("case décochée par défaut et corps masqué quand elle l'est", () => {

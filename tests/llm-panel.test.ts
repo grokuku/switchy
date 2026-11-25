@@ -33,7 +33,7 @@ import {
 } from "./helpers.js";
 import { llmSlots } from "../src/llm/slot-queue.js";
 import { relayService, UpstreamFailure } from "../src/llm/relay.js";
-import { readAllCallsLog, summarizeActivity } from "../src/llm/calls-log.js";
+import { readAllCallsLog, summarizeActivity, summarizeByKey, summarizeFallbacks, summarizeTokens, PANEL_CONTEXT_MODEL, PANEL_CONTEXT_PROVIDER } from "../src/llm/calls-log.js";
 import { toCallPayload } from "../src/live/hub.js";
 import { JUDGE_PROMPT_FR } from "../src/llm/panel-prompts.js";
 
@@ -294,6 +294,44 @@ describe("panel — écartement des appels d'outils", () => {
     const chain = lines.find((l) => l.model === "m-chain" && l.panelRole === undefined);
     expect(chain?.result).toBe("ok");
     expect(chain?.attempt).toBe(4); // rangs 0-3 pris par le panel
+  });
+
+  it("panel_all_failed n'impute AUCUN échec au principal (ligne de contexte `__panel__`)", async () => {
+    await seedPanelService();
+    // Les 3 membres échouent → panel muet → repli sur la CHAÎNE (qui réussit).
+    mock = mockModels({
+      "m-a": () => jsonResponse({ error: "boom" }, { status: 500 }),
+      "m-b": () => jsonResponse({ error: "boom" }, { status: 500 }),
+      "m-c": () => jsonResponse({ error: "boom" }, { status: 500 }),
+      "m-chain": () => chatResponse("RÉPONSE CHAÎNE"),
+    });
+
+    const res = await api(env.app).post("/v1/chat/completions").send(relayBody());
+    expect(res.status).toBe(200);
+    expect(res.body.choices[0].message.content).toBe("RÉPONSE CHAÎNE");
+
+    const lines = readAllCallsLog();
+    // 1. Aucune ligne d'échec imputée au PRINCIPAL réel (p1 / m-chain).
+    const principalFailures = lines.filter(
+      (line) => line.provider === "p1" && line.model === "m-chain" && line.result === "error",
+    );
+    expect(principalFailures).toHaveLength(0);
+
+    // 2. La trace du passage au repli EXISTE, mais sur un provider de CONTEXTE.
+    const group = lines.find((line) => line.reason === "panel_all_failed");
+    expect(group?.provider).toBe(PANEL_CONTEXT_PROVIDER);
+    expect(group?.model).toBe(PANEL_CONTEXT_MODEL);
+    expect(group?.panelRole).toBe("fallback");
+
+    // 3. Agrégations : la ligne de contexte n'est ni une tentative ni un
+    //    fournisseur (sinon le tableau de bord afficherait « __panel__ »).
+    const activity = summarizeActivity(lines);
+    expect(activity.calls).toBe(1);
+    expect(activity.succeeded).toBe(1);
+    expect(activity.attempts).toBe(4); // A + B + C + la chaîne — pas le constat
+    expect(Object.keys(summarizeTokens(lines).byProvider)).toEqual(["p1"]);
+    expect(summarizeByKey(lines).map((row) => row.attempts)).toEqual([4]);
+    expect(Object.keys(summarizeFallbacks(lines).byFallbackProvider)).not.toContain(PANEL_CONTEXT_PROVIDER);
   });
 });
 
