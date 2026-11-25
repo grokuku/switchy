@@ -34,7 +34,8 @@ import type { IncomingHttpHeaders } from "node:http";
 import { getProvider, getService, type ProviderRecord, type ServiceRecord, type ServiceStep } from "../catalog-store.js";
 import { getConcurrency } from "../config.js";
 import { ApiError } from "../utils/api-error.js";
-import { classifyReason, logCall, newCallId, type CallLogTokens, type CallReason } from "./calls-log.js";
+import { classifyReason, logCall, newCallId, type CallLogTokens, type CallReason, type CallResult } from "./calls-log.js";
+import { PANEL_FALLBACK_ATTEMPT, runPanel } from "./panel.js";
 import { preferredProvider, rememberProvider } from "./key-affinity.js";
 import { isReasoningLevel, normalizeMessagesForProvider, reasoningWireValue } from "./reasoning.js";
 import { llmSlots, QueueFullError, QueueTimeoutError } from "./slot-queue.js";
@@ -85,6 +86,13 @@ export interface RelayOutput {
   /** Flux SSE (streaming) ou corps JSON complet, à relayer tel quel. */
   payload: Buffer | ReadableStream<Uint8Array>;
   streaming: boolean;
+  /**
+   * Mode PANEL (ADDITIF) : présent seulement quand la réponse a été produite
+   * par un panel. `judged` = le juge a répondu ; `text` = texte final — le
+   * panel ne peut pas streamer, c'est la route qui en tire un SSE synthétique
+   * quand le client a demandé `stream: true` (`src/routes/llm.ts`).
+   */
+  panel?: { judged: boolean; text: string };
 }
 
 /** Échec terminal d'une tentative : statut/en-têtes/corps PRÊTS À RELAYER. */
@@ -254,14 +262,17 @@ const USAGE_SNIFF_MAX_CHARS = 64 * 1024;
 const CLASSIFY_BODY_BYTES = 2048;
 
 /**
- * Cause d'une tentative INTERROMPUE — jamais devinée :
+ * Motif d'abandon d'une tentative — jamais deviné :
  *   - `watchdog`          : le watchdog de slot a coupé (appel anormalement long) ;
+ *   - `override`          : motif PROPRE à l'appelant (panneau : membre coupé par
+ *                           son `memberTimeoutMs`) ;
  *   - `client_disconnect` : le client a coupé (fermeture d'onglet, cas normal).
  * Le watchdog PRIME : s'il a sonné, c'est lui qui a interrompu l'appel, quelle
  * que soit l'heure de la déconnexion client.
  */
-function abortReason(watchdog: AbortSignal): CallReason {
-  return watchdog.aborted ? "watchdog" : "client_disconnect";
+function abortReason(watchdog: AbortSignal, override?: () => CallReason | undefined): CallReason {
+  if (watchdog.aborted) return "watchdog";
+  return override?.() ?? "client_disconnect";
 }
 
 function usageFromSseLine(line: string): CallLogTokens | undefined {
@@ -433,13 +444,42 @@ interface StepParams {
   charge?: boolean;
   /** Vrai si cette tentative est celle du fournisseur repris par AFFINITÉ de cache. */
   affinity?: boolean;
+  /**
+   * Contexte du mode PANEL (`src/llm/panel.ts`) — ADDITIF, absent hors panel :
+   * place déjà acquise par l'appelant (admission anti-famine), champs de journal
+   * `panelRole`/`panelRank`, motif d'abandon propre et arbitrage du résultat
+   * avant journalisation. Quand il est absent, le comportement est celui,
+   * inchangé, de la chaîne `principal → fallbacks`.
+   */
+  panel?: PanelStepContext;
 }
 
-type StepOutcome =
+/** Verdict du panneau sur une réponse 2xx, appliqué avant journalisation. */
+export interface PanelResultVerdict {
+  /** Résultat journalisé (`skipped` pour un appel d'outil écarté, `error` pour un juge vide). */
+  result: CallResult;
+  /** Motif catégorisé éventuel (`panel_tool_call_skipped`, `judge_empty`…). */
+  reason?: CallReason;
+  /** Vrai si CETTE réponse est celle servie au client (succès du groupe). */
+  panelServed?: boolean;
+}
+
+/** Contexte d'une tentative pilotée par le panneau (voir `StepParams.panel`). */
+export interface PanelStepContext {
+  role: "member" | "judge";
+  /** Rang du membre (`0`=A, `1`=B, `2`=C) — absent pour le juge. */
+  rank?: number;
+  /** Place DÉJÀ acquise par le panneau : `attemptStep` n'en acquiert pas d'autre. */
+  slotKey: string;
+  /** Motif d'abandon consulté à l'instant de la coupe (délai du panneau). */
+  abortReason?: () => CallReason | undefined;
+  /** Réexamen du résultat d'une réponse 2xx (outil écarté, juge vide). */
+  decide?: (payload: Record<string, unknown> | null) => PanelResultVerdict | undefined;
+}
+export type StepOutcome =
   | { ok: true; output: RelayOutput }
   | { ok: false; failure: UpstreamFailure; fallbackable: boolean }
   | { ok: false; saturated: true };
-
 /**
  * Corps RÉELLEMENT envoyé au fournisseur. Deux régimes, JAMAIS mélangés :
  *
@@ -477,7 +517,24 @@ export function buildUpstreamBody(
   return out;
 }
 
-async function attemptStep(params: StepParams): Promise<StepOutcome> {
+/** Objet JSON d'un corps de réponse (jamais d'exception). */
+function jsonObjectOf(buffer: Buffer): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(buffer.toString("utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tente UNE étape : acquisition de la place, appel amont, journalisation,
+ * libération. Exporté pour le mode PANEL (`src/llm/panel.ts`), qui fournit
+ * lui-même la place (admission anti-famine), le motif d'abandon et l'arbitrage
+ * du résultat via `params.panel` — sans quoi il dupliquerait la mécanique
+ * en-têtes/corps/slots/journal. Comportement INCHANGÉ quand `panel` est absent.
+ */
+export async function attemptStep(params: StepParams): Promise<StepOutcome> {
   const { service, step, attempt, callId, provider, body, headers, prioritaire, signal, endpoint, keyName } = params;
   const acquireMode = params.acquireMode ?? "wait";
   const api: RelayApi = params.api ?? "chat";
@@ -508,6 +565,12 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
     providerType: provider.type,
     ...(params.charge ? { charge: true } : {}),
     ...(params.affinity ? { affinity: true } : {}),
+    ...(params.panel
+      ? {
+          panelRole: params.panel.role,
+          ...(params.panel.rank !== undefined ? { panelRank: params.panel.rank } : {}),
+        }
+      : {}),
   };
 
   try {
@@ -519,7 +582,14 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
       signal: attemptSignal,
       onExpire: () => watchdog.abort(new DOMException("LLM slot watchdog expired", "AbortError")),
     };
-    if (acquireMode === "try") {
+    if (params.panel) {
+      // PANNEAU : la place a été acquise par l'appelant (admission bornée au
+      // quorum, juge admis seulement après libération des membres). `release()`
+      // ci-dessous rend donc CETTE place, exactement comme pour un appel acquis
+      // ici — le panneau réessaie de la rendre dans son propre `finally`
+      // (libération idempotente).
+      slotKey = params.panel.slotKey;
+    } else if (acquireMode === "try") {
       // Mode ROLLING : aucune attente. Pas de place ⇒ l'étape est ÉCARTÉE pour
       // CHARGE (motif distinct d'une erreur fournisseur : `reason: "saturated"`),
       // et la chaîne passe à l'étape suivante.
@@ -580,7 +650,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
           result: report.aborted ? "aborted" : report.error ? "error" : "ok",
           status: upstream.status,
           ...(report.aborted
-            ? { reason: abortReason(watchdog.signal) }
+            ? { reason: abortReason(watchdog.signal, params.panel?.abortReason) }
             : report.error
               ? { error: report.error, reason: "upstream_error" as const }
               : {}),
@@ -595,10 +665,16 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
 
     const buffer = Buffer.from(await upstream.arrayBuffer());
     const usage = usageFromJsonPayload(buffer.toString("utf-8"));
+    // PANNEAU : une réponse 2xx peut être INUTILISABLE comme proposition (appel
+    // d'outil) ou vide (juge). Le verdict est appliqué AVANT la journalisation,
+    // sinon le journal afficherait un succès pour une proposition écartée.
+    const verdict = params.panel?.decide?.(jsonObjectOf(buffer));
     logCall({
       ...common,
-      result: "ok",
+      result: verdict?.result ?? "ok",
       status: upstream.status,
+      ...(verdict?.reason ? { reason: verdict.reason } : {}),
+      ...(verdict?.panelServed !== undefined ? { panelServed: verdict.panelServed } : {}),
       durationMs: Date.now() - startedAt,
       tokens: usage,
       stream: false,
@@ -631,7 +707,7 @@ async function attemptStep(params: StepParams): Promise<StepOutcome> {
       ...common,
       result: aborted ? "aborted" : "error",
       ...(aborted
-        ? { reason: abortReason(watchdog.signal) }
+        ? { reason: abortReason(watchdog.signal, params.panel?.abortReason) }
         : { error: err instanceof Error ? err.message : String(err), reason: "network_error" as const }),
       durationMs: Date.now() - startedAt,
       stream,
@@ -730,12 +806,31 @@ function pickWaitStep(steps: ServiceStep[], affinityIndex: number): number | nul
  * ICI — la logique fournisseur (corps, en-têtes, slots, journal) n'est jamais
  * dupliquée.
  */
-async function runServiceChain(service: ServiceRecord, input: RelayInput): Promise<ChainRun> {
+/**
+ * Réglages de traversée fournis par l'appelant — ADDITIFS, défauts = historique.
+ *
+ * Le mode PANEL en a besoin pour tenir la promesse du journal : « les 4 appels
+ * du panel et la chaîne de repli partagent le MÊME `callId` », avec les rangs
+ * 0/1/2 pour les membres, 3 pour le juge et 4+ pour la chaîne de repli.
+ */
+export interface ChainOptions {
+  /** Identifiant d'appel imposé (sinon un neuf est généré). */
+  callId?: string;
+  /** Décalage appliqué au rang journalisé (`attempt`), sans changer d'étape. */
+  attemptOffset?: number;
+}
+
+async function runServiceChain(
+  service: ServiceRecord,
+  input: RelayInput,
+  options: ChainOptions = {},
+): Promise<ChainRun> {
   const prioritaire = service.prioritaire === true;
   const steps: ServiceStep[] = [service.principal, ...service.fallbacks];
   // Identifiant commun à TOUTES les tentatives de cet appel : un repli se
   // constate en lisant le journal (mêmes `callId`) sans corrélation manuelle.
-  const callId = newCallId();
+  const callId = options.callId ?? newCallId();
+  const attemptOffset = options.attemptOffset ?? 0;
   const rolling = service.rolling === true;
 
   // Ordre de tentative = étapes ACTIVÉES, dans l'ordre du catalogue. Les étapes
@@ -752,7 +847,7 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
       callId,
       keyName: input.keyName,
       service: service.name,
-      attempt: index,
+      attempt: index + attemptOffset,
       provider: step.providerId,
       model: step.model,
       result: "skipped",
@@ -819,7 +914,7 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
           callId,
           keyName: input.keyName,
           service: service.name,
-          attempt: index,
+          attempt: index + attemptOffset,
           provider: step.providerId,
           model: step.model,
           result: "skipped",
@@ -836,7 +931,7 @@ async function runServiceChain(service: ServiceRecord, input: RelayInput): Promi
       const outcome = await attemptStep({
         service,
         step,
-        attempt: index,
+        attempt: index + attemptOffset,
         callId,
         provider,
         body: input.body,
@@ -924,6 +1019,28 @@ export async function relayService(input: RelayInput): Promise<RelayOutput> {
     throw new UpstreamFailure(499, {}, null, { aborted: true, message: "Client disconnected" });
   }
 
+  // ── Mode PANEL (chat uniquement) : branche AVANT la chaîne normale ──
+  // Décision d'architecture : le panel n'est PAS une étape de plus dans
+  // `runServiceChain` (il changerait sa sémantique de rang, de bascule et de
+  // test d'étape) — c'est une BRANCHE qui rend la main à la chaîne, avec le
+  // MÊME `callId` et un décalage de rang (`attempt` 4+), quand aucune
+  // proposition n'est utilisable (les 3 membres en échec ou en appel d'outil).
+  // Le mode `systemone` n'a pas de messages : il n'ouvre jamais de panel.
+  if ((input.api ?? "chat") === "chat" && service.panel) {
+    const callId = newCallId();
+    const served = await runPanel({ service, input, callId });
+    if (served) {
+      return { ...served.output, panel: { judged: served.judged, text: served.text } };
+    }
+    // Panel muet ET client parti : aucun appel supplémentaire (ni chaîne).
+    if (input.signal?.aborted) {
+      throw new UpstreamFailure(499, {}, null, { aborted: true, message: "Client disconnected" });
+    }
+    const fallback = await runServiceChain(service, input, { callId, attemptOffset: PANEL_FALLBACK_ATTEMPT });
+    if (fallback.output) return fallback.output;
+    throw fallback.failure ?? new UpstreamFailure(503, {}, jsonErrorBody("relay failed", "NO_PROVIDER"));
+  }
+
   const run = await runServiceChain(service, input);
   if (run.output) return run.output;
   throw run.failure ?? new UpstreamFailure(503, {}, jsonErrorBody("relay failed", "NO_PROVIDER"));
@@ -1006,7 +1123,7 @@ function asObject(value: unknown): Record<string, unknown> | null {
 }
 
 /** Texte d'une réponse OpenAI-compatible (ou native Ollama) ; `undefined` si absent. */
-function extractResponseText(payload: Record<string, unknown>): string | undefined {
+export function extractResponseText(payload: Record<string, unknown>): string | undefined {
   const choices = payload.choices;
   if (Array.isArray(choices) && choices.length > 0) {
     const message = asObject(asObject(choices[0])?.message);

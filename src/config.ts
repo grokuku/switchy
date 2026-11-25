@@ -137,6 +137,19 @@ export function getSlotWatchdogMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1_800_000;
 }
 
+/**
+ * Cadence du battement `: ping` du SSE SYNTHÉTIQUE du panel, en millisecondes.
+ *
+ * Le panel ne peut pas streamer (il attend 3 propositions puis un juge) :
+ * jusqu'à 150 s peuvent s'écouler sans un octet. La route émet donc un
+ * commentaire SSE `: ping` à cette cadence pour que les proxys et le client ne
+ * coupent pas une connexion qui travaille. `0` = aucun battement.
+ */
+export function getPanelSsePingMs(): number {
+  const parsed = Number.parseInt(readEnv("SWITCHY_PANEL_SSE_PING_MS", "15000"), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 15_000;
+}
+
 /** Mode du journal d'appels : « off », « summary » (défaut) ou « full ». */
 export function getCallsLogMode(): string {
   return readEnv("SWITCHY_CALLS_LOG_MODE", "summary");

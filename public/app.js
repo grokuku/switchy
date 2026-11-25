@@ -1728,6 +1728,15 @@ import {
     pills.append(serviceRollingButton(s));
     if (s.prioritaire) pills.append(badge("prioritaire", "env"));
     if (s.vision) pills.append(badge("vision", "ok"));
+    if (s.panel) {
+      // Panel : format, quorum et langue se lisent sans ouvrir la fenêtre.
+      const members = Array.isArray(s.panel.members) ? s.panel.members : [];
+      pills.append(badge(`panel ${members.length}+1`, "env"));
+      pills.append(badge(`quorum ${s.panel.quorum}/${members.length}`));
+      pills.append(badge(`lang ${s.panel.lang === "en" ? "en" : "fr"}`));
+      const usable = members.filter((step) => isStepEnabled(step) && String(step.model || "").trim() !== "").length;
+      if (usable < Number(s.panel.quorum)) pills.append(badge("panel inopérant", "warn"));
+    }
     pills.append(badge(`${s.fallbacks ? s.fallbacks.length : 0} repli(s)`));
     // Étapes éteintes : annoncées sur la carte (une ligne grisée passe inaperçue).
     const offSteps = serviceToSteps(s).length - enabledSteps(serviceToSteps(s)).length;
@@ -2068,6 +2077,12 @@ import {
    */
   function buildStepsEditor(initialSteps, opts) {
     opts = opts || {};
+    // MODE NOMBRE FIXE (panel) : exactement N lignes, SANS ajout, sans retrait,
+    // sans glisser — l'ordre des propositions A/B/C fait partie du contrat du
+    // prompt du juge (il cite les étiquettes). `roleLabel(index)` permet de
+    // nommer les lignes autrement que « principal / repli n ».
+    const fixedCount = Number.isInteger(opts.fixedCount) && opts.fixedCount > 0 ? opts.fixedCount : 0;
+    const roleOf = typeof opts.roleLabel === "function" ? opts.roleLabel : stepRoleLabel;
     const wrap = h("div", { class: "steps-editor-wrap" });
     const rows = h("ol", { class: "steps-editor" });
     const firstProvider = (state.providers[0] && state.providers[0].id) || "";
@@ -2075,6 +2090,17 @@ import {
       Array.isArray(initialSteps) && initialSteps.length > 0
         ? initialSteps.slice()
         : [{ providerId: firstProvider, model: "", reasoning: "off", enabled: true }];
+    if (fixedCount > 0) {
+      while (steps.length < fixedCount) {
+        steps.push({
+          providerId: (steps[steps.length - 1] && steps[steps.length - 1].providerId) || firstProvider,
+          model: "",
+          reasoning: "off",
+          enabled: true,
+        });
+      }
+      steps = steps.slice(0, fixedCount);
+    }
 
     /** Relit une ligne du DOM : une saisie en cours n'est jamais perdue. */
     function readRow(li) {
@@ -2120,9 +2146,10 @@ import {
         class: `step-editor-row${on ? "" : " is-step-disabled"}`,
         attrs: { "data-step-index": String(index) },
       });
-      const role = stepRoleLabel(index);
+      const role = roleOf(index);
 
-      li.append(stepGrip(role));
+      // Pas de poignée en nombre fixe : aucune ligne ne se déplace.
+      if (fixedCount === 0) li.append(stepGrip(role));
       li.append(h("span", { class: "step-role", text: role }));
 
       // Case ON/OFF de l'étape — même champ `enabled` que le bouton de la carte.
@@ -2193,22 +2220,26 @@ import {
       model.input.addEventListener("change", () => void detect(true));
       model.input.addEventListener("blur", () => void detect(true));
 
-      const tools = stepMoveTools(index, steps.length, role, move);
-      const removeBtn = h("button", {
-        class: "btn btn--ghost btn--icon",
-        text: "✕",
-        attrs: { type: "button", "aria-label": `Retirer ${role}`, title: `Retirer ${role}` },
-        on: { click: () => removeAt(index) },
-      });
-      removeBtn.disabled = steps.length <= 1;
-      tools.wrap.append(removeBtn);
-      if (steps.length < 2) {
-        li.querySelector(".step-grip").hidden = true;
-        tools.up.hidden = true;
-        tools.down.hidden = true;
+      if (fixedCount === 0) {
+        const tools = stepMoveTools(index, steps.length, role, move);
+        const removeBtn = h("button", {
+          class: "btn btn--ghost btn--icon",
+          text: "✕",
+          attrs: { type: "button", "aria-label": `Retirer ${role}`, title: `Retirer ${role}` },
+          on: { click: () => removeAt(index) },
+        });
+        removeBtn.disabled = steps.length <= 1;
+        tools.wrap.append(removeBtn);
+        if (steps.length < 2) {
+          li.querySelector(".step-grip").hidden = true;
+          tools.up.hidden = true;
+          tools.down.hidden = true;
+        }
+        li.append(providerSel, model.input, model.datalist, reasoningSel, tools.wrap, hint);
+      } else {
+        // Nombre fixe : ni flèches, ni retrait, ni ajout (voir `fixedCount`).
+        li.append(providerSel, model.input, model.datalist, reasoningSel, hint);
       }
-
-      li.append(providerSel, model.input, model.datalist, reasoningSel, tools.wrap, hint);
       if (step.model) void detect(false);
       return li;
     }
@@ -2218,32 +2249,35 @@ import {
       steps.forEach((step, index) => rows.append(makeRow(step, index)));
     }
 
+    if (fixedCount > 0) rows.classList.add("steps-editor--fixed");
     draw();
-    attachStepReordering(rows, move);
+    if (fixedCount === 0) attachStepReordering(rows, move);
     wrap.append(rows);
 
-    const add = iconButton("plus", "Ajouter une étape (repli)", {
-      class: "btn",
-      on: {
-        click: () => {
-          commit();
-          const last = steps[steps.length - 1];
-          steps = steps.concat([
-            {
-              providerId: (last && last.providerId) || firstProvider,
-              model: "",
-              reasoning: "off",
-              enabled: true,
-            },
-          ]);
-          draw();
-          const lastRow = rows.lastElementChild;
-          const input = lastRow && lastRow.querySelector("input.step-model-input");
-          if (input) input.focus();
+    if (fixedCount === 0) {
+      const add = iconButton("plus", "Ajouter une étape (repli)", {
+        class: "btn",
+        on: {
+          click: () => {
+            commit();
+            const last = steps[steps.length - 1];
+            steps = steps.concat([
+              {
+                providerId: (last && last.providerId) || firstProvider,
+                model: "",
+                reasoning: "off",
+                enabled: true,
+              },
+            ]);
+            draw();
+            const lastRow = rows.lastElementChild;
+            const input = lastRow && lastRow.querySelector("input.step-model-input");
+            if (input) input.focus();
+          },
         },
-      },
-    });
-    wrap.append(add);
+      });
+      wrap.append(add);
+    }
 
     return {
       wrap,
@@ -2256,6 +2290,15 @@ import {
       steps() {
         commit();
         return nonEmptySteps(steps);
+      },
+      /**
+       * TOUTES les lignes relues (modèle vide compris), dans l'ordre affiché.
+       * Utilisé par le mode NOMBRE FIXE : le panel doit pouvoir dire « le
+       * modèle de la proposition B manque » au lieu de l'écarter en silence.
+       */
+      rawSteps() {
+        commit();
+        return steps.slice();
       },
       /** Nombre de lignes de repli écartées à l'enregistrement (sans modèle). */
       ignoredEmpty() {
@@ -2299,6 +2342,93 @@ import {
     );
     const stepsEditor = buildStepsEditor(editing ? serviceToSteps(service) : [], { onCapabilities });
     form.append(stepsEditor.wrap);
+
+    // ── PANEL : 3 proposeurs + 1 juge, DANS cette fenêtre (aucun onglet) ──
+    // Case DÉCOCHÉE par défaut : un service existant n'active pas un panel par
+    // inadvertance, et un client antérieur ne peut pas l'éteindre (le champ
+    // n'est envoyé que depuis ici).
+    form.append(formSection("Panel"));
+    const existingPanel = editing && service.panel ? service.panel : null;
+    const panelBox = checkbox(!!existingPanel, "Mode panel (3 proposeurs + 1 juge)");
+    form.append(panelBox.wrap);
+    const panelBody = h("div", { class: "panel-config" });
+    panelBody.hidden = !existingPanel;
+    panelBody.append(
+      h("p", {
+        class: "field-hint muted",
+        text: "Trois propositions sont demandées EN PARALLÈLE avec une forme imposée commune, puis un juge les recompose en citant ses sources. Les outils du client restent transmis ; une proposition qui appelle un outil est écartée.",
+      }),
+    );
+
+    const PANEL_MEMBER_ROLES = ["proposition A", "proposition B", "proposition C"];
+    const membersEditor = buildStepsEditor(existingPanel ? existingPanel.members : [], {
+      fixedCount: 3,
+      roleLabel: (index) => PANEL_MEMBER_ROLES[index] || `proposition ${index + 1}`,
+    });
+    panelBody.append(membersEditor.wrap);
+
+    const judgeEditor = buildStepsEditor(existingPanel ? [existingPanel.judge] : [], {
+      fixedCount: 1,
+      roleLabel: () => "juge",
+    });
+    panelBody.append(
+      h("p", {
+        class: "field-hint muted",
+        text: "Le juge ne reçoit AUCUN outil : il ne recompose qu'à partir des propositions reçues.",
+      }),
+    );
+    panelBody.append(judgeEditor.wrap);
+
+    const panelCols = h("div", { class: "form-cols" });
+    const quorumInput = inputNumber(existingPanel ? existingPanel.quorum : 2, 1, 3);
+    panelCols.append(
+      field(
+        "quorum",
+        quorumInput,
+        "Nombre de propositions valables à partir duquel le juge est appelé. En dessous, la meilleure proposition est servie telle quelle.",
+      ),
+    );
+    const panelLangSelect = buildSelect(
+      [
+        { value: "fr", label: "français" },
+        { value: "en", label: "anglais" },
+      ],
+      existingPanel ? existingPanel.lang : "fr",
+    );
+    panelCols.append(field("langue des consignes", panelLangSelect));
+    panelBody.append(panelCols);
+
+    // Délais : repliés par défaut (réglages avancés, rarement touchés).
+    const panelAdvanced = h("details", { class: "panel-advanced" });
+    panelAdvanced.append(h("summary", { text: "réglages avancés" }));
+    const timeouts = h("div", { class: "form-cols" });
+    const memberTimeoutInput = inputNumber(existingPanel ? existingPanel.memberTimeoutMs : 60000, 1000, 600000);
+    timeouts.append(field("délai d'une proposition (ms)", memberTimeoutInput, "Au-delà, la proposition est coupée et écartée."));
+    const judgeTimeoutInput = inputNumber(existingPanel ? existingPanel.judgeTimeoutMs : 90000, 1000, 600000);
+    timeouts.append(field("délai du juge (ms)", judgeTimeoutInput, "Au-delà, la première proposition valable est servie."));
+    panelAdvanced.append(timeouts);
+    panelBody.append(panelAdvanced);
+
+    // GARDE-FOU : moins de propositions utilisables que le quorum ⇒ le juge ne
+    // sera jamais appelé. On le dit AVANT l'enregistrement.
+    const panelWarn = badge("panel inopérant", "warn");
+    panelWarn.hidden = true;
+    panelBody.append(panelWarn);
+
+    function refreshPanelWarn() {
+      const usable = membersEditor.rawSteps().filter((step) => isStepEnabled(step) && String(step.model || "").trim() !== "");
+      const quorum = Number(quorumInput.value);
+      panelWarn.hidden = !panelBox.input.checked || !Number.isFinite(quorum) || usable.length >= quorum;
+    }
+    panelBody.addEventListener("change", refreshPanelWarn);
+    panelBody.addEventListener("input", refreshPanelWarn);
+
+    panelBox.input.addEventListener("change", () => {
+      panelBody.hidden = !panelBox.input.checked;
+      refreshPanelWarn();
+    });
+    form.append(panelBody);
+    refreshPanelWarn();
 
     // Capacités
     form.append(formSection("Capacités"));
@@ -2392,6 +2522,52 @@ import {
         }
         if (!shape.principal) throw new Error("Ajoutez au moins une étape : le principal est obligatoire.");
         if (!shape.principal.model) throw new Error("L'étape principale doit avoir un modèle.");
+        // Panel : `null` = extinction EXPLICITE (seule façon de l'éteindre).
+        // Une ligne sans modèle est REFUSÉE ici : le serveur la rejetterait de
+        // toute façon (400), autant le dire avant l'aller-retour.
+        let panel = null;
+        if (panelBox.input.checked) {
+          const memberSteps = membersEditor.rawSteps();
+          const judgeSteps = judgeEditor.rawSteps();
+          const emptyMember = memberSteps.findIndex((step) => String(step.model || "").trim() === "");
+          if (emptyMember >= 0) {
+            throw new Error(`La ${PANEL_MEMBER_ROLES[emptyMember] || `proposition ${emptyMember + 1}`} doit avoir un modèle.`);
+          }
+          const judgeStep = judgeSteps[0];
+          if (!judgeStep || String(judgeStep.model || "").trim() === "") {
+            throw new Error("Le juge du panel doit avoir un modèle.");
+          }
+          const quorum = Number(quorumInput.value);
+          if (!Number.isInteger(quorum) || quorum < 1 || quorum > memberSteps.length) {
+            throw new Error(`Le quorum doit être un entier entre 1 et ${memberSteps.length}.`);
+          }
+          const memberTimeoutMs = Number(memberTimeoutInput.value);
+          const judgeTimeoutMs = Number(judgeTimeoutInput.value);
+          if (!Number.isInteger(memberTimeoutMs) || memberTimeoutMs < 1000 || memberTimeoutMs > 600000) {
+            throw new Error("Le délai d'une proposition doit être un entier entre 1000 et 600000 ms.");
+          }
+          if (!Number.isInteger(judgeTimeoutMs) || judgeTimeoutMs < 1000 || judgeTimeoutMs > 600000) {
+            throw new Error("Le délai du juge doit être un entier entre 1000 et 600000 ms.");
+          }
+          panel = {
+            members: memberSteps.map((step) => ({
+              providerId: step.providerId,
+              model: step.model,
+              reasoning: step.reasoning,
+              enabled: step.enabled,
+            })),
+            judge: {
+              providerId: judgeStep.providerId,
+              model: judgeStep.model,
+              reasoning: judgeStep.reasoning,
+              enabled: judgeStep.enabled,
+            },
+            quorum,
+            memberTimeoutMs,
+            judgeTimeoutMs,
+            lang: panelLangSelect.value === "en" ? "en" : "fr",
+          };
+        }
         const body = {
           description: descInput.value.trim(),
           principal: shape.principal,
@@ -2402,6 +2578,7 @@ import {
           prioritaire: prioritaireBox.input.checked,
           rolling: rollingBox.input.checked,
           enabled: enabledBox.input.checked,
+          panel,
         };
         if (editing) {
           await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, { method: "PUT", body });

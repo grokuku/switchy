@@ -42,6 +42,12 @@ export interface LiveCallEvent {
   charge?: boolean;
   affinity?: boolean;
   stream?: boolean;
+  /** Mode PANEL : rôle de la ligne (`member`/`judge`/`fallback`). */
+  panelRole?: "member" | "judge" | "fallback";
+  /** Mode PANEL : rang du proposeur (`0`=A, `1`=B, `2`=C). */
+  panelRank?: number;
+  /** Mode PANEL : réponse servie au client (succès du groupe). */
+  panelServed?: boolean;
 }
 
 const liveListeners = new Set<() => void>();

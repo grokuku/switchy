@@ -70,6 +70,19 @@ export type CallResult = "ok" | "error" | "aborted" | "skipped";
  *                       (cas NORMAL : l'utilisateur a fermé l'onglet).
  * Les deux derniers n'accompagnent que `result: "aborted"` : ils rendent une
  * coupe EXPLICABLE sans quoi un flux interrompu restait indéchiffrable.
+ *
+ * ── Motifs du mode PANEL (`docs/panel-service.md` §6) ──
+ *   - `panel_tool_call_skipped` : la réponse d'un proposeur est un APPEL D'OUTIL
+ *                       (résultat `skipped`) — elle ne peut pas être comparée,
+ *                       elle est écartée (le client, lui, garde ses outils) ;
+ *   - `panel_member_timeout` : proposeur coupé par `memberTimeoutMs` (`aborted`) ;
+ *   - `panel_no_quorum` : moins de `quorum` propositions utilisables (`skipped`) ;
+ *   - `panel_all_failed` : AUCUNE proposition utilisable (`error`) → repli sur la
+ *                       chaîne normale, même `callId` ;
+ *   - `judge_failed`    : juge en échec sans motif plus précis (`error`) ;
+ *   - `judge_empty`     : juge vide (`error`) ;
+ *   - `panel_degraded`  : réponse servie SANS le juge (`ok`) — première
+ *                       proposition utilisable après un échec du juge.
  */
 export const CALL_REASONS = [
   "quota",
@@ -82,6 +95,13 @@ export const CALL_REASONS = [
   "step_disabled",
   "watchdog",
   "client_disconnect",
+  "panel_tool_call_skipped",
+  "panel_member_timeout",
+  "panel_no_quorum",
+  "panel_all_failed",
+  "judge_failed",
+  "judge_empty",
+  "panel_degraded",
 ] as const;
 export type CallReason = (typeof CALL_REASONS)[number];
 
@@ -157,6 +177,21 @@ export interface CallLogEntry {
    * qu'il est le dernier à avoir répondu pour cette clé (cache chaud). Additif.
    */
   affinity?: boolean;
+  // ── Mode PANEL (additif) — voir `docs/panel-service.md` §6 ──
+  /**
+   * Rôle de la ligne dans le panel : `member` (proposeur), `judge` (juge),
+   * `fallback` (ligne de GROUPE : `panel_all_failed`, `panel_no_quorum`,
+   * `panel_degraded`). Absent hors panel.
+   */
+  panelRole?: "member" | "judge" | "fallback";
+  /** Rang du proposeur (`0`=A, `1`=B, `2`=C) — absent pour le juge. */
+  panelRank?: number;
+  /**
+   * Vrai sur la ligne dont la réponse a été SERVIE au client : le groupe
+   * `callId` est alors un SUCCÈS, quel que soit le `result` des autres lignes
+   * (`summarizeActivity`). C'est la seule règle de comptage du panel.
+   */
+  panelServed?: boolean;
   // ── Mode « full » uniquement ──
   /** Le service appelé était-il prioritaire ? (priorité intrinsèque, sans en-tête) */
   prioritaire?: boolean;
@@ -186,6 +221,9 @@ const ESSENTIAL: (keyof CallLogEntry)[] = [
   "stream",
   "charge",
   "affinity",
+  "panelRole",
+  "panelRank",
+  "panelServed",
 ];
 
 /** Longueur maximale d'un message d'erreur réseau journalisé. */
@@ -502,6 +540,8 @@ interface CallGroup {
   hasFallback: boolean;
   /** Le `last` courant est-il une tentative RÉELLEMENT exécutée (pas `skipped`) ? */
   lastRan: boolean;
+  /** Au moins une ligne du groupe a été SERVIE au client (`panelServed`). */
+  served: boolean;
 }
 
 /**
@@ -542,9 +582,10 @@ export function summarizeActivity(
     if (isFallback && ran) fallbackAttempts += 1;
 
     const key = typeof entry.callId === "string" && entry.callId !== "" ? entry.callId : `__${index}`;
+    const served = entry.panelServed === true;
     const group = groups.get(key);
     if (!group) {
-      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback, lastRan: ran });
+      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback, lastRan: ran, served });
     } else {
       // ⚠️ Le « dernier essai » se choisit parmi les tentatives RÉELLEMENT
       // EXÉCUTÉES (`ok`/`error`/`aborted`). Une entrée `skipped` (étape
@@ -557,6 +598,7 @@ export function summarizeActivity(
         group.lastRan = true;
       }
       if (isFallback) group.hasFallback = true;
+      if (served) group.served = true;
     }
 
     const ms = entry.durationMs;
@@ -570,7 +612,10 @@ export function summarizeActivity(
   let succeeded = 0;
   let fallbacks = 0;
   for (const group of groups.values()) {
-    if (group.last.result === "ok") succeeded += 1;
+    // RÈGLE DU PANEL : une ligne `panelServed === true` vaut SUCCÈS pour le
+    // groupe. Un panel dont le juge a échoué (ou dont le quorum n'a pas été
+    // atteint) a bien servi une réponse : le compter comme échec mentirait.
+    if (group.served || group.last.result === "ok") succeeded += 1;
     if (group.hasFallback) fallbacks += 1;
   }
   const calls = groups.size;
