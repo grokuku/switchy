@@ -975,9 +975,23 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   white-space: nowrap;
 }
 
+/* « 604,1 k » ne doit pas se couper en deux lignes à 430 px : les colonnes
+   numériques restent alignées sur une seule ligne. */
+.calls-tokens {
+  white-space: nowrap;
+}
+
 .repli-badge {
   margin-left: 6px;
 }
+
+/* Motif d'abandon : rendu DANS la cellule d'état (aucune colonne ajoutée, donc
+   la grille du tableau est inchangée). La règle est posée APRÈS `.badge` (plus
+   bas dans ce fichier) pour en surcharger `display` et `border-style`. */
+.calls-state {
+  white-space: normal;
+}
+
 
 /* ── Listes clé/valeur (pied de carte) ────────────────────────────────── */
 
@@ -1351,6 +1365,24 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   color: var(--switchy-danger);
   border-color: color-mix(in srgb, var(--switchy-danger) 50%, var(--switchy-border));
   background: color-mix(in srgb, var(--switchy-danger) 10%, transparent);
+}
+
+/* Motif d'abandon (« client parti », « watchdog 30 min »…) : information
+   SECONDAIRE, donc bordure pointillée et texte discret. `inline-block` (et non
+   `inline-flex`) est nécessaire pour que `text-overflow` s'applique : le libellé
+   complet reste lisible dans l'infobulle (`title`). La règle vient après
+   `.badge` pour surcharger `display` et `border-style`. */
+.badge.reason-badge {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 6px;
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--switchy-text-muted) 45%, var(--switchy-border));
+  color: var(--switchy-text-muted);
+  font-weight: 500;
 }
 
 /* ── Chaîne d'étapes d'un service (rail vertical) ─────────────────────── */
@@ -2490,6 +2522,18 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   .calls-service,
   .calls-model {
     display: none;
+  }
+
+  /* Deux pilules dans la cellule d'état + une valeur qui ne se coupe pas :
+     on resserre les marges internes pour que les 4 colonnes restantes tiennent
+     dans la largeur, sans défilement horizontal ni dernière colonne rognée. */
+  .calls-table th,
+  .calls-table td {
+    padding: 7px 6px;
+  }
+
+  .calls-table {
+    font-size: 12px;
   }
 
   .cards-grid {

@@ -480,10 +480,22 @@ import {
       init.headers["X-CSRF-Token"] = state.csrfToken;
     }
     if (options.body !== undefined) init.body = options.body;
-    if (http && typeof http.request === "function") {
-      return Promise.resolve(http.request(path, init));
-    }
-    return nativeRequest(path, init);
+    const pending = http && typeof http.request === "function"
+      ? Promise.resolve(http.request(path, init))
+      : nativeRequest(path, init);
+    return pending.catch((err) => {
+      // ⚠️ SUCCÈS SANS CORPS : un 204 (« No Content », réponse NORMALE d'un
+      // DELETE) n'a ni corps ni `Content-Type`. La brique fetch (vendor, non
+      // modifiable ici) exige du JSON et lève « réponse non-JSON » malgré un
+      // statut 2xx : ce n'est PAS un échec, la mutation a bien eu lieu. On
+      // traduit donc ce cas précis en succès `null` ; toute autre erreur
+      // (4xx/5xx, page de login, corps JSON tronqué, réseau) est relancée.
+      const status = err && err.status;
+      if (typeof status === "number" && status >= 200 && status < 300) {
+        if (status === 204 || status === 205 || (err && err.body === "")) return null;
+      }
+      throw err;
+    });
   }
 
   /** Affiche/masque le bandeau « mot de passe par défaut » (session requise). */
@@ -2427,14 +2439,28 @@ import {
       { danger: true, confirmText: "Supprimer" },
     );
     if (!ok) return;
+
+    // 1) L'appel qui décide : s'il échoue, rien n'a bougé à l'écran.
     try {
       await apiRequest(`/api/services/${encodeURIComponent(service.name)}`, { method: "DELETE" });
-      clearStepTests(service.name);
-      notify(`Service « ${service.name} » supprimé.`);
-      await loadServices();
     } catch (err) {
       handleApiError(err, "Échec de la suppression.");
+      return;
     }
+
+    // 2) SUCCÈS : l'état local et l'écran passent AVANT tout appel réseau qui
+    // pourrait échouer (patron du glisser-déposer, `reorderServiceSteps`). La
+    // carte disparaît donc TOUJOURS quand le serveur a supprimé le service —
+    // jamais un écran qui contredit le catalogue.
+    clearStepTests(service.name);
+    state.services = state.services.filter((s) => s && s.name !== service.name);
+    renderServices();
+    notify(`Service « ${service.name} » supprimé.`);
+
+    // 3) Réconciliation avec le serveur (source de vérité) ; une relecture
+    // impossible laisse l'écran déjà correct et n'affiche pas d'erreur de
+    // suppression (elle a réussi).
+    await loadServices();
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -3229,11 +3255,69 @@ import {
     return block;
   }
 
+  /**
+   * Motifs d'abandon en français COURT (ils vivent dans une pilule). La liste
+   * fait foi côté serveur (`CALL_REASONS`, src/llm/calls-log.ts) : une valeur
+   * absente d'ici retombe sur la valeur BRUTE — jamais un libellé inventé.
+   * Un test de couverture échoue si une nouvelle valeur apparaît sans libellé.
+   */
+  const REASON_LABELS = {
+    quota: "quota épuisé",
+    rate_limit: "débit",
+    overloaded: "surchargé",
+    auth_error: "clé refusée",
+    network_error: "réseau",
+    upstream_error: "amont",
+    saturated: "pas de place",
+    step_disabled: "étape désactivée",
+    watchdog: "watchdog 30 min",
+    client_disconnect: "client parti",
+  };
+
+  /** Libellé d'un motif d'abandon (`""` si absent, valeur brute si inconnue). */
+  function reasonLabel(reason) {
+    if (reason === null || reason === undefined || reason === "") return "";
+    const key = String(reason);
+    return REASON_LABELS[key] || key;
+  }
+
+  /** Valeur non nulle d'un champ compteur, ou `—` (jamais un 0 trompeur). */
+  function countOrDash(value) {
+    if (value === null || value === undefined || value === "") return "—";
+    return Number.isFinite(Number(value)) ? String(Number(value)) : "—";
+  }
+
+  /**
+   * Infobulle du motif : de quoi CORRÉLER au journal (`callId`, tentative) et de
+   * quoi COMPRENDRE. Le motif seul ne suffit pas — il vaut presque toujours
+   * « client parti » (l'utilisateur a fermé l'onglet). Le volume de contexte est
+   * le symptôme le plus parlant : seule la décomposition entrée / sortie /
+   * réflexion dit s'il s'agit de contexte réel ou d'une comptabilité amont.
+   * « — » quand le fournisseur n'expose pas la valeur.
+   */
+  function reasonTitle(entry) {
+    const tokens = entry.tokens || {};
+    return [
+      `Motif : ${reasonLabel(entry.reason)}`,
+      `appel ${entry.callId || "—"} · tentative ${countOrDash(entry.attempt)}`,
+      `tokens — entrée ${formatTokens(tokens.promptTokens)} · sortie ${formatTokens(
+        tokens.completionTokens,
+      )} · réflexion ${formatTokens(tokens.reasoningTokens)}`,
+    ].join("\n");
+  }
+
   function resultBadge(entry) {
     const result = entry.result || "error";
     const labels = { ok: "OK", error: "erreur", aborted: "interrompu", skipped: "ignoré" };
     const variant = result === "ok" ? "ok" : result === "error" ? "danger" : "warn";
-    return badge(labels[result] || result, variant);
+    let text = labels[result] || result;
+    // Le code HTTP d'un échec était INVISIBLE : « erreur 429 » dit tout de suite
+    // débit, clé refusée ou panne amont — sans ouvrir le journal.
+    if (result === "error") {
+      const status = Number(entry.status);
+      if (Number.isFinite(status) && status > 0) text += ` ${Math.trunc(status)}`;
+    }
+    return badge(text, variant);
   }
 
   /** Total de tokens d'une ligne du journal (`—` si le fournisseur ne l'expose pas). */
@@ -3251,9 +3335,22 @@ import {
     const tr = h("tr");
     tr.append(h("td", { class: "calls-time", text: formatClock(entry.ts) }));
 
+    // Le MOTIF reste DANS la cellule d'état : aucune colonne ajoutée, donc
+    // l'alignement du tableau est préservé tel quel (et sur mobile les colonnes
+    // service/modèle sont déjà masquées).
     const state = h("td", { class: "calls-state" });
     state.append(resultBadge(entry));
     if (entry.isFallback) state.append(h("span", { class: "badge badge--danger repli-badge", text: "REPLI" }));
+    // Rien pour un succès : jamais de pilule vide.
+    if (reasonLabel(entry.reason)) {
+      state.append(
+        h("span", {
+          class: "badge badge--reason reason-badge",
+          text: reasonLabel(entry.reason),
+          attrs: { title: reasonTitle(entry) },
+        }),
+      );
+    }
     tr.append(state);
 
     tr.append(h("td", { class: "calls-service", text: entry.service || "?", attrs: { title: entry.service || "?" } }));
@@ -3287,15 +3384,19 @@ import {
 
     const table = h("table", { class: "calls-table" });
     const head = h("tr");
-    for (const [label, title] of [
-      ["heure", "heure de la tentative"],
-      ["état", "verdict de la tentative"],
-      ["service", "nom du service appelé"],
-      ["modèle", "modèle réellement appelé"],
-      ["durée", "durée de la tentative"],
-      ["tokens", "tokens consommés (— = non exposé)"],
+    // Chaque en-tête porte la MÊME classe que sa cellule : le masquage mobile
+    // (`@media (max-width: 560px)` sur `.calls-service`/`.calls-model`) retire
+    // donc aussi le titre de colonne — sinon les valeurs glissaient sous les
+    // mauvais libellés.
+    for (const [label, cls, title] of [
+      ["heure", "calls-time", "heure de la tentative"],
+      ["état", "calls-state", "verdict de la tentative — motif d'abandon en infobulle"],
+      ["service", "calls-service", "nom du service appelé"],
+      ["modèle", "calls-model", "modèle réellement appelé"],
+      ["durée", "calls-duration", "durée de la tentative"],
+      ["tokens", "calls-tokens", "tokens consommés (— = non exposé)"],
     ]) {
-      head.append(h("th", { text: label, attrs: { title } }));
+      head.append(h("th", { class: cls, text: label, attrs: { title } }));
     }
     const thead = h("thead");
     thead.append(head);
