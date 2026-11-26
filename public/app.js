@@ -2758,7 +2758,7 @@ import {
   const AGGREGATES_REFRESH_MS = 30000;
 
   /** Nombre de lignes « Derniers appels » affichées (identique au serveur). */
-  const RECENT_LIMIT = 10;
+  const RECENT_LIMIT = 12;
 
   let dashboardTimer = null;
   let dashboardLoading = false;
@@ -2902,10 +2902,7 @@ import {
   const isOk = (row) => (row.result || "") === "ok";
   const isSkipped = (row) => (row.result || "") === "skipped" || row.charge === true;
 
-  /**
-   * Tuile KPI : libellé en PETITES CAPITALES, chiffre géant, contexte dessous,
-   * puis un micro-graphique de tendance (données réelles) quand il y en a.
-   */
+  /** Tuile compacte du bandeau KPI (une seule ligne à grand écran). */
   function dashboardStat(label, value, opts) {
     opts = opts || {};
     const tile = h("article", {
@@ -2913,9 +2910,13 @@ import {
       attrs: opts.title ? { title: opts.title } : null,
     });
     tile.append(h("span", { class: "kpi-label", text: label }));
-    tile.append(h("span", { class: "kpi-value", text: value, attrs: { title: String(value) } }));
-    if (opts.hint) tile.append(h("span", { class: "kpi-sub", text: opts.hint, attrs: { title: opts.hint } }));
-    if (Array.isArray(opts.series)) tile.append(sparkline(opts.series));
+    tile.append(
+      h("span", {
+        class: "kpi-value" + (opts.valueClass ? ` ${opts.valueClass}` : ""),
+        text: value,
+        attrs: { title: String(value) },
+      }),
+    );
     return tile;
   }
 
@@ -2950,54 +2951,39 @@ import {
 
   const LIVE_STATE_LABEL = { free: "libre", busy: "occupé", saturated: "saturé" };
 
-  /** Bloc — « En ce moment » : concurrence par fournisseur (barre segmentée). */
+  /** Bloc — « En ce moment » : une ligne dense par fournisseur. */
   function renderLiveBlock(live) {
-    const block = h("section", { class: "dash-block card" });
+    const block = h("section", { class: "dash-block card live-card" });
     const providers = (live && live.providers) || [];
     const active = Number(live && live.active) || 0;
     const queued = Number(live && live.queued) || 0;
-    const places = providers.reduce((sum, p) => sum + (Number(p.limit) || 0), 0);
 
     const head = h("div", { class: "card-h" });
     head.append(h("h3", { class: "dash-title", text: "En ce moment" }));
-    if (places > 0) {
-      head.append(h("span", { class: "card-h-meta", text: `${active} / ${places} places` }));
-    }
+    head.append(h("span", { class: "card-h-meta", text: `${active} actif(s) · ${queued} en attente` }));
     block.append(head);
 
     const body = h("div", { class: "dash-body" });
-    if (providers.length === 0) {
-      body.append(h("p", { class: "muted", text: "Aucun fournisseur configuré." }));
-      block.append(body);
-      return block;
-    }
-
     const list = h("div", { class: "cap-list" });
+    if (providers.length === 0) {
+      list.append(h("p", { class: "muted", text: "Aucun fournisseur configuré." }));
+    }
     for (const p of providers) {
       const state = p.state || "free";
       const used = Number(p.active) || 0;
       const limit = Number(p.limit) || 0;
       const waiting = Number(p.queued) || 0;
       const row = h("div", { class: "cap-row", attrs: { "data-state": state } });
-
-      const rowHead = h("div", { class: "cap-head" });
-      rowHead.append(h("span", { class: "cap-name", text: p.label || p.id, attrs: { title: p.label || p.id } }));
-      rowHead.append(h("span", { class: "cap-state", text: LIVE_STATE_LABEL[state] || state }));
-      rowHead.append(
-        h("span", { class: "cap-count", text: limit > 0 ? `${used} / ${limit}` : `${used}` }),
-      );
-      row.append(rowHead);
+      row.dataset.provider = p.id;
+      row.append(h("span", { class: "cap-name", text: p.label || p.id, attrs: { title: p.label || p.id } }));
       row.append(capacityBar(used, limit));
-
-      const note = h("div", { class: "cap-note" });
-      note.append(h("span", { text: `${used} appel(s) en cours` }));
-      note.append(
+      row.append(h("span", { class: "cap-count", text: limit > 0 ? `${used}/${limit}` : `${used}` }));
+      row.append(
         h("span", {
-          class: waiting > 0 ? "cap-note--busy" : "",
+          class: "cap-note" + (waiting > 0 ? " cap-note--busy" : ""),
           text: waiting > 0 ? `${waiting} en attente` : "file vide",
         }),
       );
-      row.append(note);
       list.append(row);
     }
     body.append(list);
@@ -3005,202 +2991,178 @@ import {
     block.append(
       h("p", {
         class: "dash-foot",
-        text: `${active} appel(s) en cours · ${queued} en attente au total`,
+        text: `actifs · attente · ${active} appel(s) en cours · ${queued} en attente au total`,
       }),
     );
     return block;
   }
 
-  /**
-   * Six tuiles KPI en tête de l'onglet Activité : appels, réussite, replis
-   * (alerte si > 0), sautés (charge), affinité, latence. Les quatre premières
-   * portent un micro-graphique de tendance calculé sur le journal récent.
-   */
-  function renderSummaryBlock(activity, recent) {
+  /** Huit KPI en bandeau : agrégats 24 h, tokens et concurrence directe. */
+  function renderSummaryBlock(activity, tokens, live) {
     activity = activity || {};
-    const grid = h("section", { class: "kpi-grid", attrs: { "aria-label": "Chiffres des 24 dernières heures" } });
+    const grid = h("section", { class: "kpi-grid", attrs: { "aria-label": "Indicateurs synthétiques" } });
     const fallbacks = Number(activity.fallbacks) || 0;
-
-    grid.append(
-      dashboardStat("Appels", formatCompact(activity.calls), {
-        hint: `${formatCompact(activity.attempts)} tentative(s) · 24 h`,
-        series: recentSeries(recent, (rows) => rows.length),
-      }),
-    );
-    grid.append(
-      dashboardStat("Réussite", formatPercent(activity.successRate), {
-        hint: `${formatCompact(activity.succeeded)} appel(s) réussi(s)`,
-        series: recentSeries(recent, (rows) => rows.filter(isOk).length / rows.length),
-      }),
-    );
-    grid.append(
-      dashboardStat("Replis", formatCompact(activity.fallbacks), {
-        alert: fallbacks > 0,
-        hint: `${formatPercent(activity.fallbackRate)} des appels`,
-        series: recentSeries(recent, (rows) => rows.filter((row) => row.isFallback === true).length),
-      }),
-    );
-    grid.append(
-      dashboardStat("Sautés (charge)", formatCompact(activity.loadFallbacks), {
-        hint: "rolling : étape pleine",
-        series: recentSeries(recent, (rows) => rows.filter(isSkipped).length),
-      }),
-    );
-    grid.append(
-      dashboardStat("Affinité", formatCompact(activity.affinityHits), {
-        hint: "fournisseur repris",
-      }),
-    );
+    const loadFallbacks = Number(activity.loadFallbacks) || 0;
     const latency = activity.latency || {};
+    const active = Number(live && live.active) || 0;
+    const queued = Number(live && live.queued) || 0;
+
+    grid.append(dashboardStat("Appels · 24 h", formatCompact(activity.calls)));
+    grid.append(dashboardStat("Réussite", formatPercent(activity.successRate), { valueClass: "good" }));
+    grid.append(dashboardStat("Replis", formatCompact(activity.fallbacks), { alert: fallbacks > 0, valueClass: "accent-text" }));
+    grid.append(dashboardStat("Sautés charge", formatCompact(activity.loadFallbacks), { alert: loadFallbacks > 0 }));
     grid.append(
-      dashboardStat("Latence moy.", formatDuration(latency.avgMs), {
-        hint: `max ${formatDuration(latency.maxMs)}`,
+      dashboardStat("Affinité cache", formatCompact(activity.affinityHits), {
+        title: "Tentatives servies par le fournisseur repris pour cette clé",
       }),
+    );
+    grid.append(
+      dashboardStat(
+        "Latence moy. / max",
+        `${formatDuration(latency.avgMs)} / ${formatDuration(latency.maxMs)}`,
+      ),
+    );
+    grid.append(dashboardStat("Tokens · 24 h", formatTokens(totalTokenCount(tokens && tokens.total))));
+    grid.append(
+      dashboardStat("En cours / attente", `${active} / ${queued}`, { valueClass: "kpi-live-value" }),
     );
     return grid;
   }
 
-  /** Ligne du tableau de tokens (total, service ou fournisseur). */
+  /** Statistique compacte de la carte « 24 h » (distincte des tuiles KPI). */
+  function activityStat(label, value, valueClass) {
+    const row = h("div", { class: "stat" });
+    row.append(h("span", { text: label }));
+    row.append(h("strong", { class: valueClass || "", text: value }));
+    return row;
+  }
+
+  /** Total dérivé des seules parts CONNUES (`null` si aucune n'est exposée). */
+  function totalTokenCount(totals) {
+    const values = [totals && totals.prompt, totals && totals.completion, totals && totals.reasoning]
+      .filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)))
+      .map(Number);
+    return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) : null;
+  }
+
+  /** Ligne du tableau de tokens ; le libellé de groupe précède sa première ligne. */
   function tokenRow(name, totals, opts) {
     opts = opts || {};
-    const tr = h("tr", { class: opts.total ? "token-row token-row--total" : "token-row" });
-    tr.append(h("th", { text: name, attrs: { scope: "row" } }));
+    const tr = h("tr", { class: "token-row" + (opts.group ? " group-start" : "") });
+    const label = h("th", { attrs: { scope: "row" } });
+    if (opts.group) {
+      label.append(h("span", { class: "token-group-label", text: opts.group }));
+      label.append(h("br"));
+    }
+    label.append(document.createTextNode(name));
+    tr.append(label);
+    tr.append(h("td", { text: formatTokens(totalTokenCount(totals)) }));
     tr.append(h("td", { text: formatTokens(totals.prompt) }));
     tr.append(h("td", { text: formatTokens(totals.completion) }));
     tr.append(h("td", { text: formatTokens(totals.reasoning) }));
     return tr;
   }
 
-  function tokenGroupRow(label) {
-    return h("tr", { class: "token-group" }, h("th", { text: label, attrs: { colspan: "4" } }));
-  }
-
-  /**
-   * Barre de RÉPARTITION entrée / sortie / réflexion (SVG) + légende chiffrée.
-   * Les parts sont calculées sur les seules valeurs CONNUES : une valeur non
-   * exposée par le fournisseur n'est ni comptée ni affichée comme un zéro.
-   */
+  /** Total et répartition entrée / sortie / réflexion, sans valeur inventée. */
   function tokensSplit(total) {
-    const parts = [
-      { key: "prompt", label: "entrée", value: total.prompt },
-      { key: "completion", label: "sortie", value: total.completion },
-      { key: "reasoning", label: "réflexion", value: total.reasoning },
-    ].map((part) => {
-      const num = Number(part.value);
-      return { ...part, num: Number.isFinite(num) && num > 0 ? num : 0 };
-    });
-    const sum = parts.reduce((acc, part) => acc + part.num, 0);
+    const wrap = h("div", { class: "token-summary" });
+    const totalLine = h("div", { class: "token-total" });
+    totalLine.append(h("strong", { text: formatTokens(totalTokenCount(total)) }));
+    totalLine.append(h("span", { text: "tokens au total" }));
+    wrap.append(totalLine);
 
-    const wrap = h("div", { class: "split" });
-    const bar = svgEl("svg", {
-      class: "split-bar",
-      viewBox: "0 0 100 12",
-      preserveAspectRatio: "none",
-      "aria-hidden": "true",
-      focusable: "false",
-    });
-    if (sum > 0) {
-      let x = 0;
-      for (const part of parts) {
-        if (part.num <= 0) continue;
-        const width = (part.num / sum) * 100;
-        bar.append(
-          svgEl("rect", {
-            class: `split-seg split-seg--${part.key}`,
-            x: Number(x.toFixed(3)),
-            y: 0,
-            width: Number(Math.max(width - 0.4, 0.4).toFixed(3)),
-            height: 12,
-            rx: 2,
-          }),
-        );
-        x += width;
-      }
+    const split = h("div", { class: "token-split" });
+    for (const part of [
+      ["Entrée", total.prompt],
+      ["Sortie", total.completion],
+      ["Réflexion", total.reasoning],
+    ]) {
+      const cell = h("div");
+      cell.append(h("span", { text: part[0] }));
+      cell.append(h("b", { text: formatTokens(part[1]) }));
+      split.append(cell);
     }
-    wrap.append(bar);
-
-    const legend = h("ul", { class: "split-legend" });
-    for (const part of parts) {
-      const li = h("li", null);
-      li.append(h("span", { class: `split-key split-key--${part.key}`, attrs: { "aria-hidden": "true" } }));
-      li.append(document.createTextNode(part.label));
-      li.append(h("b", { text: formatTokens(part.value) }));
-      if (sum > 0 && part.num > 0) {
-        li.append(h("span", { text: formatPercent(part.num / sum) }));
-      }
-      legend.append(li);
-    }
-    wrap.append(legend);
+    wrap.append(split);
     return wrap;
   }
 
-  /** Bloc — « Tokens (24 h) » : répartition, total, par service, par fournisseur. */
+  /** Bloc — « Tokens · 24 h » : total, répartition, services et fournisseurs. */
   function renderTokensBlock(tokens) {
     tokens = tokens || {};
-    const block = h("section", { class: "dash-block card" });
+    const block = h("section", { class: "dash-block card tokens-card" });
 
     const head = h("div", { class: "card-h" });
-    head.append(h("h3", { class: "dash-title", text: "Tokens" }));
-    head.append(h("span", { class: "card-h-meta", text: "24 h" }));
+    head.append(h("h3", { class: "dash-title", text: "Tokens · 24 h" }));
+    head.append(h("span", { class: "card-h-meta", text: "entrée / sortie / réflexion" }));
     block.append(head);
 
     const body = h("div", { class: "dash-body" });
     const totals = tokens.total || { prompt: null, completion: null, reasoning: null };
     body.append(tokensSplit(totals));
 
-    const table = h("table", { class: "token-table" });
+    const table = h("table", { class: "token-table", attrs: { "aria-label": "Tokens sur 24 heures" } });
     const headRow = h("tr");
-    headRow.append(h("th", { text: "" }));
-    headRow.append(h("th", { text: "entrée" }));
-    headRow.append(h("th", { text: "sortie" }));
-    headRow.append(h("th", { text: "réflexion" }));
+    for (const label of ["Service / fournisseur", "Total", "Entrée", "Sortie", "Réfl."]) {
+      headRow.append(h("th", { text: label }));
+    }
     const thead = h("thead");
     thead.append(headRow);
     table.append(thead);
 
     const tbody = h("tbody");
-    tbody.append(tokenRow("Total", totals, { total: true }));
     const services = Object.entries(tokens.byService || {});
-    if (services.length > 0) {
-      tbody.append(tokenGroupRow("Par service"));
-      for (const [name, values] of services) tbody.append(tokenRow(name, values));
-    }
+    services.forEach(([name, values], index) => {
+      tbody.append(tokenRow(name, values, { group: index === 0 ? "Services" : "" }));
+    });
     const providers = Object.entries(tokens.byProvider || {});
-    if (providers.length > 0) {
-      tbody.append(tokenGroupRow("Par fournisseur"));
-      for (const [name, values] of providers) tbody.append(tokenRow(name, values));
-    }
+    providers.forEach(([name, values], index) => {
+      tbody.append(tokenRow(name, values, { group: index === 0 ? "Fournisseurs" : "" }));
+    });
     table.append(tbody);
-    body.append(h("div", { class: "table-wrap" }, table));
+    if (services.length === 0 && providers.length === 0) {
+      body.append(h("p", { class: "dash-note muted", text: "Aucune consommation rapportée sur la période." }));
+    } else {
+      body.append(h("div", { class: "table-wrap" }, table));
+    }
     block.append(body);
-
-    block.append(
-      h("p", {
-        class: "dash-foot",
-        text:
-          services.length === 0 && providers.length === 0
-            ? "Aucune consommation rapportée sur la période."
-            : "« — » = non exposé par le fournisseur (ou compte inconnu).",
-      }),
-    );
     return block;
   }
 
-  /**
-   * Bloc ⑤ — « Par clé d'API » : une ligne par clé (NOM uniquement, jamais un
-   * secret). « en cours » = appels en vol de cette clé (mesure distincte des
-   * places par fournisseur du bloc « En ce moment »).
-   */
-  function renderKeyBlock(byKey) {
-    const block = h("section", { class: "dash-block card" });
+  /** Carte centrale : synthèse 24 h puis lignes compactes par NOM de clé. */
+  function renderKeyBlock(byKey, activity) {
+    const block = h("section", { class: "dash-block card activity-key-card" });
     const rows = Array.isArray(byKey) ? byKey : [];
+    activity = activity || {};
+    const latency = activity.latency || {};
 
     const headCard = h("div", { class: "card-h" });
-    headCard.append(h("h3", { class: "dash-title", text: "Par clé d'API" }));
+    headCard.append(h("h3", { class: "dash-title", text: "24 h" }));
     headCard.append(
-      h("span", { class: "card-h-meta", text: rows.length === 0 ? "—" : `${rows.length} clé(s)` }),
+      h("span", {
+        class: "card-h-meta",
+        text: `${formatCompact(activity.succeeded)} réussis / ${formatCompact(activity.calls)}`,
+      }),
     );
     block.append(headCard);
+
+    const stats = h("div", { class: "stats-grid" });
+    stats.append(activityStat("Appels", formatCompact(activity.calls)));
+    stats.append(activityStat("Réussite", formatPercent(activity.successRate), "good"));
+    stats.append(activityStat("Replis", formatCompact(activity.fallbacks), "accent-text"));
+    stats.append(activityStat("Sautés charge", formatCompact(activity.loadFallbacks), "warn-text"));
+    stats.append(activityStat("Affinité cache", formatCompact(activity.affinityHits)));
+    stats.append(
+      activityStat(
+        "Latence moy. / max",
+        `${formatDuration(latency.avgMs)} / ${formatDuration(latency.maxMs)}`,
+      ),
+    );
+    block.append(stats);
+
+    const subhead = h("div", { class: "subhead" });
+    subhead.append(h("span", { text: "Par clé d’API" }));
+    subhead.append(h("span", { text: "E / S / R" }));
+    block.append(subhead);
 
     if (rows.length === 0) {
       block.append(h("div", { class: "dash-body" }, h("p", { class: "muted", text: "Aucune clé d'API utilisée sur la période." })));
@@ -3208,50 +3170,39 @@ import {
     }
 
     const table = h("table", { class: "token-table key-table" });
-    const head = h("tr");
-    head.append(h("th", { text: "clé" }));
-    head.append(h("th", { text: "en cours", attrs: { title: "appels en vol de cette clé" } }));
-    head.append(h("th", { text: "appels (24 h)" }));
-    head.append(h("th", { text: "réussite" }));
-    head.append(h("th", { text: "replis" }));
-    head.append(h("th", { text: "latence" }));
-    head.append(h("th", { text: "entrée" }));
-    head.append(h("th", { text: "sortie" }));
-    head.append(h("th", { text: "réflexion" }));
-    const thead = h("thead");
-    thead.append(head);
-    table.append(thead);
-
     const tbody = h("tbody");
     for (const row of rows) {
       const tr = h("tr", { class: "key-row" });
-      // Identifiant d'affichage : permet la mise à jour EN PLACE de la seule
-      // cellule « en cours » (voir `paintKeyBlock`) sans reconstruire le bloc.
+      // Identifiant stable : seule la cellule « en cours » est repeinte ensuite.
       tr.dataset.key = row.key || "inconnu";
-      tr.append(h("th", { text: row.key || "inconnu", attrs: { scope: "row", title: row.key || "inconnu" } }));
       const inFlight = Number(row.inFlight) || 0;
-      tr.append(h("td", { class: inFlight > 0 ? "key-inflight key-inflight--on" : "key-inflight", text: String(inFlight) }));
-      tr.append(h("td", { text: formatCompact(row.calls) }));
-      tr.append(h("td", { text: formatPercent(row.successRate) }));
       const fallbacks = Number(row.fallbacks) || 0;
-      tr.append(h("td", { class: fallbacks > 0 ? "key-fallbacks key-fallbacks--alert" : "key-fallbacks", text: formatCompact(fallbacks) }));
-      const latency = row.latency || {};
-      tr.append(h("td", { text: formatDuration(latency.avgMs) }));
+      const keyLatency = row.latency || {};
       const tokens = row.tokens || {};
-      tr.append(h("td", { text: formatTokens(tokens.prompt) }));
-      tr.append(h("td", { text: formatTokens(tokens.completion) }));
-      tr.append(h("td", { text: formatTokens(tokens.reasoning) }));
+
+      const name = h("th", { attrs: { scope: "row", title: row.key || "inconnu" } });
+      name.append(h("span", { class: "key-name", text: row.key || "inconnu" }));
+      name.append(
+        h("span", {
+          class: "key-sub",
+          text: `${formatCompact(fallbacks)} repli(s) · ${formatDuration(keyLatency.avgMs)} · E/S/R ${formatTokens(
+            tokens.prompt,
+          )} / ${formatTokens(tokens.completion)} / ${formatTokens(tokens.reasoning)}`,
+        }),
+      );
+      tr.append(name);
+      tr.append(
+        h("td", {
+          class: inFlight > 0 ? "key-inflight key-inflight--on" : "key-inflight",
+          text: `${inFlight} en cours`,
+        }),
+      );
+      tr.append(h("td", { class: "key-calls", text: `${formatCompact(row.calls)} appels` }));
+      tr.append(h("td", { class: "key-rate", text: formatPercent(row.successRate) }));
       tbody.append(tr);
     }
     table.append(tbody);
-    const body = h("div", { class: "dash-body" }, h("div", { class: "table-wrap" }, table));
-    block.append(body);
-    block.append(
-      h("p", {
-        class: "dash-foot",
-        text: "« en cours » = appels en vol de la clé · « — » = valeur non exposée par le fournisseur.",
-      }),
-    );
+    block.append(h("div", { class: "key-list" }, table));
     return block;
   }
 
@@ -3365,15 +3316,18 @@ import {
     return tr;
   }
 
-  /** Bloc — « Derniers appels » : vrai tableau aligné (heure, état, service, modèle, durée, tokens). */
+  /** Bloc — « Derniers appels » : tableau dense, borné à RECENT_LIMIT. */
   function renderRecentBlock(recent) {
-    const block = h("section", { class: "dash-block card" });
-    const rows = Array.isArray(recent) ? recent : [];
+    const block = h("section", { class: "dash-block card calls-card" });
+    const rows = (Array.isArray(recent) ? recent : []).slice(0, RECENT_LIMIT);
 
     const headCard = h("div", { class: "card-h" });
     headCard.append(h("h3", { class: "dash-title", text: "Derniers appels" }));
     headCard.append(
-      h("span", { class: "card-h-meta", text: rows.length === 0 ? "—" : `${rows.length} dernier(s)` }),
+      h("span", {
+        class: "card-h-meta",
+        text: rows.length === 0 ? "—" : `${rows.length} plus récent(s) · heure locale`,
+      }),
     );
     block.append(headCard);
 
@@ -3407,6 +3361,12 @@ import {
     table.append(tbody);
 
     block.append(h("div", { class: "dash-body" }, h("div", { class: "table-wrap" }, table)));
+    block.append(
+      h("p", {
+        class: "dash-foot",
+        text: "Les motifs distinguent repli, interruption, départ du client et erreur fournisseur.",
+      }),
+    );
     return block;
   }
 
@@ -3469,12 +3429,49 @@ import {
     return out;
   }
 
-  /** Repeint « En ce moment » (places par fournisseur + totaux). */
-  function paintLiveBlock() {
+  /** Repeint les seules valeurs directes ; repli complet si la forme change. */
+  function paintLiveBlock(full) {
     if (!dashHosts || !dashHosts.live) return;
     const view = liveView();
     if (!view) return;
-    dashHosts.live.replaceChildren(...Array.from(renderLiveBlock(view).childNodes));
+    const providers = Array.isArray(view.providers) ? view.providers : [];
+    const list = full ? null : dashHosts.live.querySelector(".cap-list");
+    const domRows = list ? Array.from(list.querySelectorAll(".cap-row")) : [];
+    const wanted = providers.map((provider) => provider.id);
+    const sameShape =
+      domRows.length === wanted.length &&
+      domRows.every((row, index) => (row.dataset.provider || "") === wanted[index]);
+    if (!list || !sameShape) {
+      dashHosts.live.replaceChildren(...Array.from(renderLiveBlock(view).childNodes));
+    } else {
+      providers.forEach((provider, index) => {
+        const row = domRows[index];
+        const active = Number(provider.active) || 0;
+        const limit = Number(provider.limit) || 0;
+        const queued = Number(provider.queued) || 0;
+        row.dataset.state = provider.state || "free";
+        const count = row.querySelector(".cap-count");
+        if (count) count.textContent = limit > 0 ? `${active}/${limit}` : String(active);
+        const note = row.querySelector(".cap-note");
+        if (note) {
+          note.textContent = queued > 0 ? `${queued} en attente` : "file vide";
+          note.className = "cap-note" + (queued > 0 ? " cap-note--busy" : "");
+        }
+        const bar = row.querySelector(".cap-bar");
+        if (bar) bar.replaceWith(capacityBar(active, limit));
+      });
+      const meta = dashHosts.live.querySelector(".card-h-meta");
+      if (meta) meta.textContent = `${view.active} actif(s) · ${view.queued} en attente`;
+      const foot = dashHosts.live.querySelector(".dash-foot");
+      if (foot) {
+        foot.textContent = `actifs · attente · ${view.active} appel(s) en cours · ${view.queued} en attente au total`;
+      }
+    }
+    const kpi = dashHosts.summary && dashHosts.summary.querySelector(".kpi-live-value");
+    if (kpi) {
+      kpi.textContent = `${view.active} / ${view.queued}`;
+      kpi.setAttribute("title", kpi.textContent);
+    }
   }
 
   /**
@@ -3494,14 +3491,14 @@ import {
       domRows.length === wanted.length &&
       domRows.every((tr, i) => (tr.dataset.key || "") === wanted[i]);
     if (!tbody || !sameShape) {
-      dashHosts.key.replaceChildren(...Array.from(renderKeyBlock(rows).childNodes));
+      dashHosts.key.replaceChildren(...Array.from(renderKeyBlock(rows, lastDashboard.activity).childNodes));
       return;
     }
     rows.forEach((row, i) => {
       const cell = domRows[i].querySelector("td.key-inflight");
       if (!cell) return;
       const inFlight = Number(row.inFlight) || 0;
-      cell.textContent = String(inFlight);
+      cell.textContent = `${inFlight} en cours`;
       cell.className = inFlight > 0 ? "key-inflight key-inflight--on" : "key-inflight";
     });
   }
@@ -3522,7 +3519,7 @@ import {
     tbody.prepend(recentRow(entry));
     while (tbody.children.length > RECENT_LIMIT) tbody.removeChild(tbody.lastElementChild);
     const meta = dashHosts.recent.querySelector(".card-h-meta");
-    if (meta) meta.textContent = `${recentEntries.length} dernier(s)`;
+    if (meta) meta.textContent = `${recentEntries.length} plus récent(s) · heure locale`;
   }
 
   /** Applique une frame du direct (`snapshot`, `live` ou `call`). */
@@ -3543,7 +3540,7 @@ import {
       keys: Array.isArray(frame.keys) ? frame.keys : [],
       totals: frame.totals || { active: 0, queued: 0 },
     };
-    paintLiveBlock();
+    paintLiveBlock(isSnapshot);
     // Snapshot (connexion / reconnexion) = rendu COMPLET ; `live` = en place.
     paintKeyBlock(isSnapshot);
     if (isSnapshot) paintRecent(true);
@@ -3571,17 +3568,19 @@ import {
     lastDashboard = data;
     recentEntries = Array.isArray(data.recent) ? data.recent.slice(0, RECENT_LIMIT) : [];
 
-    // Ordre validé : KPI 24 h → (En ce moment | Tokens) → Par clé → Derniers appels.
+    // Bandeau KPI → trois colonnes (direct | 24 h + clés | tokens) → appels.
     const view = liveState ? liveView() : data.live;
-    const row = h("div", { class: "dash-row" });
+    const summaryHost = renderSummaryBlock(data.activity, data.tokens, view);
+    const row = h("div", { class: "dash-row dash-row--top" });
     const liveHost = renderLiveBlock(view);
-    const keyHost = renderKeyBlock(keysWithLive(data.byKey));
+    const keyHost = renderKeyBlock(keysWithLive(data.byKey), data.activity);
     const recentHost = renderRecentBlock(recentEntries);
     row.append(liveHost);
+    row.append(keyHost);
     row.append(renderTokensBlock(data.tokens));
-    host.replaceChildren(renderSummaryBlock(data.activity, recentEntries), row, keyHost, recentHost);
+    host.replaceChildren(summaryHost, row, recentHost);
     // Références des blocs DIRECT (seuls repeints par le WebSocket).
-    dashHosts = { live: liveHost, key: keyHost, recent: recentHost };
+    dashHosts = { live: liveHost, key: keyHost, recent: recentHost, summary: summaryHost };
   }
 
   /** Charge (et peint) les AGRÉGATS — garde anti-réentrance. */

@@ -36,7 +36,7 @@ import { listKeys } from "../switchy-auth.js";
 export const DASHBOARD_WINDOW_HOURS = 24;
 
 /** Nombre de tentatives récentes exposées par le tableau de bord. */
-export const DASHBOARD_RECENT_LIMIT = 10;
+export const DASHBOARD_RECENT_LIMIT = 12;
 
 /** État visuel d'un fournisseur (piloté par le remplissage de son seau). */
 export type LiveState = "free" | "busy" | "saturated";

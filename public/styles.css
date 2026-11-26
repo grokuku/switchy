@@ -305,7 +305,9 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   width: 100%;
   min-width: 0;
   flex: 1;
-  padding: clamp(16px, 2.2vw, 26px);
+  /* Marge verticale volontairement plus serrée que l'horizontale : l'onglet
+     Activité doit tenir dans 1440×900 sans défilement (variante A). */
+  padding: clamp(12px, 1.7vw, 18px) clamp(16px, 2.2vw, 26px);
 }
 
 .panel {
@@ -514,19 +516,31 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 
 /* ── Tableau de bord « Activité » ─────────────────────────────────────── */
 
+#panel-activity .panel-head { margin-bottom: 7px; }
+#panel-activity .panel-head h2 { font-size: 20px; }
+#panel-activity .panel-hint { font-size: 10.5px; max-width: 1100px; }
+#panel-activity .panel-head-actions .btn {
+  padding: 4px 9px;
+  font-size: 10px;
+}
+#panel-activity .toolbar-status { font-size: 9.5px; }
+
 .dash {
   display: grid;
-  gap: var(--switchy-gap);
+  gap: 8px;
   width: 100%;
   min-width: 0;
 }
 
-/* Deux blocs côte à côte ; passent l'un sous l'autre en étroit. */
+/* Variante A : trois bandes fonctionnelles, puis les appels pleine largeur. */
 .dash-row {
   display: grid;
-  gap: var(--switchy-gap);
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+  gap: 8px;
   min-width: 0;
+}
+
+.dash-row--top {
+  grid-template-columns: 1.05fr 1.12fr 1.35fr;
 }
 
 .dash-block {
@@ -545,16 +559,21 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 
 .dash-title {
   margin: 0;
-  font-size: 11.5px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.09em;
+  letter-spacing: 0.08em;
   color: var(--switchy-text-muted);
+}
+
+.dash-block .card-h-meta {
+  font-size: 9.5px;
+  white-space: nowrap;
 }
 
 .dash-note {
   margin: 0;
-  font-size: 12.5px;
+  font-size: 10px;
 }
 
 /* Les blocs du tableau de bord portent l'en-tête .card-h + un corps .card-b. */
@@ -563,64 +582,56 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 11px 16px;
+  gap: 8px;
+  min-height: 29px;
+  padding: 5px 9px;
   border-bottom: 1px solid var(--switchy-line);
   background: color-mix(in srgb, var(--switchy-bg-elev) 45%, transparent);
   border-radius: var(--switchy-radius-lg) var(--switchy-radius-lg) 0 0;
 }
 
 .dash-body {
-  padding: 14px 16px;
+  padding: 3px 9px 5px;
   display: grid;
-  gap: 12px;
+  gap: 5px;
   min-width: 0;
 }
 
 .dash-foot {
-  padding: 11px 16px;
+  margin: 0;
+  padding: 4px 9px;
   border-top: 1px solid var(--switchy-line);
-  font-size: 12.5px;
+  font-size: 9.5px;
   color: var(--switchy-text-muted);
 }
 
-.dash-head-meta {
-  font-size: 12px;
-  color: var(--switchy-text-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-/* ── KPI (six tuiles en tête de l'onglet Activité) ────────────────────── */
+/* ── Bandeau de huit KPI ────────────────────────────────────────────── */
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 172px), 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--switchy-line);
+  border-radius: var(--switchy-radius-md);
+  background: var(--switchy-glass);
 }
 
 .kpi {
-  display: grid;
-  align-content: start;
-  gap: 2px;
   min-width: 0;
-  padding: 12px 14px 10px;
-  border: 1px solid var(--switchy-line);
-  border-radius: var(--switchy-radius-md);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--switchy-bg-raised) 92%, transparent),
-      color-mix(in srgb, var(--switchy-bg) 92%, transparent)
-    );
+  padding: 5px 9px;
+  border-right: 1px solid var(--switchy-line);
   overflow: hidden;
 }
 
+.kpi:last-child { border-right: 0; }
+
 .kpi-label {
-  font-size: 10.5px;
-  font-weight: 700;
+  display: block;
+  font-size: 8.5px;
+  font-weight: 650;
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.04em;
   color: var(--switchy-text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -628,160 +639,82 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 }
 
 .kpi-value {
-  font-size: clamp(23px, 2.3vw, 31px);
+  display: block;
+  margin-top: 1px;
+  font-size: 15px;
   font-weight: 720;
-  line-height: 1.15;
-  letter-spacing: -0.025em;
+  line-height: 18px;
   font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.kpi-sub {
-  font-size: 11.5px;
-  color: var(--switchy-text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.good { color: var(--switchy-ok); }
+.warn-text { color: var(--switchy-warn); }
+.accent-text { color: var(--switchy-accent); }
 
-.kpi-spark {
-  display: block;
-  width: 100%;
-  height: 28px;
-  margin-top: 8px;
-  overflow: visible;
-}
-
-.kpi-spark-area {
-  fill: color-mix(in srgb, var(--switchy-accent) 15%, transparent);
-  stroke: none;
-}
-
-.kpi-spark-line {
-  fill: none;
-  stroke: var(--switchy-accent);
-  stroke-width: 1.6;
-  stroke-linejoin: round;
-  stroke-linecap: round;
-  vector-effect: non-scaling-stroke;
-}
-
-.kpi-spark.is-empty .kpi-spark-line {
-  stroke: var(--switchy-border);
-  stroke-dasharray: 3 3;
-}
-
-/* Un repli — potentiellement PAYANT — passe en couleur d'alerte. */
-.kpi--alert {
-  border-color: color-mix(in srgb, var(--switchy-warn) 55%, var(--switchy-border));
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--switchy-warn) 12%, var(--switchy-bg-raised)),
-      color-mix(in srgb, var(--switchy-warn) 5%, var(--switchy-bg))
-    );
-}
-
+/* Repli potentiellement payant : seul le chiffre est alerté dans la bande. */
 .kpi--alert .kpi-value { color: var(--switchy-warn); }
-.kpi--alert .kpi-spark-line { stroke: var(--switchy-warn); }
-.kpi--alert .kpi-spark-area { fill: color-mix(in srgb, var(--switchy-warn) 16%, transparent); }
 
-/* ── « En ce moment » : barre de capacité SEGMENTÉE ───────────────────── */
+/* ── « En ce moment » : une ligne par fournisseur ────────────────────── */
 
 .cap-list {
   display: grid;
-  gap: 8px;
   min-width: 0;
 }
 
 .cap-row {
   display: grid;
-  gap: 6px;
+  grid-template-columns: minmax(76px, 1fr) minmax(54px, 1.25fr) 34px 66px;
+  align-items: center;
+  gap: 7px;
   min-width: 0;
-  padding: 9px 11px;
-  border: 1px solid var(--switchy-line);
-  border-radius: var(--switchy-radius-sm);
-  background: color-mix(in srgb, var(--switchy-bg) 55%, transparent);
+  min-height: 34px;
+  border-bottom: 1px solid var(--switchy-line);
 }
 
-.cap-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  font-size: 13px;
-}
+.cap-row:last-child { border-bottom: 0; }
 
 .cap-name {
   min-width: 0;
-  font-weight: 600;
+  font-size: 10.5px;
+  font-weight: 650;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.cap-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex: 0 0 auto;
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  color: var(--switchy-text-muted);
-}
-
-/* Le point d'état emprunte la couleur de son libellé : lisible sans couleur
-   grâce au TEXTE (« libre » / « occupé » / « saturé »). */
-.cap-state::before {
-  content: "";
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-.cap-row[data-state="free"] .cap-state { color: var(--switchy-ok); }
-.cap-row[data-state="busy"] .cap-state { color: var(--switchy-accent); }
-.cap-row[data-state="saturated"] .cap-state { color: var(--switchy-warn); }
-
 .cap-count {
-  margin-left: auto;
-  flex: 0 0 auto;
-  font-size: 12.5px;
+  text-align: right;
+  font-size: 10px;
   font-variant-numeric: tabular-nums;
-  color: var(--switchy-text-muted);
+  white-space: nowrap;
 }
 
 .cap-bar {
   display: flex;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
-  height: 8px;
-  border-radius: 4px;
+  height: 5px;
   overflow: hidden;
 }
 
 .cap-seg {
   flex: 1 1 0;
   min-width: 2px;
-  border-radius: 2px;
-  background: color-mix(in srgb, var(--switchy-border) 55%, transparent);
+  border-radius: 1px;
+  background: var(--switchy-bg-hover);
 }
 
-.cap-seg.is-on { background: var(--switchy-ok); }
-.cap-row[data-state="busy"] .cap-seg.is-on { background: var(--switchy-accent); }
+.cap-seg.is-on { background: var(--switchy-accent); }
 .cap-row[data-state="saturated"] .cap-seg.is-on { background: var(--switchy-warn); }
 
 .cap-note {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  font-size: 11.5px;
+  font-size: 9px;
+  text-align: right;
   color: var(--switchy-text-muted);
+  white-space: nowrap;
 }
 
 .cap-note--busy {
@@ -789,60 +722,102 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-weight: 600;
 }
 
-/* ── Tokens : barre de répartition + légende ──────────────────────────── */
+/* ── Tokens : total et trois parts ────────────────────────────────────── */
 
-.split {
-  display: grid;
-  gap: 9px;
-  min-width: 0;
-}
+.token-summary { min-width: 0; }
 
-.split-bar {
-  display: block;
-  width: 100%;
-  height: 12px;
-  border-radius: 6px;
-  overflow: hidden;
-  background: color-mix(in srgb, var(--switchy-border) 45%, transparent);
-}
-
-.split-seg--prompt { fill: var(--switchy-accent); }
-.split-seg--completion { fill: var(--switchy-ok); }
-.split-seg--reasoning { fill: var(--switchy-warn); }
-
-.split-legend {
+.token-total {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px 16px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: 12.5px;
-  color: var(--switchy-text-muted);
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0 5px;
 }
 
-.split-legend li {
-  display: inline-flex;
-  align-items: center;
+.token-total strong {
+  font-size: 22px;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.token-total span {
+  color: var(--switchy-text-muted);
+  font-size: 9.5px;
+}
+
+.token-split {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  padding-bottom: 2px;
+}
+
+.token-split div {
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--switchy-bg-raised);
+}
+
+.token-split span {
+  display: block;
+  color: var(--switchy-text-muted);
+  font-size: 8.5px;
+}
+
+.token-split b {
+  display: block;
+  overflow: hidden;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Synthèse 24 h intégrée à la carte des clés ─────────────────────── */
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 5px 9px;
+}
+
+.stat {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 6px;
   min-width: 0;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--switchy-line);
 }
 
-.split-key {
-  width: 9px;
-  height: 9px;
-  border-radius: 3px;
-  flex: 0 0 auto;
+.stat:nth-last-child(-n+2) { border-bottom: 0; }
+.stat span {
+  overflow: hidden;
+  color: var(--switchy-text-muted);
+  font-size: 8.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-
-.split-key--prompt { background: var(--switchy-accent); }
-.split-key--completion { background: var(--switchy-ok); }
-.split-key--reasoning { background: var(--switchy-warn); }
-
-.split-legend b {
-  color: var(--switchy-text);
-  font-weight: 650;
+.stat strong {
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 9px 4px;
+  border-top: 1px solid var(--switchy-line);
+  color: var(--switchy-text-muted);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
 }
 
 /* ── Tableaux (tokens, clés, appels) ─────────────────────────────────── */
@@ -857,25 +832,35 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 .calls-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  table-layout: fixed;
+  font-size: 10.5px;
 }
 
 .token-table th,
 .token-table td,
 .calls-table th,
 .calls-table td {
-  padding: 7px 10px;
+  padding: 3px 6px;
   border-bottom: 1px solid var(--switchy-line);
   font-variant-numeric: tabular-nums;
 }
 
+/* Le tableau de tokens de la colonne 3 est le plus HAUT des trois blocs :
+   c'est lui qui fixe la hauteur de la rangée, donc on resserre ses lignes
+   pour que la rangée garde de la place pour « Derniers appels ». */
+.token-table th,
+.token-table td {
+  padding: 2px 6px;
+}
+
 .token-table thead th,
 .calls-table thead th {
+  height: 20px;
   color: var(--switchy-text-muted);
-  font-weight: 700;
-  font-size: 10.5px;
+  font-weight: 650;
+  font-size: 8.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   white-space: nowrap;
 }
 
@@ -887,6 +872,21 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 .calls-table thead th {
   text-align: left;
 }
+
+.calls-table td {
+  height: 22px;
+  line-height: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calls-table .calls-time { width: 9%; }
+.calls-table .calls-state { width: 21%; }
+.calls-table .calls-service { width: 11%; }
+.calls-table .calls-model { width: 35%; }
+.calls-table .calls-duration { width: 13%; }
+.calls-table .calls-tokens { width: 11%; }
 
 .calls-table tbody tr:last-child td,
 .token-table tbody tr:last-child td,
@@ -905,36 +905,60 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-variant-numeric: normal;
 }
 
-.token-row--total th,
-.token-row--total td {
-  font-weight: 700;
-}
-
-.token-group th {
-  text-align: left;
-  padding-top: 13px;
+.token-group-label {
+  display: block;
   color: var(--switchy-accent);
-  font-size: 10.5px;
+  font-size: 7.5px;
   font-weight: 700;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  border-bottom: 0;
 }
 
-/* Bloc — « Par clé d'API » */
-.key-table thead th:first-child,
+.token-row.group-start th,
+.token-row.group-start td {
+  border-top-color: var(--switchy-line-strong);
+}
+
+/* Bloc — « Par clé d'API » : nom et détail sur deux lignes compactes. */
+.key-list { padding: 0 9px 5px; }
+
 .key-table th[scope="row"] {
+  width: 38%;
   text-align: left;
 }
 
 .key-row th[scope="row"] {
-  max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.key-name {
+  display: inline;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.key-sub {
+  display: block;
+  overflow: hidden;
+  margin-top: 1px;
+  color: var(--switchy-text-muted);
+  font-size: 8.5px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.key-table td {
+  overflow: hidden;
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .key-inflight {
+  width: 23%;
   color: var(--switchy-text-muted);
 }
 
@@ -943,8 +967,10 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-weight: 700;
 }
 
-.key-fallbacks--alert {
-  color: var(--switchy-warn);
+.key-calls { width: 23%; }
+.key-rate {
+  width: 16%;
+  color: var(--switchy-ok);
   font-weight: 700;
 }
 
@@ -958,31 +984,44 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   font-weight: 600;
 }
 
-.calls-model,
+.calls-model {
+  color: var(--switchy-text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+}
+
 .calls-tokens {
   color: var(--switchy-text-muted);
 }
 
 .ellipsis {
   display: block;
-  max-width: 26ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.calls-duration {
-  white-space: nowrap;
-}
-
-/* « 604,1 k » ne doit pas se couper en deux lignes à 430 px : les colonnes
-   numériques restent alignées sur une seule ligne. */
+.calls-duration,
 .calls-tokens {
+  text-align: right;
   white-space: nowrap;
 }
 
 .repli-badge {
   margin-left: 6px;
+}
+
+.calls-card .badge {
+  min-height: 15px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 9px;
+  line-height: 13px;
+}
+
+.calls-card .repli-badge,
+.calls-card .badge.reason-badge {
+  margin-left: 3px;
 }
 
 /* Motif d'abandon : rendu DANS la cellule d'état (aucune colonne ajoutée, donc
@@ -1932,7 +1971,7 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   flex-wrap: wrap;
   justify-content: space-between;
   gap: 8px;
-  padding: 12px 22px;
+  padding: 10px 22px;
   border-top: 1px solid var(--switchy-line);
   background: color-mix(in srgb, var(--switchy-bg-raised) 70%, transparent);
   color: var(--switchy-text-muted);
@@ -2401,7 +2440,38 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
   word-break: break-word;
 }
 
-/* ── Petits écrans (< 900 px) : une seule colonne, jamais de débordement ── */
+/* La variante A reste sur deux colonnes à ~900 px ; Tokens prend toute la
+   largeur de la seconde rangée. */
+@media (max-width: 1000px) {
+  .kpi-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .kpi:nth-child(4) { border-right: 0; }
+  .kpi:nth-child(-n+4) { border-bottom: 1px solid var(--switchy-line); }
+
+  .dash-row--top { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tokens-card { grid-column: 1 / -1; }
+  .tokens-card .token-summary {
+    display: grid;
+    grid-template-columns: 30% 70%;
+    align-items: center;
+  }
+  .tokens-card .token-total { padding: 7px 9px 7px 0; }
+  .tokens-card .token-split { padding: 3px 0; }
+}
+
+@media (max-width: 820px) {
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi { border-bottom: 1px solid var(--switchy-line); }
+  .kpi:nth-child(even) { border-right: 0; }
+  .kpi:nth-last-child(-n+2) { border-bottom: 0; }
+
+  .dash-row--top { grid-template-columns: minmax(0, 1fr); }
+  .tokens-card { grid-column: auto; }
+  .tokens-card .token-summary { display: block; }
+  .tokens-card .token-total { padding: 4px 0 5px; }
+  .tokens-card .token-split { padding: 0 0 2px; }
+}
+
+/* ── Petits écrans (< 900 px) : navigation et formulaires ────────────── */
 
 @media (max-width: 899px) {
   .topbar-inner {
@@ -2446,14 +2516,6 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
 
   .toolbar {
     padding: 10px;
-  }
-
-  .dash-row {
-    grid-template-columns: 1fr;
-  }
-
-  .kpi-grid {
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
   }
 
   .setting-row {
@@ -2524,16 +2586,33 @@ html[data-theme$="-light"] .theme-toggle .icon--moon {
     display: none;
   }
 
-  /* Deux pilules dans la cellule d'état + une valeur qui ne se coupe pas :
-     on resserre les marges internes pour que les 4 colonnes restantes tiennent
-     dans la largeur, sans défilement horizontal ni dernière colonne rognée. */
+  /* Quatre colonnes utiles, resserrées : aucun défilement horizontal. */
   .calls-table th,
   .calls-table td {
-    padding: 7px 6px;
+    padding: 3px 4px;
   }
 
   .calls-table {
-    font-size: 12px;
+    font-size: 9px;
+  }
+
+  .calls-table .calls-time { width: 19%; }
+  .calls-table .calls-state { width: 38%; }
+  .calls-table .calls-duration { width: 23%; }
+  .calls-table .calls-tokens { width: 20%; }
+  .calls-card .badge { padding-inline: 3px; font-size: 8px; }
+  .calls-card .badge.reason-badge { max-width: 12ch; }
+
+  /* L'en-tête « Service / fournisseur » ne tient plus sur une ligne à cette
+     largeur : il passe sur deux lignes (sinon il touche « Total »). */
+  .token-table thead th:first-child {
+    white-space: normal;
+    line-height: 1.15;
+    padding-inline: 4px;
+  }
+  .token-table th,
+  .token-table td {
+    padding-inline: 4px;
   }
 
   .cards-grid {
