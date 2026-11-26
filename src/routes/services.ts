@@ -21,7 +21,6 @@ import {
   runCatalogMutation,
 } from "../catalog-store.js";
 import { testServiceStep, TEST_TIMEOUT_MS } from "../llm/relay.js";
-import type { PanelTestTarget } from "../llm/panel.js";
 import { requestKeyName, requireCsrfForSession, rejectDefaultPassword } from "../middleware/api-auth.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
 
@@ -39,12 +38,7 @@ export const TEST_MAX_PROMPT_CHARS = 4_000;
 export const TEST_DEFAULT_MAX_TOKENS = 64;
 export const TEST_MAX_TOKENS = 256;
 
-function testBody(body: unknown): {
-  prompt: string;
-  maxTokens: number;
-  stepIndex?: number;
-  panel?: PanelTestTarget;
-} {
+function testBody(body: unknown): { prompt: string; maxTokens: number; stepIndex?: number } {
   const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
   const errors: string[] = [];
 
@@ -77,32 +71,8 @@ function testBody(body: unknown): {
     } else stepIndex = record.stepIndex;
   }
 
-  // ── Cible PANEL (ADDITIF) : `panel: "member" | "judge"` + `panelIndex` ──
-  // Un client antérieur (qui n'envoie ni l'un ni l'autre) garde exactement le
-  // comportement d'avant : `stepIndex` seul, ou chaîne complète.
-  let panel: PanelTestTarget | undefined;
-  if (record.panel !== undefined && record.panel !== null) {
-    if (record.panel === "judge") panel = { role: "judge" };
-    else if (record.panel === "member") {
-      const rawIndex = record.panelIndex;
-      if (typeof rawIndex !== "number" || !Number.isInteger(rawIndex) || rawIndex < 0) {
-        errors.push("panelIndex: doit être un entier positif ou nul (0 = proposition A)");
-      } else panel = { role: "member", index: rawIndex };
-    } else errors.push('panel: doit valoir "member" ou "judge"');
-  } else if (record.panelIndex !== undefined && record.panelIndex !== null) {
-    errors.push('panelIndex: n\'a de sens qu\'avec panel: "member"');
-  }
-  if (panel && stepIndex !== undefined) {
-    errors.push("stepIndex et panel: une seule cible à la fois");
-  }
-
   if (errors.length > 0) throw ApiError.validation(errors);
-  return {
-    prompt,
-    maxTokens,
-    ...(stepIndex !== undefined ? { stepIndex } : {}),
-    ...(panel ? { panel } : {}),
-  };
+  return { prompt, maxTokens, ...(stepIndex !== undefined ? { stepIndex } : {}) };
 }
 
 router.get("/", (_req: Request, res: Response) => {
@@ -142,32 +112,24 @@ router.delete("/:name", requireCsrfForSession, rejectDefaultPassword, async (req
 /**
  * TEST d'une étape (bouton « Tester » par étape, et zone « Tester les modèles »).
  *
- * Corps : `{ stepIndex?: number, prompt?: string, maxTokens?: number,
- *           panel?: "member" | "judge", panelIndex?: 0|1|2 }`
- *   - `stepIndex` absent et `panel` absent → CHAÎNE COMPLÈTE (principal puis
- *     replis, comme la production) ;
+ * Corps : `{ stepIndex?: number, prompt?: string, maxTokens?: number }`
+ *   - `stepIndex` absent → CHAÎNE COMPLÈTE (principal puis replis, comme la
+ *     production) ;
  *   - `stepIndex: 0` → principal SEUL ;
  *   - `stepIndex: n` → repli n-1 SEUL (aucun repli derrière : on teste bien CETTE
- *     étape) ;
- *   - `panel: "member"` + `panelIndex: 0|1|2` → UN membre du panel (A/B/C) SEUL,
- *     avec le corps EXACT de la production (squelette compris) ;
- *   - `panel: "judge"` → le JUGE SEUL, avec des propositions FACTICES — jamais
- *     les 3 membres (ce serait 4 appels pour un diagnostic).
- *
- * ⚠️ ADDITIF : `panel`/`panelIndex` sont facultatifs et exclusifs de `stepIndex`;
- * un client antérieur (chaîne complète ou `stepIndex`) n'est pas affecté.
+ *     étape).
  *
  * Réponse 200 (même en cas d'échec fournisseur — le résultat est un DIAGNOSTIC) :
  * `{ ok, status, stepIndex, providerId, model, reasoning, latencyMs,
  *    tokens: { prompt, completion, reasoning }, text?, error?: { code, reason,
- *    message }, fellBack, panel?: { role, index? } }`.
+ *    message }, fellBack }`.
  *
- * 400 `VALIDATION_ERROR` (index hors bornes, cible panel invalide ou absente de
- * ce service, prompt vide…), 404 `NOT_FOUND` (service inconnu). ⚠️ Aucun secret,
- * aucun corps amont brut, aucune URL de fournisseur dans la réponse.
+ * 400 `VALIDATION_ERROR` (index hors bornes, prompt vide…), 404 `NOT_FOUND`
+ * (service inconnu). ⚠️ Aucun secret, aucun corps amont brut, aucune URL de
+ * fournisseur dans la réponse.
  */
 router.post("/:name/test", requireCsrfForSession, rejectDefaultPassword, async (req: Request, res: Response) => {
-  let parsed: ReturnType<typeof testBody>;
+  let parsed: { prompt: string; maxTokens: number; stepIndex?: number };
   try {
     parsed = testBody(req.body);
   } catch (err) {
@@ -191,23 +153,6 @@ router.post("/:name/test", requireCsrfForSession, rejectDefaultPassword, async (
     });
     return;
   }
-  // Cible PANEL : refusée proprement quand le service n'a pas de panel ou quand
-  // l'index de membre sort des bornes — aucun appel ne doit partir pour rien.
-  if (parsed.panel) {
-    const panel = service.panel;
-    const members = panel ? panel.members.length : 0;
-    const memberIndex = parsed.panel.role === "member" ? parsed.panel.index : undefined;
-    const invalid =
-      !panel ||
-      (memberIndex !== undefined && (memberIndex < 0 || memberIndex >= members));
-    if (invalid) {
-      const errors = !panel
-        ? ["panel: ce service n'a pas de mode panel"]
-        : [`panelIndex: doit être un entier entre 0 et ${Math.max(0, members - 1)}`];
-      res.status(400).json({ error: errors[0], code: "VALIDATION_ERROR", errors });
-      return;
-    }
-  }
 
   try {
     const result = await testServiceStep({
@@ -217,7 +162,6 @@ router.post("/:name/test", requireCsrfForSession, rejectDefaultPassword, async (
         max_tokens: parsed.maxTokens,
       },
       ...(parsed.stepIndex !== undefined ? { stepIndex: parsed.stepIndex } : {}),
-      ...(parsed.panel ? { panel: parsed.panel } : {}),
       timeoutMs: TEST_TIMEOUT_MS,
       keyName: requestKeyName(req),
       endpoint: "test",

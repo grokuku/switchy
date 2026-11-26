@@ -70,19 +70,6 @@ export type CallResult = "ok" | "error" | "aborted" | "skipped";
  *                       (cas NORMAL : l'utilisateur a fermé l'onglet).
  * Les deux derniers n'accompagnent que `result: "aborted"` : ils rendent une
  * coupe EXPLICABLE sans quoi un flux interrompu restait indéchiffrable.
- *
- * ── Motifs du mode PANEL (`docs/panel-service.md` §6) ──
- *   - `panel_tool_call_skipped` : la réponse d'un proposeur est un APPEL D'OUTIL
- *                       (résultat `skipped`) — elle ne peut pas être comparée,
- *                       elle est écartée (le client, lui, garde ses outils) ;
- *   - `panel_member_timeout` : proposeur coupé par `memberTimeoutMs` (`aborted`) ;
- *   - `panel_no_quorum` : moins de `quorum` propositions utilisables (`skipped`) ;
- *   - `panel_all_failed` : AUCUNE proposition utilisable (`error`) → repli sur la
- *                       chaîne normale, même `callId` ;
- *   - `judge_failed`    : juge en échec sans motif plus précis (`error`) ;
- *   - `judge_empty`     : juge vide (`error`) ;
- *   - `panel_degraded`  : réponse servie SANS le juge (`ok`) — première
- *                       proposition utilisable après un échec du juge.
  */
 export const CALL_REASONS = [
   "quota",
@@ -95,13 +82,6 @@ export const CALL_REASONS = [
   "step_disabled",
   "watchdog",
   "client_disconnect",
-  "panel_tool_call_skipped",
-  "panel_member_timeout",
-  "panel_no_quorum",
-  "panel_all_failed",
-  "judge_failed",
-  "judge_empty",
-  "panel_degraded",
 ] as const;
 export type CallReason = (typeof CALL_REASONS)[number];
 
@@ -113,26 +93,6 @@ export type CallReason = (typeof CALL_REASONS)[number];
  */
 export function newCallId(): string {
   return randomUUID().replace(/-/g, "").slice(0, 12);
-}
-
-/**
- * Fournisseur FICTIF des lignes de GROUPE du panel (`panel_all_failed`) —
- * décision utilisateur : cette ligne CONSTATE la fin du panel, elle n'est pas un
- * appel réseau. L'attribuer au principal fabriquait un faux échec au nom d'un
- * modèle qui n'a jamais été appelé ; lui donner son propre `provider` explicite
- * garde la trace du passage au repli SANS polluer les statistiques d'un modèle
- * réel. Les agrégations (`summarizeActivity`, `summarizeTokens`,
- * `summarizeFallbacks`, `summarizeByKey`) l'EXCLUENT : ce n'est ni une
- * tentative, ni un fournisseur, ni une consommation.
- */
-export const PANEL_CONTEXT_PROVIDER = "__panel__";
-
-/** Modèle FICTIF des mêmes lignes de groupe (aucun modèle réel appelé). */
-export const PANEL_CONTEXT_MODEL = "__panel__";
-
-/** Vrai pour une ligne de CONTEXTE du panel (constat, pas un appel fournisseur). */
-export function isPanelContextEntry(entry: Pick<CallLogEntry, "provider">): boolean {
-  return entry.provider === PANEL_CONTEXT_PROVIDER;
 }
 
 /**
@@ -197,21 +157,6 @@ export interface CallLogEntry {
    * qu'il est le dernier à avoir répondu pour cette clé (cache chaud). Additif.
    */
   affinity?: boolean;
-  // ── Mode PANEL (additif) — voir `docs/panel-service.md` §6 ──
-  /**
-   * Rôle de la ligne dans le panel : `member` (proposeur), `judge` (juge),
-   * `fallback` (ligne de GROUPE : `panel_all_failed`, `panel_no_quorum`,
-   * `panel_degraded`). Absent hors panel.
-   */
-  panelRole?: "member" | "judge" | "fallback";
-  /** Rang du proposeur (`0`=A, `1`=B, `2`=C) — absent pour le juge. */
-  panelRank?: number;
-  /**
-   * Vrai sur la ligne dont la réponse a été SERVIE au client : le groupe
-   * `callId` est alors un SUCCÈS, quel que soit le `result` des autres lignes
-   * (`summarizeActivity`). C'est la seule règle de comptage du panel.
-   */
-  panelServed?: boolean;
   // ── Mode « full » uniquement ──
   /** Le service appelé était-il prioritaire ? (priorité intrinsèque, sans en-tête) */
   prioritaire?: boolean;
@@ -241,9 +186,6 @@ const ESSENTIAL: (keyof CallLogEntry)[] = [
   "stream",
   "charge",
   "affinity",
-  "panelRole",
-  "panelRank",
-  "panelServed",
 ];
 
 /** Longueur maximale d'un message d'erreur réseau journalisé. */
@@ -458,12 +400,7 @@ export function summarizeFallbacks(
     const ts = typeof entry.ts === "string" ? Date.parse(entry.ts) : Number.NaN;
     const inWindow = Number.isFinite(ts) ? ts >= cutoff : true;
     // Un repli est une tentative de rang > 0 (isFallback explicite ou ancien journal).
-    // Une ligne de CONTEXTE du panel n'est PAS une tentative de repli : elle ne
-    // gonfle ni le bilan ni la répartition par fournisseur (pas de faux
-    // fournisseur « __panel__ »).
-    const isFallback =
-      !isPanelContextEntry(entry) &&
-      (entry.isFallback === true || (typeof entry.attempt === "number" && entry.attempt > 0));
+    const isFallback = entry.isFallback === true || (typeof entry.attempt === "number" && entry.attempt > 0);
     if (isFallback) {
       stats.total += 1;
       if (inWindow) {
@@ -565,8 +502,6 @@ interface CallGroup {
   hasFallback: boolean;
   /** Le `last` courant est-il une tentative RÉELLEMENT exécutée (pas `skipped`) ? */
   lastRan: boolean;
-  /** Au moins une ligne du groupe a été SERVIE au client (`panelServed`). */
-  served: boolean;
 }
 
 /**
@@ -598,12 +533,7 @@ export function summarizeActivity(
     // compte ni comme tentative exécutée, ni comme tentative de repli. Les
     // sauts pour CHARGE restent comptés à part (`loadFallbacks`), justement
     // pour ne jamais les confondre avec des échecs fournisseur.
-    //
-    // ⚠️ Une ligne de CONTEXTE du panel (`panel_all_failed`, provider
-    // `__panel__`) n'a déclenché AUCUN appel réseau : elle ne compte pas non
-    // plus comme tentative, et n'écrase pas le « dernier essai » du groupe
-    // (sinon un appel réussi paraîtrait échoué à cause d'un constat de repli).
-    const ran = entry.result !== "skipped" && !isPanelContextEntry(entry);
+    const ran = entry.result !== "skipped";
     if (ran) attempts += 1;
     if (entry.reason === "saturated") loadFallbacks += 1;
     if (entry.affinity === true) affinityHits += 1;
@@ -612,10 +542,9 @@ export function summarizeActivity(
     if (isFallback && ran) fallbackAttempts += 1;
 
     const key = typeof entry.callId === "string" && entry.callId !== "" ? entry.callId : `__${index}`;
-    const served = entry.panelServed === true;
     const group = groups.get(key);
     if (!group) {
-      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback, lastRan: ran, served });
+      groups.set(key, { last: entry, lastAttempt: attempt, hasFallback: isFallback, lastRan: ran });
     } else {
       // ⚠️ Le « dernier essai » se choisit parmi les tentatives RÉELLEMENT
       // EXÉCUTÉES (`ok`/`error`/`aborted`). Une entrée `skipped` (étape
@@ -628,7 +557,6 @@ export function summarizeActivity(
         group.lastRan = true;
       }
       if (isFallback) group.hasFallback = true;
-      if (served) group.served = true;
     }
 
     const ms = entry.durationMs;
@@ -642,10 +570,7 @@ export function summarizeActivity(
   let succeeded = 0;
   let fallbacks = 0;
   for (const group of groups.values()) {
-    // RÈGLE DU PANEL : une ligne `panelServed === true` vaut SUCCÈS pour le
-    // groupe. Un panel dont le juge a échoué (ou dont le quorum n'a pas été
-    // atteint) a bien servi une réponse : le compter comme échec mentirait.
-    if (group.served || group.last.result === "ok") succeeded += 1;
+    if (group.last.result === "ok") succeeded += 1;
     if (group.hasFallback) fallbacks += 1;
   }
   const calls = groups.size;
@@ -700,9 +625,6 @@ export function summarizeTokens(
   const byProvider: Record<string, TokenTotals> = {};
   for (const entry of entries) {
     if (!entry.tokens || !withinWindow(entry.ts, cutoff)) continue;
-    // Une ligne de CONTEXTE du panel ne désigne aucun fournisseur réel : la
-    // compter ferait apparaître un faux fournisseur « __panel__ ».
-    if (isPanelContextEntry(entry)) continue;
     addTokens(total, entry);
     addTokens((byService[String(entry.service ?? "?")] ??= emptyTokenTotals()), entry);
     addTokens((byProvider[String(entry.provider ?? "?")] ??= emptyTokenTotals()), entry);

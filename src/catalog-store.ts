@@ -20,7 +20,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, chmodSync, statSync } from "fs";
 import path from "path";
 import { getCatalogFile } from "./config.js";
-import { PANEL_LANGS, type PanelLang } from "./llm/panel-prompts.js";
 import { ApiError } from "./utils/api-error.js";
 import { AsyncMutex } from "./utils/async-mutex.js";
 
@@ -54,53 +53,6 @@ export const LIMITS = {
   maxConcurrency: { min: 1, max: 1000 },
   maxFallbacks: 16,
 } as const;
-
-/**
- * Bornes et défauts du mode « panel » (3 proposeurs + 1 juge).
- *
- * Le nombre de PROPOSEURS est FIXE (3) : les étiquettes `[A]`, `[B]`, `[C]`
- * reprises par le juge dans ses lignes `[sources : …]` en dépendent, et le
- * prompt du juge les cite en dur (§3.1). Le quorum se compte donc sur 3.
- */
-export const PANEL_MEMBERS = 3;
-
-export const PANEL_LIMITS = {
-  quorum: { min: 1, max: PANEL_MEMBERS },
-  /** Délai d'un appel de proposeur ou du juge (ms) — borné à la saisie. */
-  timeoutMs: { min: 1_000, max: 600_000 },
-} as const;
-
-/** Valeurs appliquées quand le corps ne les précise pas (rétro-compatibilité). */
-export const PANEL_DEFAULTS = {
-  quorum: 2,
-  memberTimeoutMs: 60_000,
-  judgeTimeoutMs: 90_000,
-  lang: "fr" as PanelLang,
-} as const;
-
-/**
- * Configuration du mode « PANEL » d'un service — 3 propositions en parallèle
- * puis 1 juge qui les recompose en citant ses sources (voir
- * `docs/panel-service.md`).
- *
- * ⚠️ Champ OPTIONNEL sur `ServiceRecord` et NON un type union : un client
- * antérieur qui renvoie le corps d'un service sans `panel` ne doit jamais
- * ÉTEINDRE le mode par accident (même piège que `normalizeStep`).
- */
-export interface PanelConfig {
-  /** Exactement 3 (voir `PANEL_MEMBERS`) ; l'ordre donne `[A]`, `[B]`, `[C]`. */
-  members: ServiceStep[];
-  /** Juge : mêmes champs qu'une étape (fournisseur, modèle, réflexion). */
-  judge: ServiceStep;
-  /** Nombre de propositions UTILISABLES exigées pour appeler le juge (1..3). */
-  quorum: number;
-  /** Coupe d'un proposeur trop long (ms). */
-  memberTimeoutMs: number;
-  /** Coupe du juge trop long (ms). */
-  judgeTimeoutMs: number;
-  /** Langue des prompts imposés (`fr` par défaut). */
-  lang: PanelLang;
-}
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$/;
@@ -190,16 +142,6 @@ export interface ServiceRecord {
    * principal. `false` (défaut) = file d'attente normale, comportement historique.
    */
   rolling: boolean;
-  /**
-   * Mode « PANEL » (optionnel) : 3 proposeurs en parallèle + 1 juge qui
-   * recompose la réponse finale en citant ses sources. Absent = mode normal
-   * (chaîne `principal → fallbacks`). `principal` et `fallbacks` RESTENT
-   * obligatoires : ils servent de repli quand le panel ne peut rien servir, de
-   * déclaration de capacités au client et de cible du bouton « Tester ».
-   *
-   * ⚠️ Pas de `panel.enabled` : une seule vérité d'extinction, `service.enabled`.
-   */
-  panel?: PanelConfig;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -247,41 +189,6 @@ function normalizeStep(step: ServiceStep): ServiceStep {
   return { ...step, enabled: step.enabled !== false };
 }
 
-function normalizeInteger(value: unknown, fallback: number, bounds: { min: number; max: number }): number {
-  return typeof value === "number" && Number.isInteger(value) && value >= bounds.min && value <= bounds.max
-    ? value
-    : fallback;
-}
-
-/**
- * Normalise un `panel` lu du DISQUE : étapes normalisées (`enabled` absent =
- * activée), délais/langue manquants comblés par les défauts. Une configuration
- * structurellement inexploitable (pas 3 membres, juge absent) est ÉCARTÉE avec
- * une trace — on ne devine jamais un panel à moitié décrit.
- */
-function normalizePanel(raw: unknown): PanelConfig | null {
-  const obj = asRecord(raw);
-  if (!obj || !Array.isArray(obj.members) || obj.members.length !== PANEL_MEMBERS) return null;
-  const judge = asRecord(obj.judge);
-  if (!judge) return null;
-  const members: ServiceStep[] = [];
-  for (const entry of obj.members) {
-    const step = asRecord(entry);
-    if (!step) return null;
-    members.push(normalizeStep(step as unknown as ServiceStep));
-  }
-  return {
-    members,
-    judge: normalizeStep(judge as unknown as ServiceStep),
-    quorum: normalizeInteger(obj.quorum, PANEL_DEFAULTS.quorum, PANEL_LIMITS.quorum),
-    memberTimeoutMs: normalizeInteger(obj.memberTimeoutMs, PANEL_DEFAULTS.memberTimeoutMs, PANEL_LIMITS.timeoutMs),
-    judgeTimeoutMs: normalizeInteger(obj.judgeTimeoutMs, PANEL_DEFAULTS.judgeTimeoutMs, PANEL_LIMITS.timeoutMs),
-    lang: (PANEL_LANGS as readonly string[]).includes(String(obj.lang))
-      ? (obj.lang as PanelLang)
-      : PANEL_DEFAULTS.lang,
-  };
-}
-
 function normalizeService(value: Record<string, unknown>): ServiceRecord {
   // `reservations` (ancien champ de service) est explicitement écarté : sa
   // sémantique a migré vers `ProviderRecord.maxConcurrency`.
@@ -293,16 +200,6 @@ function normalizeService(value: Record<string, unknown>): ServiceRecord {
   if (service.principal) service.principal = normalizeStep(service.principal);
   if (Array.isArray(service.fallbacks)) {
     service.fallbacks = service.fallbacks.filter((step) => !!step).map((step) => normalizeStep(step));
-  }
-  // Panel : champ optionnel, normalisé s'il est présent et exploitable.
-  if (service.panel !== undefined && service.panel !== null) {
-    const panel = normalizePanel(service.panel);
-    if (panel) {
-      service.panel = panel;
-    } else {
-      console.error(`[catalog] service "${String(service.name ?? "?")}": panel inexploitable, ignoré`);
-      delete service.panel;
-    }
   }
   return service;
 }
@@ -775,10 +672,7 @@ export function deleteProvider(id: string): void {
   if (idx < 0) throw ApiError.notFound(`provider "${id}" not found`);
 
   const using = catalog.services.filter(
-    (s) =>
-      s.principal.providerId === id ||
-      s.fallbacks.some((f) => f.providerId === id) ||
-      (s.panel ? [...s.panel.members, s.panel.judge].some((step) => step.providerId === id) : false),
+    (s) => s.principal.providerId === id || s.fallbacks.some((f) => f.providerId === id),
   );
   if (using.length > 0) {
     throw ApiError.conflict(
@@ -800,71 +694,6 @@ export function getService(name: string): ServiceRecord | null {
   return loadCatalog().services.find((s) => s.name === name) ?? null;
 }
 
-/**
- * Valide la configuration d'un PANEL : 3 membres exactement, 1 juge, quorum
- * borné (1..3), délais bornés, langue `fr`/`en`. Les champs facultatifs
- * (quorum, délais, langue) prennent leur DÉFAUT quand ils sont absents ; une
- * valeur fournie mais hors bornes est REFUSÉE (jamais corrigée en silence).
- *
- * Les étapes (membres et juge) suivent les mêmes règles qu'un `principal` :
- * fournisseur existant, modèle non vide, `reasoning` connu, `enabled` booléen
- * (absent = activée).
- */
-function validatePanel(
-  value: unknown,
-  field: string,
-  errors: string[],
-  providerIds: Set<string>,
-): PanelConfig | null {
-  const obj = asRecord(value);
-  if (!obj) {
-    errors.push(`${field}: required object { members[${PANEL_MEMBERS}], judge, quorum?, memberTimeoutMs?, judgeTimeoutMs?, lang? }`);
-    return null;
-  }
-
-  const members: ServiceStep[] = [];
-  if (!Array.isArray(obj.members)) {
-    errors.push(`${field}.members: required, must be an array of exactly ${PANEL_MEMBERS} steps`);
-  } else {
-    if (obj.members.length !== PANEL_MEMBERS) {
-      errors.push(`${field}.members: must contain exactly ${PANEL_MEMBERS} steps (labels A, B, C)`);
-    }
-    obj.members.forEach((raw, index) => {
-      const step = validateStep(raw, `${field}.members[${index}]`, errors, providerIds);
-      if (step !== null) members.push(step);
-    });
-  }
-
-  const judge = validateStep(obj.judge, `${field}.judge`, errors, providerIds);
-
-  const quorum =
-    obj.quorum === undefined
-      ? PANEL_DEFAULTS.quorum
-      : requireInteger(obj.quorum, `${field}.quorum`, errors, PANEL_LIMITS.quorum);
-  const memberTimeoutMs =
-    obj.memberTimeoutMs === undefined
-      ? PANEL_DEFAULTS.memberTimeoutMs
-      : requireInteger(obj.memberTimeoutMs, `${field}.memberTimeoutMs`, errors, PANEL_LIMITS.timeoutMs);
-  const judgeTimeoutMs =
-    obj.judgeTimeoutMs === undefined
-      ? PANEL_DEFAULTS.judgeTimeoutMs
-      : requireInteger(obj.judgeTimeoutMs, `${field}.judgeTimeoutMs`, errors, PANEL_LIMITS.timeoutMs);
-  const lang =
-    obj.lang === undefined ? PANEL_DEFAULTS.lang : requireEnum(obj.lang, `${field}.lang`, errors, PANEL_LANGS);
-
-  if (
-    members.length !== PANEL_MEMBERS ||
-    judge === null ||
-    quorum === null ||
-    memberTimeoutMs === null ||
-    judgeTimeoutMs === null ||
-    lang === null
-  ) {
-    return null;
-  }
-  return { members, judge, quorum, memberTimeoutMs, judgeTimeoutMs, lang };
-}
-
 /** Valide le corps commun d'un service ; `mustExist` = nom déjà pris interdit. */
 function validateServiceBody(
   body: Record<string, unknown>,
@@ -882,8 +711,6 @@ function validateServiceBody(
   vision?: boolean;
   prioritaire?: boolean;
   rolling?: boolean;
-  /** `null` = extinction EXPLICITE du panel ; absent = inchangé. */
-  panel?: PanelConfig | null;
   enabled?: boolean;
 } {
   const out: ReturnType<typeof validateServiceBody> = {};
@@ -948,17 +775,6 @@ function validateServiceBody(
     const rolling = requireBoolean(body.rolling ?? false, "rolling", errors);
     if (rolling !== null) out.rolling = rolling;
   }
-  // PANEL : champ OPTIONNEL. Absent ⇒ inchangé (un client antérieur ne peut pas
-  // éteindre le mode par accident). `null` ⇒ extinction explicite. Un objet
-  // invalide ⇒ 400, jamais un remplacement silencieux.
-  if (body.panel !== undefined) {
-    if (body.panel === null) {
-      out.panel = null;
-    } else {
-      const panel = validatePanel(body.panel, "panel", errors, providerIds);
-      if (panel !== null) out.panel = panel;
-    }
-  }
   if (body.enabled !== undefined || mustExist) {
     const enabled = requireBoolean(body.enabled ?? true, "enabled", errors);
     if (enabled !== null) out.enabled = enabled;
@@ -993,7 +809,6 @@ export function createService(input: unknown): ServiceRecord {
     vision: parsed.vision ?? false,
     prioritaire: parsed.prioritaire ?? false,
     rolling: parsed.rolling ?? false,
-    ...(parsed.panel ? { panel: parsed.panel } : {}),
     enabled: parsed.enabled ?? true,
     createdAt: now,
     updatedAt: now,
@@ -1033,10 +848,6 @@ export function updateService(name: string, input: unknown): ServiceRecord {
   if (parsed.vision !== undefined) next.vision = parsed.vision;
   if (parsed.prioritaire !== undefined) next.prioritaire = parsed.prioritaire;
   if (parsed.rolling !== undefined) next.rolling = parsed.rolling;
-  if (parsed.panel !== undefined) {
-    if (parsed.panel === null) delete next.panel;
-    else next.panel = parsed.panel;
-  }
   if (parsed.enabled !== undefined) next.enabled = parsed.enabled;
 
   next.updatedAt = new Date().toISOString();

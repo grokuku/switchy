@@ -81,9 +81,6 @@ const CALL_FIELDS: (keyof LiveCallEvent)[] = [
   "charge",
   "affinity",
   "stream",
-  "panelRole",
-  "panelRank",
-  "panelServed",
 ];
 
 /**

@@ -24,8 +24,6 @@ import { Readable } from "node:stream";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { relayServiceChat, UpstreamFailure, QueueFullError, QueueTimeoutError, type RelayOutput } from "../llm/relay.js";
 import { listOpenAiModels, getOpenAiModel } from "../llm/openai-models.js";
-import { getService } from "../catalog-store.js";
-import { getPanelSsePingMs } from "../config.js";
 import { ApiError, errorBody } from "../utils/api-error.js";
 import { requestKeyName } from "../middleware/api-auth.js";
 import { beginCall, endCall } from "../llm/inflight-by-key.js";
@@ -55,70 +53,6 @@ function sendRelay(res: Response, out: RelayOutput): void {
   res.send(out.payload);
 }
 
-/** Type MIME du flux synthétique du panel (identique à un vrai SSE de chat). */
-const SSE_CONTENT_TYPE = "text/event-stream; charset=utf-8";
-
-/**
- * Ouvre un flux SSE SYNTHÉTIQUE pour un service en mode PANEL (§4).
- *
- * Pourquoi : un panel ne peut pas streamer (il lui faut les 3 propositions
- * complètes, puis le juge). Sans cela, un client qui a demandé `stream: true`
- * attendrait jusqu'à 150 s sans le moindre octet, et un proxy couperait. On
- * ouvre donc les en-têtes TOUT DE SUITE et on émet un commentaire SSE `: ping`
- * toutes les `SWITCHY_PANEL_SSE_PING_MS` (15 s) — le contenu, lui, part d'un
- * bloc à la fin.
- *
- * Retourne la fonction d'arrêt du battement (à appeler dans un `finally`).
- */
-function openPanelSse(res: Response): () => void {
-  res.status(200);
-  res.setHeader("content-type", SSE_CONTENT_TYPE);
-  res.setHeader("cache-control", "no-cache, no-transform");
-  res.setHeader("connection", "keep-alive");
-  res.setHeader("x-accel-buffering", "no");
-  // Posé AVANT l'envoi des en-têtes (ensuite c'est trop tard) : il annonce un
-  // flux issu d'un panel, sans prétendre savoir si le juge répondra.
-  res.setHeader("x-switchy-panel", "panel");
-  res.flushHeaders();
-  const pingMs = getPanelSsePingMs();
-  if (pingMs <= 0) return () => {};
-  const timer = setInterval(() => {
-    if (res.writableEnded || res.destroyed) return;
-    res.write(": ping\n\n");
-  }, pingMs);
-  (timer as { unref?: () => void })?.unref?.();
-  return () => clearInterval(timer);
-}
-
-/** Événements SSE d'une réponse complète servie d'un bloc (panel ou repli). */
-function sseChunks(model: string, text: string): string {
-  const created = Math.floor(Date.now() / 1000);
-  const base = { id: `switchy-panel-${Date.now()}`, object: "chat.completion.chunk", created, model };
-  const content = JSON.stringify({
-    ...base,
-    choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }],
-  });
-  const stop = JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-  return `data: ${content}\n\ndata: ${stop}\n\ndata: [DONE]\n\n`;
-}
-
-/** Texte d'un corps JSON de réponse (repli de chaîne non streamée) ; `""` si absent. */
-function textFromJsonPayload(payload: Buffer): string {
-  try {
-    const parsed = JSON.parse(payload.toString("utf-8")) as {
-      choices?: Array<{ message?: { content?: unknown } }>;
-    };
-    const content = parsed.choices?.[0]?.message?.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content.map((part) => (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "")).join("");
-    }
-    return "";
-  } catch {
-    return "";
-  }
-}
-
 async function handleRelay(req: Request, res: Response, serviceName: string, endpoint: string): Promise<void> {
   // Déconnexion du client → interruption de l'appel amont et libération du slot.
   const controller = new AbortController();
@@ -133,16 +67,6 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
   beginCall(keyName);
   let streaming = false;
   let counted = false;
-
-  // SSE SYNTHÉTIQUE : un service en mode PANEL qui reçoit `stream: true` ne
-  // pourra rien émettre avant la fin. On ouvre le flux AVANT l'appel pour
-  // tenir la connexion (battement `: ping`) et pour que l'échec éventuel
-  // s'exprime en SSE, pas en JSON sur un flux déjà commencé.
-  const requestBody = bodyRecord(req.body);
-  const panelService = getService(serviceName);
-  const panelSse =
-    requestBody.stream === true && panelService?.enabled === true && panelService.panel !== undefined;
-  let closeSse: (() => void) | undefined = panelSse ? openPanelSse(res) : undefined;
   const finishCount = (): void => {
     if (counted) return;
     counted = true;
@@ -159,46 +83,8 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
       keyName,
     });
     streaming = out.streaming === true;
-    if (!closeSse) {
-      sendRelay(res, out);
-    } else if (out.panel) {
-      // Réponse du panel (juge ou proposition dégradée) : un bloc, puis [DONE].
-      // `x-switchy-panel` est déjà annoncé (`panel`) : les en-têtes sont partis.
-      res.write(sseChunks(serviceName, out.panel.text));
-      res.end();
-      streaming = false;
-    } else if (out.streaming && out.payload instanceof ReadableStream) {
-      // Repli sur la chaîne : le flux amont est DÉJÀ du SSE, on le relaie tel quel.
-      const nodeStream = Readable.fromWeb(out.payload as unknown as WebReadableStream<Uint8Array>);
-      res.once("close", () => nodeStream.destroy());
-      nodeStream.on("error", () => {
-        if (!res.writableEnded) res.destroy();
-      });
-      nodeStream.pipe(res);
-    } else {
-      const text = Buffer.isBuffer(out.payload) ? textFromJsonPayload(out.payload) : "";
-      res.write(sseChunks(serviceName, text));
-      res.end();
-      streaming = false;
-    }
+    sendRelay(res, out);
   } catch (err) {
-    // Flux SSE déjà ouvert : l'échec doit s'exprimer EN SSE (les en-têtes sont
-    // partis, un `res.status().json()` lèverait ERR_HTTP_HEADERS_SENT).
-    if (closeSse) {
-      if (err instanceof UpstreamFailure && err.aborted) {
-        if (!res.writableEnded) res.destroy();
-        return;
-      }
-      const detail =
-        err instanceof UpstreamFailure && err.body
-          ? err.body.toString("utf-8")
-          : JSON.stringify(errorBody(err).body);
-      if (!res.writableEnded) {
-        res.write(`data: ${detail}\n\ndata: [DONE]\n\n`);
-        res.end();
-      }
-      return;
-    }
     if (err instanceof UpstreamFailure) {
       if (err.aborted) {
         if (!res.writableEnded) res.destroy();
@@ -226,8 +112,6 @@ async function handleRelay(req: Request, res: Response, serviceName: string, end
     const { status, body } = errorBody(err);
     res.status(status).json(body);
   } finally {
-    closeSse?.();
-    closeSse = undefined;
     // Flux SSE : l'appel reste « en vol » jusqu'à la fin de la réponse.
     if (streaming && !res.writableFinished) {
       res.once("finish", finishCount);
