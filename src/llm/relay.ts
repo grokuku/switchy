@@ -272,6 +272,19 @@ function usageFromSseLine(line: string): CallLogTokens | undefined {
   return usageFromJsonPayload(payload);
 }
 
+/**
+ * Fenêtre (caractères) conservée pour reconnaître le TERMINATEUR SSE, y
+ * compris quand il est coupé entre deux morceaux du flux.
+ */
+const SSE_DONE_TAIL_MAX = 32;
+
+/**
+ * Terminateur d'un flux SSE OpenAI-compatible (`data␣:␣[DONE]`), ancré en FIN
+ * de fenêtre : un `data: [DONE]` qui apparaîtrait dans le CONTENU d'un message
+ * (donc suivi de `"}`… et non de la fin du flux) ne compte PAS.
+ */
+const SSE_DONE_TAIL_PATTERN = /(?:^|\n)\s*data:\s*\[DONE\]\s*$/;
+
 interface StreamReport {
   aborted: boolean;
   error: string | undefined;
@@ -284,6 +297,20 @@ interface StreamReport {
  * tampon), un détecteur borné extrait `usage` des lignes SSE au passage, et
  * `onFinish` est appelé une seule fois (fin normale, erreur ou annulation)
  * pour libérer le slot et journaliser.
+ *
+ * ⚠️ COURSE DE FERMETURE (faux positif « client parti » corrigé ici).
+ * Un client SSE OpenAI-compatible (SDK `openai`, donc Pi-Web) ANNULE sa requête
+ * HTTP dès qu'il a lu l'événement terminal `data: [DONE]` — alors que le relais
+ * n'a pas encore observé `done` sur le flux amont. La fermeture arrive donc
+ * APRÈS que toute la charge utile a été relayée, mais AVANT `res.end()`. La
+ * classer « aborted » serait un MENSONGE : c'est un appel réussi.
+ * D'où le drapeau `upstreamEnded`, mémorisé AVANT que le client puisse fermer :
+ *   - le flux amont a émis son dernier morceau et le lecteur a vu `done` ;
+ *   - ou le TERMINATEUR SSE (`data: [DONE]`) vient d'être relayé — posé dans le
+ *     même tour de boucle que l'`enqueue`, donc avant toute fermeture observée.
+ * Fermeture client avec `upstreamEnded` ⇒ `aborted: false` (résultat `ok`).
+ * Fermeture client SANS `upstreamEnded` ⇒ `aborted: true` (vrai abandon),
+ * comportement INCHANGÉ.
  */
 export function instrumentStream(
   source: ReadableStream<Uint8Array>,
@@ -297,6 +324,10 @@ export function instrumentStream(
   let bytes = 0;
   let usage: CallLogTokens | undefined;
   let finished = false;
+  /** L'amont a FINI d'émettre : la fermeture du client n'est plus un abandon. */
+  let upstreamEnded = false;
+  /** Fenêtre bornée des derniers caractères relayés (détection du terminateur). */
+  let tail = "";
   const reader = source.getReader();
   let stopping = false;
   let stopPromise: Promise<void> | undefined;
@@ -311,7 +342,8 @@ export function instrumentStream(
   const stop = (reason: unknown): Promise<void> => {
     stopping = true;
     return stopPromise ??= Promise.resolve(reader.cancel(reason)).catch(() => {}).then(() => {
-      finish({ aborted: true, error: undefined, usage, bytes });
+      // Amont DÉJÀ terminé : la coupure du client est postérieure à la donnée.
+      finish({ aborted: !upstreamEnded, error: undefined, usage, bytes });
     });
   };
   let streamController: ReadableStreamDefaultController<Uint8Array>;
@@ -332,6 +364,7 @@ export function instrumentStream(
         const { done, value } = await reader.read();
         if (stopping || finished) return;
         if (done) {
+          upstreamEnded = true;
           controller.close();
           finish({ aborted: false, error: undefined, usage, bytes });
           return;
@@ -339,9 +372,18 @@ export function instrumentStream(
         if (!value) return;
         controller.enqueue(value);
         bytes += value.byteLength;
-        if (!observing) return;
+        if (!observing && upstreamEnded) return;
+        let text: string;
         try {
-          buffer += decoder.decode(value, { stream: true });
+          text = decoder.decode(value, { stream: true });
+          // Terminateur SSE : détecté même quand le détecteur d'usage est
+          // réservé (`observing === false`) — sa fenêtre est indépendante.
+          if (!upstreamEnded) {
+            tail = (tail + text).slice(-SSE_DONE_TAIL_MAX);
+            if (SSE_DONE_TAIL_PATTERN.test(tail)) upstreamEnded = true;
+          }
+          if (!observing) return;
+          buffer += text;
           let idx: number;
           while ((idx = buffer.indexOf("\n")) >= 0) {
             const line = buffer.slice(0, idx).replace(/\r$/, "");

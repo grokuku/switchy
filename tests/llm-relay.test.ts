@@ -333,3 +333,255 @@ describe("relais — streaming SSE", () => {
     expect(aborted).toMatchObject({ service: "chat", attempt: 0, provider: "p1" });
   });
 });
+
+// ── Course entre la FIN du flux amont et la FERMETURE du client ──────────────
+//
+// Un client SSE OpenAI-compatible (SDK `openai`, donc Pi-Web) ANNULE sa requête
+// HTTP dès qu'il a lu `data: [DONE]` : la fermeture arrive alors que le relais
+// n'a pas encore observé `done` sur le flux amont et que `res.end()` n'a pas eu
+// lieu. Sans le drapeau `upstreamEnded`, l'appel était classé
+// `aborted` / `client_disconnect` alors que le client avait TOUT reçu (faux
+// positif mesuré : 100 % des 267 lignes `aborted` portaient des jetons complets).
+// Ces tests figent la DISTINCTION : amont TERMINÉ ⇒ `ok` ; amont EN COURS ⇒
+// `aborted` + `client_disconnect` (vrai abandon, jamais masqué).
+
+/** Amont SSE dont le TERMINATEUR est émis tôt mais la fermeture retardée. */
+function tardyCloseSseResponse(closeDelayMs: number): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+        controller.enqueue(
+          encoder.encode('data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}\n\n'),
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        // Le fournisseur n'a pas encore FERMÉ : le relais n'a donc pas vu `done`
+        // quand le client coupe — c'est exactement la course observée en prod.
+        await new Promise((resolve) => setTimeout(resolve, closeDelayMs));
+        controller.close();
+      } catch {
+        /* flux déjà annulé par la coupure : sans objet */
+      }
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+/** Amont SSE ouvert que rien ne termine (aucun terminateur) : coupure = abandon. */
+function unterminatedSseResponse(init: { signal?: AbortSignal }): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+      init.signal?.addEventListener("abort", () => {
+        try {
+          controller.error(new DOMException("aborted", "AbortError"));
+        } catch {
+          /* déjà terminé */
+        }
+      });
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+/**
+ * Ouvre une VRAIE connexion HTTP, puis la COUPE (`req.destroy()`) dès que
+ * `cutOn` est atteint — comme le fait le SDK `openai` après `[DONE]`.
+ */
+async function streamThenCut(cutOn: "done-marker" | "first-chunk"): Promise<string> {
+  const server = env.app.listen(0);
+  let received = "";
+  try {
+    const port = (server.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/api/llm/chat",
+          method: "POST",
+          headers: { "content-type": "application/json", "x-api-key": TEST_API_KEY },
+        },
+        (res) => {
+          res.on("data", (chunk: Buffer) => {
+            received += chunk.toString();
+            const reached = cutOn === "done-marker" ? received.includes("[DONE]") : received.includes("data:");
+            if (reached) {
+              req.destroy();
+              resolve();
+            }
+          });
+          res.on("end", () => resolve());
+        },
+      );
+      req.on("error", () => {});
+      req.write(JSON.stringify({ messages: [], stream: true }));
+      req.end();
+    });
+  } finally {
+    server.close();
+  }
+  return received;
+}
+
+describe("flux terminé côté amont, fermeture côté client : un succès, pas un abandon", () => {
+  it("A — amont déjà terminé (`[DONE]` + fermeture) puis le client coupe → result: ok, jetons conservés", async () => {
+    await seedChat();
+    mock = installMockFetch(() =>
+      sseResponse([
+        'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}\n\n',
+        "data: [DONE]\n\n",
+      ]),
+    );
+
+    const received = await streamThenCut("done-marker");
+    expect(received).toContain("[DONE]");
+
+    await waitFor(() => readLog().length > 0, 2000);
+    const entry = readLog()[0];
+    // ⚠️ Le client a TOUT reçu : la fermeture n'est pas un abandon.
+    expect(entry).toMatchObject({
+      service: "chat",
+      result: "ok",
+      stream: true,
+      tokens: { promptTokens: 11, completionTokens: 4, totalTokens: 15 },
+    });
+    expect(entry.result).not.toBe("aborted");
+    expect(entry.reason).toBeUndefined();
+  });
+
+  it("C — COURSE : `[DONE]` relayé mais amont encore OUVERT quand le client coupe → result: ok", async () => {
+    await seedChat();
+    // 50 ms : la fermeture amont est certainement postérieure à la coupure
+    // client, donc `done` n'a PAS pu être observé avant elle.
+    mock = installMockFetch(() => tardyCloseSseResponse(50));
+
+    const received = await streamThenCut("done-marker");
+    expect(received).toContain("[DONE]");
+
+    await waitFor(() => readLog().length > 0, 2000);
+    const entry = readLog()[0];
+    expect(entry).toMatchObject({ result: "ok", stream: true, status: 200 });
+    expect(entry.reason).toBeUndefined();
+    expect(entry.tokens).toEqual({ promptTokens: 11, completionTokens: 4, totalTokens: 15 });
+  });
+
+  it("B — NON-RÉGRESSION : le client coupe AU MILIEU (aucun terminateur) → aborted + client_disconnect", async () => {
+    await seedChat();
+    mock = installMockFetch((_url, init) => unterminatedSseResponse(init));
+
+    await streamThenCut("first-chunk");
+
+    await waitFor(() => readLog().length > 0, 3000);
+    const entry = readLog()[0];
+    // ⚠️ Vrai abandon : surtout NE PAS le maquiller en succès.
+    expect(entry).toMatchObject({ result: "aborted", reason: "client_disconnect" });
+    expect(entry.tokens).toBeUndefined();
+  });
+
+  it("D — le cas « coupé après [DONE] » conserve `tokens` / `usage` / `durationMs` du cas nominal", async () => {
+    await seedChat();
+    mock = installMockFetch(() => tardyCloseSseResponse(20));
+
+    // 1) nominal : le client lit le flux jusqu'au bout.
+    const nominal = await api(env.app).post("/api/llm/chat").send({ messages: [], stream: true });
+    expect(nominal.status).toBe(200);
+    await waitFor(() => readLog().length === 1, 2000);
+
+    // 2) course : le client coupe dès `[DONE]`, amont pas encore fermé.
+    await streamThenCut("done-marker");
+    await waitFor(() => readLog().length === 2, 2000);
+
+    const [complete, cut] = readLog();
+    expect(complete).toMatchObject({ result: "ok", stream: true });
+    expect(cut).toMatchObject({ result: "ok", stream: true });
+    // Aucun champ de mesure perdu ou réinventé par le reclassement.
+    expect(cut.tokens).toEqual(complete.tokens);
+    expect(cut.status).toBe(complete.status);
+    expect(cut.model).toBe(complete.model);
+    expect(cut.error).toBeUndefined();
+    expect(typeof cut.durationMs).toBe("number");
+    expect(typeof complete.durationMs).toBe("number");
+  });
+});
+
+describe("instrumentStream — le terminateur SSE vaut fin de l'amont", () => {
+  it("terminateur relayé puis annulation du consommateur → aborted: false, octets/usage conservés", async () => {
+    const encoder = new TextEncoder();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        // Jamais fermé : le lecteur ne verra pas `done` avant l'annulation.
+      },
+    });
+    const reports: Array<{ aborted: boolean; bytes: number; usage?: unknown }> = [];
+    const relayed = instrumentStream(source, () => false, (report) => reports.push(report));
+    const reader = relayed.getReader();
+    await reader.read(); // morceau contenant l'usage
+    await reader.read(); // morceau contenant le terminateur
+    await reader.cancel();
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0].aborted).toBe(false);
+    expect(reports[0].usage).toEqual({ promptTokens: 7, completionTokens: 3 });
+    expect(reports[0].bytes).toBe('data: {"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n'.length + "data: [DONE]\n\n".length);
+  });
+
+  it("terminateur COUPÉ entre deux morceaux → aborted: false", async () => {
+    const encoder = new TextEncoder();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: [DO"));
+        controller.enqueue(encoder.encode("NE]\n\n"));
+      },
+    });
+    const reports: Array<{ aborted: boolean }> = [];
+    const relayed = instrumentStream(source, () => false, (report) => reports.push(report));
+    const reader = relayed.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel();
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0].aborted).toBe(false);
+  });
+
+  it("annulation AVANT tout terminateur → aborted: true (vrai abandon préservé)", async () => {
+    const encoder = new TextEncoder();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+      },
+    });
+    const reports: Array<{ aborted: boolean }> = [];
+    const relayed = instrumentStream(source, () => false, (report) => reports.push(report));
+    const reader = relayed.getReader();
+    await reader.read();
+    await reader.cancel();
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0].aborted).toBe(true);
+  });
+
+  it("un `data: [DONE]` présent dans le CONTENU d'un message ne vaut pas fin d'amont", async () => {
+    const encoder = new TextEncoder();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode('data: {"choices":[{"delta":{"content":"data: [DONE]"}}]}\n\n'),
+        );
+      },
+    });
+    const reports: Array<{ aborted: boolean }> = [];
+    const relayed = instrumentStream(source, () => false, (report) => reports.push(report));
+    const reader = relayed.getReader();
+    await reader.read();
+    await reader.cancel();
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0].aborted).toBe(true);
+  });
+});
